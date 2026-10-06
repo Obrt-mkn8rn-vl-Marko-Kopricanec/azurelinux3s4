@@ -31,3 +31,4 @@ Thumbs.db
 /out/
 /artifacts/
 /coverage/
+__pycache__/
