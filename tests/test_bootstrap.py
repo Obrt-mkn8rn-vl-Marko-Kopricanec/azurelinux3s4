@@ -50,7 +50,7 @@ uint32_t TDNFPluginLoadInterface(void **functions) {
         for name in ("state", "state/components", "state/repos", "run", "runner", "units", "systemd",
                      "bin", "plugin", "pluginconf"):
             (self.root / name).mkdir(mode=0o700)
-        (self.root / "rpm-key").write_text("fixture key; no real transactions are performed\n")
+        (self.root / "rpm-key").write_bytes((SCRIPT.parent / "tests/fixtures/azurelinux-rpm-key.asc").read_bytes())
         bundle = next(path for path in (Path('/etc/ssl/certs/ca-certificates.crt'),
             Path('/etc/pki/tls/certs/ca-bundle.crt')) if path.exists())
         (self.root / 'ca-bundle').write_bytes(bundle.read_bytes())
@@ -159,7 +159,12 @@ if args[0] == "-V":
 if args[0] == "-q": sys.exit(0)
 sys.exit(99)
 ''')
-        self.command("gpg2", "import sys\nsys.exit(0)\n")
+        self.command("gpg2", r'''
+import os
+import shutil
+import sys
+os.execv(shutil.which("gpg"), ["gpg", *sys.argv[1:]])
+''')
         # The host has no native Azure tdnf. This command fixture exercises the
         # probe's control and evidence rules and actually loads the ELF fixtures.
         # Native tdnf participation is also validated separately in the local VM.
@@ -174,16 +179,21 @@ import xml.etree.ElementTree as ET
 args = sys.argv[1:]
 config = dict(line.split("=", 1) for line in Path(args[args.index("-c")+1]).read_text().splitlines() if "=" in line)
 home = Path(os.environ.get("GNUPGHOME", ""))
-if home != Path(config["persistdir"]).parent / "gnupg": sys.exit(98)
+repo = Path(config["repodir"]) / "probe.repo"
+if repo.exists() and home != Path(config["persistdir"]).parent / "gnupg": sys.exit(98)
+if not repo.exists() and not home.parent.name.startswith("transaction."): sys.exit(98)
 if home.stat().st_mode & 0o777 != 0o700: sys.exit(98)
 if "no-autostart\ndisable-dirmngr\n" not in (home / "gpg.conf").read_text(): sys.exit(98)
-repo = Path(config["repodir"]) / "probe.repo"
 if repo.exists():
     metadata = Path(dict(line.split("=", 1) for line in repo.read_text().splitlines() if "=" in line)["baseurl"].removeprefix("file://"))
     ET.fromstring((metadata / "repodata/repomd.xml").read_bytes())
     ET.fromstring(gzip.decompress((metadata / "repodata/primary.xml.gz").read_bytes()))
 else:
-    sys.exit(99)
+    if not (home / "pubring.kbx").is_file(): sys.exit(98)
+    if "GPG_AGENT_INFO" in os.environ: sys.exit(98)
+    with (Path(os.environ["S4_FIXTURE_ROOT"]) / "native-transactions").open("a") as log:
+        import json
+        log.write(json.dumps({"args": args, "home": str(home), "stdin": sys.stdin.read()}) + "\n")
 if "--noplugins" in args: sys.exit(int(os.environ.get("S4_CONTROL_FAILURE", "0")))
 mode = os.environ.get("S4_TDNF_MODE", "verified")
 if mode == "hang": time.sleep(100)
@@ -199,6 +209,10 @@ except (OSError, AttributeError):
     print("Error loading plugin")
     sys.exit(0)  # upstream tdnf's fail-open behavior
 print("Loaded plugin: tdnfrepogpgcheck")
+if not repo.exists():
+    if os.environ.get("S4_NETWORK_FAILURE"): sys.exit(int(os.environ["S4_NETWORK_FAILURE"]))
+    print("Refreshing repo: azurelinux3s4-base\nRefreshing repo: azurelinux3s4-extended")
+    sys.exit(0)
 if mode == "load-only": sys.exit(1)
 if mode == "engine-error":
     print("gpg verify failed: Invalid crypto engine\nError: TDNFVerifySignature 2003")
@@ -222,6 +236,7 @@ export S4_FIXTURE_ROOT={shlex.quote(str(self.root))}
 export PATH={shlex.quote(str(self.root / 'bin'))}:$PATH
 S4_ARCH=x86_64
 S4_NOW=1000000
+S4_COMPONENTS=(bootstrap)
 update-ca-trust() {{ return 0; }}
 """
 
@@ -844,9 +859,118 @@ sys.exit(result.returncode)
         self.assertFalse((self.root / 'run/executed').exists())
 
     def test_transactions_have_timeout_refresh_and_no_stdin(self):
-        result = self.shell('s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; if read -r line; then return 9; fi; }; s4_tdnf install example')
-        self.assertIn("--kill-after=30s 15m tdnf -c", result.stdout)
-        self.assertIn("--releasever=3.0 --refresh -y --disableplugin=* --enableplugin=tdnfrepogpgcheck install example", result.stdout)
+        result = self.shell('s4_repositories; s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; command timeout "$@"; }; s4_tdnf install example')
+        self.assertIn("--kill-after=30s 15m python3 -I -", result.stdout)
+        transaction = json.loads((self.root / "native-transactions").read_text())
+        self.assertIn("--releasever=3.0 --refresh -y --disableplugin=* --enableplugin=tdnfrepogpgcheck install example",
+                      " ".join(transaction["args"]))
+        self.assertEqual(transaction["stdin"], "")
+
+    def test_metadata_transaction_imports_only_pinned_vendor_into_private_home(self):
+        operator = self.root / "operator-keyring"
+        operator.mkdir(mode=0o700)
+        (operator / "gpg.conf").write_text("operator configuration must remain unchanged\n")
+        self.shell("s4_repositories; export GNUPGHOME=" + shlex.quote(str(operator))
+                   + " GPG_AGENT_INFO=foreign-agent; s4_verify_repository_trust")
+        transaction = json.loads((self.root / "native-transactions").read_text())
+        self.assertNotEqual(transaction["home"], str(operator))
+        self.assertFalse(Path(transaction["home"]).exists())
+        self.assertEqual(list((self.root / "run").glob("transaction.*")), [])
+        self.assertEqual((operator / "gpg.conf").read_text(), "operator configuration must remain unchanged\n")
+        self.assertEqual(list(operator.iterdir()), [operator / "gpg.conf"])
+
+    def test_changed_vendor_key_refuses_before_native_transaction(self):
+        for data in (b"unknown key\n", (self.root / "rpm-key").read_bytes() + b"extra packets\n", b"x" * 65537):
+            with self.subTest(size=len(data)):
+                (self.root / "rpm-key").write_bytes(data)
+                result = self.shell("s4_repositories; s4_verify_repository_trust", expected=75)
+                self.assertIn("does not match the vetted keyblock", result.stderr)
+                self.assertFalse((self.root / "native-transactions").exists())
+                self.assertEqual(list((self.root / "run").glob("transaction.*")), [])
+
+    def test_missing_vendor_key_is_deferred_without_native_transaction(self):
+        (self.root / "rpm-key").unlink()
+        self.shell("s4_verify_metadata() { return 0; }; s4_tdnf makecache", expected=75)
+        self.assertFalse((self.root / "native-transactions").exists())
+
+    def test_failed_vendor_import_blocks_native_transaction(self):
+        self.command("gpg2", "import sys\nsys.exit(42)\n")
+        result = self.shell("s4_repositories; s4_verify_repository_trust", expected=75)
+        self.assertIn("could not be imported", result.stderr)
+        self.assertFalse((self.root / "native-transactions").exists())
+        self.assertEqual(list((self.root / "run").glob("transaction.*")), [])
+
+    def test_private_keyring_identity_observation_must_be_exact(self):
+        self.command("gpg2", r'''
+import os
+import subprocess
+import sys
+if "--list-keys" in sys.argv:
+    print(os.environ["S4_KEY_OBSERVATION"])
+    sys.exit(int(os.environ.get("S4_KEY_QUERY_FAILURE", "0")))
+sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
+''')
+        valid = "pub:-:2048:1:0CD9FED33135CE90:1584388724:::-:::scSC:\nfpr:::::::::2BC94FFF7015A5F28F1537AD0CD9FED33135CE90:"
+        for observation in ("", "pub", valid.replace("2BC94FFF", "00000000"), valid + "\n" + valid,
+                            valid.replace("pub:-", "pub:r"), valid.replace("pub:-", "pub:e"),
+                            valid.replace("pub:-", "pub:d"), valid + "\nsec:::::::::::"):
+            with self.subTest(observation=observation):
+                self.shell("s4_repositories; export S4_KEY_OBSERVATION=" + shlex.quote(observation)
+                           + "; s4_verify_repository_trust", expected=75)
+                self.assertFalse((self.root / "native-transactions").exists())
+        self.shell("s4_repositories; export S4_KEY_OBSERVATION=" + shlex.quote(valid)
+                   + " S4_KEY_QUERY_FAILURE=42; s4_verify_repository_trust", expected=75)
+
+    def test_actual_operation_without_native_loader_evidence_is_pending(self):
+        self.command("tdnf", "print('Metadata cache created')\n")
+        self.shell("s4_repositories; s4_verify_metadata() { return 0; }; s4_verify_repository_trust", expected=75)
+        self.assertEqual(list((self.root / "run").glob("transaction.*")), [])
+
+    def test_actual_operation_loader_error_does_not_certify_metadata(self):
+        self.command("tdnf", "print('Loaded plugin: tdnfrepogpgcheck\\nError loading plugin')\n")
+        self.shell("s4_repositories; s4_verify_metadata() { return 0; }; s4_verify_repository_trust", expected=75)
+
+    def test_actual_operation_failure_propagates_and_cleans_keyring(self):
+        self.shell("s4_repositories; export S4_NETWORK_FAILURE=28; s4_verify_repository_trust", expected=28)
+        self.assertEqual(list((self.root / "run").glob("transaction.*")), [])
+
+    def test_repository_trust_failure_keeps_repair_enabled_and_records_backoff(self):
+        self.shell("S4_COMPONENTS=(bootstrap repository-trust); s4_verify_bootstrap() { return 0; }; export S4_NETWORK_FAILURE=28; s4_repair yes",
+                   expected=75)
+        record = dict(line.split("=", 1) for line in (self.root / "state/components/repository-trust").read_text().splitlines())
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["last_exit"], "28")
+        self.assertIn(int(record["next_attempt"]), range(int(record["last_attempt"]) + 60, int(record["last_attempt"]) + 91))
+        self.assertNotIn("disable", (self.root / "events").read_text())
+        self.shell("s4_timer_state enabled active")
+
+    def test_repository_trust_backoff_precedes_network_work(self):
+        (self.root / "state/components/repository-trust").write_text("attempts=2\nnext_attempt=1000300\n")
+        self.shell("s4_repositories; s4_reconcile_component repository-trust no", expected=75)
+        self.assertFalse((self.root / "native-transactions").exists())
+
+    def test_stale_repository_success_does_not_replace_signed_refresh(self):
+        (self.root / "state/components/repository-trust").write_text("status=complete\nattempts=0\nnext_attempt=0\n")
+        self.shell("s4_repositories; export S4_NETWORK_FAILURE=28; s4_reconcile_component repository-trust no", expected=75)
+        self.assertIn("status=pending", (self.root / "state/components/repository-trust").read_text())
+        self.assertEqual(len((self.root / "native-transactions").read_text().splitlines()), 1)
+
+    def test_both_components_require_success_before_timer_finalization(self):
+        self.shell("S4_COMPONENTS=(bootstrap repository-trust); s4_verify_bootstrap() { return 0; }; s4_repair yes")
+        for component in ("bootstrap", "repository-trust"):
+            self.assertIn("status=complete", (self.root / ("state/components/" + component)).read_text())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
+        self.shell("s4_timer_state disabled inactive; s4_timer_state disabled inactive \"$S4_RECOVERY_TIMER\"")
+
+    def test_repository_refresh_deadline_is_shorter_than_package_transaction(self):
+        result = self.shell('s4_repositories; s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; command timeout "$@"; }; s4_verify_repository_trust')
+        self.assertIn("--kill-after=30s 5m python3 -I -", result.stdout)
+
+    def test_repo_component_status_preserves_incomplete_server_claim(self):
+        result = self.shell("S4_COMPONENTS=(bootstrap repository-trust); s4_status")
+        self.assertIn("implemented_components=bootstrap repository-trust", result.stdout)
+        self.assertIn("[repository-trust]", result.stdout)
+        self.assertIn("server_ready=no", result.stdout)
 
     def test_repository_policy_is_production_only(self):
         self.shell("s4_repositories")

@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.1.2
+S4_VERSION=0.2.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -12,12 +12,16 @@ S4_RUN=/run/azurelinux3s4
 S4_INSTALL_DIR=/usr/local/lib/azurelinux3s4
 S4_SYSTEMD_DIR=/etc/systemd/system
 S4_GPG_KEY=/etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+# Azure Linux 3's vendor source key, independently checked against signed
+# production base/extended metadata. Rotation requires newly vetted pins.
+S4_VENDOR_KEY_SHA256=1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89
+S4_VENDOR_FINGERPRINT=2BC94FFF7015A5F28F1537AD0CD9FED33135CE90
 S4_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.trust.crt
 S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(bootstrap)
+S4_COMPONENTS=(bootstrap repository-trust)
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -216,9 +220,86 @@ EOF
 
 s4_tdnf() {
     s4_verify_metadata || return 75
-    timeout --signal=TERM --kill-after=30s 15m \
-        tdnf -c "$S4_STATE/tdnf.conf" --releasever=3.0 --refresh -y \
-        --disableplugin='*' --enableplugin=tdnfrepogpgcheck "$@" </dev/null
+    s4_safe_path "$S4_GPG_KEY" || return 75
+    [[ -f $S4_GPG_KEY && ! -L $S4_GPG_KEY ]] || return 75
+    local limit=15m
+    [[ ${1:-} != makecache ]] || limit=5m
+    # The native plugin uses GnuPG's keyring, not the repository's gpgkey option.
+    # Build a new keyring per operation; never inherit an administrator's keys,
+    # trust database, home configuration, agent, or network key retrieval.
+    timeout --signal=TERM --kill-after=30s "$limit" \
+        python3 -I - "$S4_RUN" "$S4_GPG_KEY" "$S4_VENDOR_KEY_SHA256" \
+        "$S4_VENDOR_FINGERPRINT" "$S4_STATE/tdnf.conf" "$limit" "$@" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+try:
+    # Read a bounded snapshot; GnuPG imports that snapshot, not a second read of
+    # a potentially replaced source key. The SHA-256 pins all keyblock packets.
+    with open(sys.argv[2], "rb") as source:
+        key = source.read(65537)
+    if len(key) > 65536 or hashlib.sha256(key).hexdigest() != sys.argv[3]:
+        raise ValueError("Azure Linux vendor key does not match the vetted keyblock")
+    with tempfile.TemporaryDirectory(prefix="transaction.", dir=sys.argv[1]) as directory:
+        root = Path(directory)
+        home = root / "gnupg"
+        home.mkdir(mode=0o700)
+        (home / "gpg.conf").write_text(
+            "no-autostart\ndisable-dirmngr\nno-auto-key-retrieve\nno-auto-key-import\n")
+        snapshot = root / "vendor.asc"
+        snapshot.write_bytes(key)
+        environment = dict(os.environ, GNUPGHOME=str(home), LC_ALL="C")
+        environment.pop("GPG_AGENT_INFO", None)
+        gpg = ["gpg2", "--no-options", "--homedir", str(home), "--batch", "--no-tty",
+               "--no-autostart", "--disable-dirmngr", "--no-auto-key-retrieve", "--no-auto-key-import"]
+        def run(*arguments, **options):
+            return subprocess.run(arguments, stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, env=environment, **options)
+        imported = run(*gpg, "--import", str(snapshot), timeout=15)
+        if imported.returncode:
+            raise ValueError("vetted vendor key could not be imported into its private keyring")
+        listed = run(*gpg, "--with-colons", "--list-keys", timeout=15)
+        records = [line.split(":") for line in listed.stdout.splitlines()]
+        public = [record for record in records if record[0] == "pub"]
+        fingerprints = [record[9] for record in records if record[0] == "fpr" and len(record) > 9]
+        if (listed.returncode or len(public) != 1 or len(public[0]) < 10
+                or fingerprints != [sys.argv[4]] or public[0][1] in ("r", "e", "d")
+                or any(record[0] in ("sec", "ssb") for record in records)):
+            raise ValueError("private metadata keyring did not prove the exact vendor identity")
+        # Verbose loader evidence is mandatory for this actual operation as well
+        # as the separate integrity/invalid-signature challenge before it.
+        command = ["tdnf", "-v", "-c", sys.argv[5], "--releasever=3.0", "--refresh", "-y",
+                   "--disableplugin=*", "--enableplugin=tdnfrepogpgcheck", *sys.argv[7:]]
+        transaction = run(*command, timeout=240 if sys.argv[6] == "5m" else 800)
+        print(transaction.stdout, end="")
+        print(transaction.stderr, end="", file=sys.stderr)
+        output = transaction.stdout + transaction.stderr
+        if transaction.returncode:
+            sys.exit(transaction.returncode if 0 < transaction.returncode < 126 else 75)
+        if "Loaded plugin: tdnfrepogpgcheck" not in output or "Error loading plugin" in output:
+            raise ValueError("native metadata verifier participation was not observed")
+except (ValueError, OSError, subprocess.SubprocessError) as error:
+    print("azurelinux3s4: trusted metadata transaction deferred: " + str(error), file=sys.stderr)
+    sys.exit(75)
+PY
+}
+
+s4_verify_repository_trust() {
+    # A stored success marker is insufficient. Re-import the pinned key and
+    # require a fresh native signed refresh of both enabled production repos.
+    s4_tdnf makecache
+}
+
+s4_verify_component() {
+    case $1 in
+        bootstrap) s4_verify_bootstrap ;;
+        repository-trust) s4_verify_repository_trust ;;
+        *) return 78 ;;
+    esac
 }
 
 s4_tdnf_recovery() {
@@ -466,8 +547,30 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == bootstrap ]] || return 78
-    if s4_verify_bootstrap; then
+    [[ $component == bootstrap || $component == repository-trust ]] || return 78
+    if [[ $component == repository-trust ]]; then
+        # Its health check IS an online signed refresh. Honor backoff before
+        # network work and do not repeat the same failed refresh in a child.
+        attempts=$(s4_state_value "$component" attempts)
+        next=$(s4_state_value "$component" next_attempt)
+        (( next <= S4_NOW + 3630 )) || next=0
+        if [[ $force != yes ]] && (( next > S4_NOW )); then
+            s4_log "$component is pending; next permitted attempt is $next."
+            return 75
+        fi
+        (( attempts < 10 )) || attempts=10
+        attempts=$((attempts + 1))
+        s4_write_state "$component" running "$attempts" 0 0 || return $?
+        if s4_verify_repository_trust; then
+            s4_write_state "$component" complete 0 0 0
+            return $?
+        else
+            result=$?
+        fi
+        s4_defer_component "$component" "$result" "$attempts"
+        return $?
+    fi
+    if s4_verify_component "$component"; then
         # A stale success marker alone never proves completion.
         s4_write_state "$component" complete 0 0 0
         return $?
@@ -488,7 +591,7 @@ s4_reconcile_component() {
     # Run in a new shell with errexit enabled even when the caller uses `if`.
     # Do not let Bash's conditional-function errexit exception mask a failed step.
     if s4_run_component "$component"; then
-        if s4_verify_bootstrap; then
+        if s4_verify_component "$component"; then
             s4_write_state "$component" complete 0 0 0
             return $?
         fi
@@ -725,7 +828,7 @@ s4_repair() {
 }
 
 s4_status() {
-    printf 'version=%s\nserver_ready=no\nimplemented_components=bootstrap\n' "$S4_VERSION"
+    printf 'version=%s\nserver_ready=no\nimplemented_components=%s\n' "$S4_VERSION" "${S4_COMPONENTS[*]}"
     local component
     for component in "${S4_COMPONENTS[@]}"; do
         printf '\n[%s]\n' "$component"
@@ -750,10 +853,10 @@ s4_main() {
     local action=${1:-install}
     case $action in
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: bootstrap only; server hardening is incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: bootstrap and repository trust only; server hardening is incomplete.\n'
             return 0 ;;
         install|--status|--repair) [[ $# -le 1 ]] || return 64 ;;
-        --component) [[ $# == 2 && $2 == bootstrap ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == bootstrap || $2 == repository-trust ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -764,14 +867,17 @@ s4_main() {
     s4_prepare_state || return $?
     s4_lock || return $?
     if [[ $action == --component ]]; then
-        s4_apply_bootstrap
+        case $2 in
+            bootstrap) s4_apply_bootstrap ;;
+            repository-trust) s4_verify_repository_trust ;;
+        esac
         return $?
     fi
     if [[ $action == install ]]; then
         s4_install_runner || return $?
         s4_install_units || return $?
         s4_repair yes || return $?
-        s4_log 'INCOMPLETE: bootstrap only. This checkpoint has not hardened the server.'
+        s4_log 'INCOMPLETE: bootstrap and repository trust only. This checkpoint has not hardened the server.'
         return 78
     fi
     s4_repair no
