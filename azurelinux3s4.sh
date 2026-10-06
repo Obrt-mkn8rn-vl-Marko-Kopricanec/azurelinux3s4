@@ -4,14 +4,14 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.2.0
+S4_VERSION=0.3.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
 S4_RUN=/run/azurelinux3s4
 S4_INSTALL_DIR=/usr/local/lib/azurelinux3s4
 S4_SYSTEMD_DIR=/etc/systemd/system
-S4_GPG_KEY=/etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+S4_GPG_KEY=$S4_STATE/vendor-rpm-key.asc
 # Azure Linux 3's vendor source key, independently checked against signed
 # production base/extended metadata. Rotation requires newly vetted pins.
 S4_VENDOR_KEY_SHA256=1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89
@@ -21,7 +21,7 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(bootstrap repository-trust)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust)
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -64,8 +64,8 @@ s4_preflight() {
     [[ $EUID == 0 ]] || { s4_log 'Run with administrator privileges (sudo or root).'; return 77; }
     s4_platform || return $?
     local tool
-    for tool in awk bash cat chmod cmp date dirname flock install mktemp mv rpm \
-                ln readlink rm stat sync systemctl tdnf timeout uname; do
+    for tool in awk base64 bash cat chmod cmp date dirname flock head install mktemp mv rpm \
+                ln readlink rm sha256sum stat sync systemctl tdnf timeout uname; do
         command -v "$tool" >/dev/null || {
             s4_log "The base image lacks required bootstrap command: $tool"
             return 78
@@ -179,6 +179,107 @@ next_attempt=$next
 last_exit=$result
 last_attempt=$S4_NOW
 EOF
+}
+
+s4_vendor_key_material() {
+    # Public release key carried by this single executable; no network or GnuPG
+    # prerequisite is needed to recover its vetted bytes. Never trust a new key
+    # merely because a remote endpoint offers it.
+    cat <<'S4_VENDOR_KEY'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: BSN Pgp v1.1.0.0
+
+mQENBF5v2nQBCADD+o8FgJQUcV9QTgdOTrYo8VtwHNOtTI1WWki8cUx+pI+aarHo
+zYN3/QQj+a5lALWeWM/w+aT1q/xGBBkmr9Qo5xWaXeiKZaMVv3H+1HIOjVvrWOHX
+zm+FvONB2fwAOclq9p7YaMqWtn4GckxD2YXhkTW0Y4kM+TcMTgSCiGKskjnmTfHw
+G+SI9av/CZvqqfNZkdIuNTS9eSqTTenCKkgLvYRKSpkhZj1OuB/iTu+xK0BuoVns
+jmju/Fw+tBrcdu3Q1sRXDrh8lnZgHxQUxHjwnyMlTM8a9N2qCgnu+SQjNyk3NXgi
+dGSFkdtaF/Z+KNwG10XVs1jzjO/rtsrvrwJvABEBAAG0Ok1hcmluZXIgUlBNIFJl
+bGVhc2UgU2lnbmluZyA8bWFyaW5lcnJwbXByb2RAbWljcm9zb2Z0LmNvbT6JATgE
+EwEIACIFAl5v2nQCGwMGCwkIBwMCBhUIAgkKCwQWAgMBAh4BAheAAAoJEAzZ/tMx
+Nc6QfaMH/iqp4Uyd66rAC2tSILWrH6RLkf05TIE0GZheqQkEO7a/Khy3u/Ej/HgC
+QUlIC7yrJJGfNCyAx44Z/QsnrWz5EqVZOvjgY9MDpmzfve7KqmbnDBjmbSc6g8IH
+HcgUYyfTHEUj69IfgNyJK4Io1vi1WgY/sesAn2ZPpoeT3ihH5FqH7dQkGWeGg1bA
+FIaVXm+gMAssaj+k52g/+CnY4KZUHrSkg48OoRB+2a6FqGS8BLeCa+v+zaJCk2fz
+EI/NeJwL4Asz1F4AwkEu5X9y8eEGArCXoP0OpYpCxIBZ+7MiKKDOoNf0a/0nOhvs
+29LIIOnG+x0/RDfRgFObrF9geKpVTpI=
+=ZhFE
+-----END PGP PUBLIC KEY BLOCK-----
+S4_VENDOR_KEY
+}
+
+s4_vendor_key_matches() {
+    local digest
+    s4_safe_path "$S4_GPG_KEY" || return 1
+    [[ -f $S4_GPG_KEY && ! -L $S4_GPG_KEY ]] || return 1
+    [[ $(stat -c %s -- "$S4_GPG_KEY") == 983 ]] || return 1
+    digest=$(timeout --kill-after=5s 15s sha256sum -- "$S4_GPG_KEY") || return 1
+    [[ ${digest%% *} == "$S4_VENDOR_KEY_SHA256" ]]
+}
+
+s4_rpm_database_path() {
+    local keyring database
+    keyring=$(timeout --kill-after=5s 30s rpm --eval '%{?_keyring}') || return 75
+    # RPM 4.18 defaults to rpmdb for an unset keyring selector. A filesystem
+    # keyring must not be falsely certified by observing a different database.
+    [[ -z $keyring || $keyring == rpmdb ]] || return 75
+    database=$(timeout --kill-after=5s 30s rpm --eval '%{_dbpath}') || return 75
+    [[ $database == /* && ${#database} -le 4096 ]] || return 75
+    # A distro-owned leaf alias is allowed only inside trusted ancestry. Check
+    # that ancestry before following it so an unprivileged alias cannot redirect
+    # RPM while the persistence check observes an unrelated safe directory.
+    s4_safe_path "$(dirname -- "$database")" || return 75
+    if [[ -L $database ]]; then
+        [[ $(stat -c %u -- "$database") == 0 ]] || return 75
+    fi
+    database=$(readlink -e -- "$database") || return 75
+    s4_safe_path "$database" || return 75
+    [[ -d $database ]] || return 75
+    printf '%s\n' "$database"
+}
+
+s4_rpm_vendor_key_matches() {
+    local encoded digest
+    # PUBKEYS is the actual base64 packet material RPM loads, not a description
+    # or a short key ID. Bound output and compare the complete decoded keyblock.
+    encoded=$(timeout --kill-after=5s 30s rpm -q --qf '[%{PUBKEYS}\n]' \
+        gpg-pubkey-3135ce90-5e6fda74 | head -c 2049) || return 1
+    (( ${#encoded} > 0 && ${#encoded} <= 2048 )) || return 1
+    digest=$(printf '%s\n' "$encoded" | base64 --decode | sha256sum) || return 1
+    [[ ${digest%% *} == 38ced48482bda02f404a772c09c3572440a3f597bf15cc3b7abadaef60be2e81 ]]
+}
+
+s4_verify_trust_anchor() {
+    local database
+    s4_vendor_key_matches || return 1
+    database=$(s4_rpm_database_path) || return 1
+    s4_rpm_vendor_key_matches || return 1
+    # An earlier failed publication/import barrier can leave correct bytes
+    # visible. Re-establish persistence even on the existing healthy path.
+    timeout --kill-after=5s 30s sync -f -- "$(dirname -- "$S4_GPG_KEY")" \
+        "$database" "$(dirname -- "$database")" || return 1
+    s4_vendor_key_matches && s4_rpm_vendor_key_matches
+}
+
+s4_apply_trust_anchor() {
+    local material digest database
+    database=$(s4_rpm_database_path) || return 75
+    material=$(s4_vendor_key_material) || return 75
+    digest=$(printf '%s\n' "$material" | sha256sum) || return 75
+    [[ ${digest%% *} == "$S4_VENDOR_KEY_SHA256" ]] || {
+        s4_log 'Embedded vendor material differs from its vetted pin; repair is deferred.'
+        return 75
+    }
+    # Only our own regular-file target is replaced. Wrong-kind, linked or
+    # untrusted paths remain untouched under the accepted write contract.
+    s4_atomic_write "$S4_GPG_KEY" 0600 <<<"$material" || return $?
+    s4_vendor_key_matches || return 75
+    if ! s4_rpm_vendor_key_matches; then
+        timeout --kill-after=5s 30s rpm --import "$S4_GPG_KEY" </dev/null || return 75
+    fi
+    # Import exit zero is insufficient; require actual admitted packets and a
+    # persistence barrier, including on an already-registered retry.
+    s4_verify_trust_anchor || return 75
 }
 
 s4_repositories() {
@@ -296,6 +397,7 @@ s4_verify_repository_trust() {
 
 s4_verify_component() {
     case $1 in
+        trust-anchor) s4_verify_trust_anchor ;;
         bootstrap) s4_verify_bootstrap ;;
         repository-trust) s4_verify_repository_trust ;;
         *) return 78 ;;
@@ -547,7 +649,7 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == bootstrap || $component == repository-trust ]] || return 78
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust ]] || return 78
     if [[ $component == repository-trust ]]; then
         # Its health check IS an online signed refresh. Honor backoff before
         # network work and do not repeat the same failed refresh in a child.
@@ -803,8 +905,11 @@ s4_restore_repair_timer() {
 s4_repair() {
     local force=$1 component pending=no result attempts
     S4_NOW=$(date +%s)
-    if s4_repositories; then
+    if [[ ${S4_COMPONENTS[0]} == trust-anchor ]] && ! s4_reconcile_component trust-anchor "$force"; then
+        pending=yes
+    elif s4_repositories; then
         for component in "${S4_COMPONENTS[@]}"; do
+            [[ $component != trust-anchor ]] || continue
             if ! s4_reconcile_component "$component" "$force"; then
                 pending=yes
             fi
@@ -813,6 +918,7 @@ s4_repair() {
         result=$?
         pending=yes
         for component in "${S4_COMPONENTS[@]}"; do
+            [[ $component != trust-anchor ]] || continue
             attempts=$(s4_state_value "$component" attempts)
             (( attempts < 10 )) || attempts=10
             s4_defer_component "$component" "$result" "$((attempts + 1))" || true
@@ -853,10 +959,10 @@ s4_main() {
     local action=${1:-install}
     case $action in
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: bootstrap and repository trust only; server hardening is incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: trust anchor, bootstrap and repository trust only; server hardening is incomplete.\n'
             return 0 ;;
         install|--status|--repair) [[ $# -le 1 ]] || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == bootstrap || $2 == repository-trust ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -868,6 +974,7 @@ s4_main() {
     s4_lock || return $?
     if [[ $action == --component ]]; then
         case $2 in
+            trust-anchor) s4_apply_trust_anchor ;;
             bootstrap) s4_apply_bootstrap ;;
             repository-trust) s4_verify_repository_trust ;;
         esac
@@ -877,7 +984,7 @@ s4_main() {
         s4_install_runner || return $?
         s4_install_units || return $?
         s4_repair yes || return $?
-        s4_log 'INCOMPLETE: bootstrap and repository trust only. This checkpoint has not hardened the server.'
+        s4_log 'INCOMPLETE: trust anchor, bootstrap and repository trust only. This checkpoint has not hardened the server.'
         return 78
     fi
     s4_repair no

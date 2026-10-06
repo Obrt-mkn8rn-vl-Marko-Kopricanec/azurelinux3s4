@@ -48,9 +48,12 @@ uint32_t TDNFPluginLoadInterface(void **functions) {
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         for name in ("state", "state/components", "state/repos", "run", "runner", "units", "systemd",
-                     "bin", "plugin", "pluginconf"):
+                     "bin", "plugin", "pluginconf", "rpmdb"):
             (self.root / name).mkdir(mode=0o700)
-        (self.root / "rpm-key").write_bytes((SCRIPT.parent / "tests/fixtures/azurelinux-rpm-key.asc").read_bytes())
+        material = (SCRIPT.parent / "tests/fixtures/azurelinux-rpm-key.asc").read_bytes()
+        (self.root / "rpm-key").write_bytes(material)
+        packets = base64.b64decode("".join(line for line in material.decode('ascii').splitlines()
+            if line and not line.startswith(("-----", "Version:", "="))), validate=True)
         bundle = next(path for path in (Path('/etc/ssl/certs/ca-certificates.crt'),
             Path('/etc/pki/tls/certs/ca-bundle.crt')) if path.exists())
         (self.root / 'ca-bundle').write_bytes(bundle.read_bytes())
@@ -62,7 +65,7 @@ uint32_t TDNFPluginLoadInterface(void **functions) {
         self.plugin_config.write_text('[main]\nenabled=1\n')
         self.database = {"files": {"tdnf-plugin-repogpgcheck": {str(self.plugin): self.digest(self.plugin)},
                                    "plugin-dependency": {str(self.plugin_dependency): self.digest(self.plugin_dependency)}},
-                         "verification": {}}
+                         "verification": {}, "vendor_packets": [base64.b64encode(packets).decode('ascii')]}
         self.write_database()
         (self.root / "units/azurelinux3s4-repair.timer").write_text("fixture timer\n")
         (self.root / "units/azurelinux3s4-finalization-recovery.timer").write_text("fixture recovery timer\n")
@@ -112,6 +115,7 @@ import os
 from pathlib import Path
 import sys
 root = Path(os.environ["S4_FIXTURE_ROOT"])
+if os.environ.get("S4_SYNC_ERROR_PATH") in sys.argv[1:]: sys.exit(42)
 for name in sys.argv[1:]:
     if name in ("-f", "--"): continue
     path = Path(name)
@@ -128,6 +132,24 @@ from pathlib import Path
 import sys
 data = json.loads((Path(os.environ["S4_FIXTURE_ROOT"]) / "rpm-database.json").read_text())
 args, package = sys.argv[1:], sys.argv[-1]
+root = Path(os.environ["S4_FIXTURE_ROOT"])
+if args[0] == "--eval":
+    if os.environ.get("S4_RPM_EVAL_ERROR"): sys.exit(42)
+    print(os.environ.get("S4_RPM_KEYRING", "rpmdb") if args[1] == "%{?_keyring}" else os.environ.get("S4_RPM_DATABASE", str(root / "rpmdb")))
+    sys.exit(0)
+if args[0] == "--import":
+    with (root / "rpm-imports").open("a") as log: log.write(package + "\n")
+    if os.environ.get("S4_RPM_IMPORT_ERROR"): sys.exit(42)
+    if not os.environ.get("S4_RPM_IMPORT_NOOP"):
+        lines=Path(package).read_text().splitlines()
+        data["vendor_packets"]=["".join(line for line in lines if line and not line.startswith(("-----", "Version:", "=")))]
+        (root / "rpm-database.json").write_text(json.dumps(data))
+    sys.exit(0)
+if "%{PUBKEYS}" in " ".join(args):
+    if os.environ.get("S4_RPM_KEY_QUERY_ERROR"): sys.exit(42)
+    if not data.get("vendor_packets"): sys.exit(1)
+    print("\n".join(data["vendor_packets"]))
+    sys.exit(0)
 packages = {"tdnf-plugin-repogpgcheck", "tdnf", "gnupg2", "plugin-dependency"}
 if "--requires" in args:
     if package not in packages: sys.exit(1)
@@ -971,6 +993,158 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
         self.assertIn("implemented_components=bootstrap repository-trust", result.stdout)
         self.assertIn("[repository-trust]", result.stdout)
         self.assertIn("server_ready=no", result.stdout)
+
+    def test_embedded_anchor_is_exact_reviewed_public_material(self):
+        result = self.shell('s4_vendor_key_material')
+        self.assertEqual(result.stdout.encode(), (SCRIPT.parent / 'tests/fixtures/azurelinux-rpm-key.asc').read_bytes())
+        self.assertEqual(hashlib.sha256(result.stdout.encode()).hexdigest(),
+                         '1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89')
+
+    def test_missing_private_anchor_recovers_without_network_or_gnupg(self):
+        (self.root / 'rpm-key').unlink()
+        self.database['vendor_packets'] = []
+        self.write_database()
+        self.command('gpg2', 'raise SystemExit(99)\n')
+        self.command('tdnf', 'raise SystemExit(99)\n')
+        self.shell('s4_apply_trust_anchor; s4_verify_trust_anchor')
+        self.assertEqual((self.root / 'rpm-key').read_bytes(), (SCRIPT.parent / 'tests/fixtures/azurelinux-rpm-key.asc').read_bytes())
+        self.assertEqual((self.root / 'rpm-key').stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / 'rpm-imports').read_text().splitlines(), [str(self.root / 'rpm-key')])
+
+    def test_damaged_private_anchor_recovers_and_preserves_distribution_key(self):
+        original = self.root / 'distribution-key'
+        original.write_text('operator distribution material remains untouched\n')
+        (self.root / 'rpm-key').write_text('damaged private bytes\n')
+        self.shell('s4_apply_trust_anchor; s4_verify_trust_anchor')
+        self.assertEqual(original.read_text(), 'operator distribution material remains untouched\n')
+        self.assertFalse((self.root / 'rpm-imports').exists())
+
+    def test_corrupt_embedded_material_never_replaces_existing_anchor(self):
+        prior = (self.root / 'rpm-key').read_bytes()
+        self.shell("s4_vendor_key_material() { printf 'changed embedded bytes\\n'; }; s4_apply_trust_anchor", expected=75)
+        self.assertEqual((self.root / 'rpm-key').read_bytes(), prior)
+        self.assertFalse((self.root / 'rpm-imports').exists())
+
+    def test_registered_anchor_is_idempotent_and_preserves_other_rpm_keys(self):
+        self.database['foreign_keys'] = ['operator key']
+        self.write_database()
+        prior = (self.root / 'rpm-key').stat().st_mtime_ns
+        self.shell('s4_apply_trust_anchor; s4_apply_trust_anchor')
+        self.assertEqual((self.root / 'rpm-key').stat().st_mtime_ns, prior)
+        self.assertFalse((self.root / 'rpm-imports').exists())
+        self.assertEqual(json.loads((self.root / 'rpm-database.json').read_text())['foreign_keys'], ['operator key'])
+
+    def test_rpm_admission_failure_and_zero_exit_noop_remain_pending(self):
+        self.database['vendor_packets'] = []
+        self.write_database()
+        for setting in ('S4_RPM_IMPORT_ERROR=1', 'S4_RPM_IMPORT_NOOP=1'):
+            with self.subTest(setting=setting):
+                self.shell('export ' + setting + '; s4_apply_trust_anchor', expected=75)
+                self.shell('s4_verify_trust_anchor', expected=1)
+
+    def test_rpm_identity_requires_actual_complete_packets(self):
+        encoded = self.database['vendor_packets'][0]
+        for packets in ([], ['not base64'], [encoded, encoded], [base64.b64encode(b'wrong public packet').decode()],
+                        [encoded[:-4]], ['x' * 2049]):
+            with self.subTest(packets=packets):
+                self.database['vendor_packets'] = packets
+                self.write_database()
+                self.shell('s4_rpm_vendor_key_matches', expected=1)
+        self.database['vendor_packets'] = [encoded]
+        self.write_database()
+        self.shell('export S4_RPM_KEY_QUERY_ERROR=1; s4_rpm_vendor_key_matches', expected=1)
+
+    def test_unsupported_or_unknown_rpm_observation_cannot_admit_trust(self):
+        for setting in ('S4_RPM_KEYRING=fs', 'S4_RPM_KEYRING=unknown', 'S4_RPM_EVAL_ERROR=1',
+                        'S4_RPM_DATABASE=relative', 'S4_RPM_DATABASE=' + str(self.root / 'absent-db')):
+            with self.subTest(setting=setting):
+                self.shell('export ' + setting + '; s4_apply_trust_anchor', expected=75)
+                self.assertFalse((self.root / 'rpm-imports').exists())
+        self.shell("export S4_RPM_KEYRING=''; s4_verify_trust_anchor")
+
+    def test_database_alias_in_untrusted_parent_is_refused(self):
+        directory = self.root / 'untrusted'
+        directory.mkdir()
+        directory.chmod(0o777)
+        alias = directory / 'rpmdb'
+        alias.symlink_to(self.root / 'rpmdb', target_is_directory=True)
+        self.shell('export S4_RPM_DATABASE=' + shlex.quote(str(alias)) + '; s4_apply_trust_anchor', expected=75)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse((self.root / 'rpm-imports').exists())
+
+    def test_anchor_wrong_kind_paths_refuse_without_open_or_removal(self):
+        path = self.root / 'rpm-key'
+        path.unlink()
+        os.mkfifo(path, 0o600)
+        inode = path.stat().st_ino
+        self.shell('s4_apply_trust_anchor', expected=78, timeout=3)
+        self.assertEqual(path.stat().st_ino, inode)
+        path.unlink()
+        path.mkdir(mode=0o700)
+        inode = path.stat().st_ino
+        self.shell('s4_apply_trust_anchor', expected=78)
+        self.assertEqual(path.stat().st_ino, inode)
+        path.rmdir()
+        target = self.root / 'operator-key'
+        target.write_text('unchanged')
+        path.symlink_to(target)
+        self.shell('s4_apply_trust_anchor', expected=78)
+        self.assertEqual(target.read_text(), 'unchanged')
+        path.unlink()
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(str(path))
+            inode = path.stat().st_ino
+            self.shell('s4_apply_trust_anchor', expected=78)
+            self.assertEqual(path.stat().st_ino, inode)
+
+    def test_anchor_barrier_failure_never_certifies_visible_admission(self):
+        (self.root / 'rpm-key').unlink()
+        self.database['vendor_packets'] = []
+        self.write_database()
+        failure = 'export S4_SYNC_ERROR_PATH=$S4_FIXTURE_ROOT/rpmdb; '
+        self.shell(failure + 's4_apply_trust_anchor', expected=75)
+        self.assertTrue((self.root / 'rpm-key').exists())
+        self.shell(failure + 's4_apply_trust_anchor', expected=75)
+        self.assertEqual(len((self.root / 'rpm-imports').read_text().splitlines()), 1)
+        self.shell(failure + 's4_verify_trust_anchor', expected=1)
+        self.shell('s4_verify_trust_anchor')
+
+    def test_anchor_write_barrier_failure_prevents_rpm_import(self):
+        (self.root / 'rpm-key').unlink()
+        self.database['vendor_packets'] = []
+        self.write_database()
+        self.shell('sync() { return 42; }; s4_apply_trust_anchor', expected=1)
+        self.assertFalse((self.root / 'rpm-imports').exists())
+
+    def test_anchor_failure_blocks_bootstrap_and_online_refresh(self):
+        self.database['vendor_packets'] = []
+        self.write_database()
+        self.shell('''S4_COMPONENTS=(trust-anchor bootstrap repository-trust)
+            export S4_RPM_IMPORT_NOOP=1
+            s4_run_component() { [[ $1 == trust-anchor ]] || return 99; s4_apply_trust_anchor; }
+            s4_repair yes''', expected=75)
+        record = dict(line.split('=', 1) for line in (self.root / 'state/components/trust-anchor').read_text().splitlines())
+        self.assertEqual(record['status'], 'pending')
+        self.assertEqual(record['last_exit'], '75')
+        self.assertFalse((self.root / 'state/tdnf.conf').exists())
+        self.assertFalse((self.root / 'native-transactions').exists())
+        self.shell('s4_timer_state enabled active')
+
+    def test_all_three_components_recover_key_before_online_completion(self):
+        (self.root / 'rpm-key').unlink()
+        self.database['vendor_packets'] = []
+        self.write_database()
+        self.shell('''S4_COMPONENTS=(trust-anchor bootstrap repository-trust)
+            s4_verify_bootstrap() { return 0; }
+            s4_run_component() { [[ $1 == trust-anchor ]] || return 99; s4_apply_trust_anchor; }
+            s4_repair yes''')
+        for component in ('trust-anchor', 'bootstrap', 'repository-trust'):
+            self.assertIn('status=complete', (self.root / ('state/components/' + component)).read_text())
+        self.shell('s4_timer_state disabled inactive; s4_timer_state disabled inactive "$S4_RECOVERY_TIMER"')
+
+    def test_anchor_identity_query_is_bounded(self):
+        self.command('rpm', 'import time\ntime.sleep(100)\n')
+        self.shell('timeout() { shift 2; command timeout --kill-after=1s 1s "$@"; }; s4_rpm_vendor_key_matches', expected=1, timeout=3)
 
     def test_repository_policy_is_production_only(self):
         self.shell("s4_repositories")
