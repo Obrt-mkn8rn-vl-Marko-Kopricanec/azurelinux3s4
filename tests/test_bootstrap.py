@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -64,6 +65,10 @@ uint32_t TDNFPluginLoadInterface(void **functions) {
                          "verification": {}}
         self.write_database()
         (self.root / "units/azurelinux3s4-repair.timer").write_text("fixture timer\n")
+        (self.root / "units/azurelinux3s4-finalization-recovery.timer").write_text("fixture recovery timer\n")
+        (self.root / "units/azurelinux3s4-repair.service").write_text("fixture worker\n")
+        shutil.copyfile(SCRIPT, self.root / "runner/azurelinux3s4.sh")
+        (self.root / "runner/azurelinux3s4.sh").chmod(0o700)
         self.command("systemctl", r'''
 import os
 from pathlib import Path
@@ -72,25 +77,48 @@ root = Path(os.environ["S4_FIXTURE_ROOT"])
 args = sys.argv[1:]
 with (root / "events").open("a") as log:
     log.write(" ".join(args) + "\n")
-enabled, active = root / "run/timer-enabled", root / "run/timer-active"
+unit = args[-1]
+kind = "recovery" if unit == "azurelinux3s4-finalization-recovery.timer" else "timer"
+enabled, active = root / ("run/" + kind + "-enabled"), root / ("run/" + kind + "-active")
+link = root / "units/timers.target.wants" / unit
+prefix = "S4_RECOVERY_" if kind == "recovery" else "S4_PRIMARY_"
+def setting(name, default="0"):
+    return os.environ.get(prefix + name, os.environ.get("S4_" + name, default))
 if args[0] == "daemon-reload":
     sys.exit(int(os.environ.get("S4_DAEMON_FAILURE", "0")))
 if args[0] == "enable":
+    if setting("ENABLE_FAILURE") != "0": sys.exit(int(setting("ENABLE_FAILURE")))
     enabled.touch(); active.touch()
-    sys.exit(int(os.environ.get("S4_ENABLE_FAILURE", "0")))
+    sys.exit(0)
 if args[0] == "disable":
     enabled.unlink(missing_ok=True); active.unlink(missing_ok=True)
-    (root / "units/timers.target.wants/azurelinux3s4-repair.timer").unlink(missing_ok=True)
-    sys.exit(int(os.environ.get("S4_DISABLE_FAILURE", "0")))
+    link.unlink(missing_ok=True)
+    if os.environ.get("S4_REMOVE_EMPTY_WANTS") and not any(link.parent.iterdir()): link.parent.rmdir()
+    sys.exit(int(setting("DISABLE_FAILURE")))
 if args[0] == "show":
-    if os.environ.get("S4_QUERY_FAILURE"):
+    if setting("QUERY_FAILURE") != "0":
         print("manager query failed", file=sys.stderr)
-        sys.exit(int(os.environ["S4_QUERY_FAILURE"]))
-    print("LoadState=" + os.environ.get("S4_LOAD_STATE", "loaded"))
-    print("UnitFileState=" + os.environ.get("S4_FILE_STATE", "enabled" if enabled.exists() else "disabled"))
-    print("ActiveState=" + os.environ.get("S4_ACTIVE_STATE", "active" if active.exists() else "inactive"))
+        sys.exit(int(setting("QUERY_FAILURE")))
+    print("LoadState=" + setting("LOAD_STATE", "loaded"))
+    print("UnitFileState=" + setting("FILE_STATE", "enabled" if link.is_symlink() else "disabled"))
+    print("ActiveState=" + setting("ACTIVE_STATE", "active" if active.exists() else "inactive"))
     sys.exit(0)
 sys.exit(99)
+''')
+        # Keep ordinary command fixtures within their private tree. The native
+        # Azure VM exercises real syncfs; these tests use file/directory fsync.
+        self.command("sync", r'''
+import os
+from pathlib import Path
+import sys
+root = Path(os.environ["S4_FIXTURE_ROOT"])
+for name in sys.argv[1:]:
+    if name in ("-f", "--"): continue
+    path = Path(name)
+    path.relative_to(root)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
 ''')
         self.command("rpm", r'''
 import hashlib
@@ -221,6 +249,102 @@ update-ca-trust() {{ return 0; }}
 
     def state(self):
         return dict(line.split("=", 1) for line in (self.root / "state/components/bootstrap").read_text().splitlines())
+
+    def durability_model(self):
+        # Model /etc, /usr and /var as separate filesystems. Only successful -f
+        # barriers commit their snapshots. An adverse reboot drops all remaining
+        # changes, including visible renames/links and newly created ancestry.
+        # This is a control-flow/persistence model, not physical power-loss proof.
+        self.command("sync", r'''
+import base64
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+root = Path(os.environ["S4_FIXTURE_ROOT"])
+args = sys.argv[1:]
+operands = [Path(name) for name in args if name not in ("-f", "--")]
+for path in operands: path.relative_to(root)
+wants = root / "units/timers.target.wants"
+failed = bool(os.environ.get("S4_SYNC_FAIL_WANTS") and wants in operands)
+failed |= bool(os.environ.get("S4_SYNC_FAIL_PARENT") and root / "units" in operands)
+failed |= bool(os.environ.get("S4_SYNC_FAIL_RUNNER") and root / "runner" in operands)
+completion = root / "state/finalization"
+failed |= bool(os.environ.get("S4_SYNC_FAIL_COMPLETION") and root / "state" in operands
+               and completion.exists() and completion.read_text() == "status=complete\n")
+if os.environ.get("S4_SYNC_FAIL_ONCE") and wants in operands and not (root / "failed-once").exists():
+    (root / "failed-once").touch(); failed = True
+with (root / "barriers").open("a") as log:
+    log.write(json.dumps({"args": args, "ok": not failed}) + "\n")
+if failed: sys.exit(42)
+if "-f" not in args: sys.exit(0)
+database = root / "durable.json"
+durable = json.loads(database.read_text()) if database.exists() else {}
+for path in operands:
+    scope = path.relative_to(root).parts[0]
+    if scope not in ("units", "runner", "state"): sys.exit(99)
+    filesystem = root / scope
+    snapshot = {}
+    for entry in [filesystem, *filesystem.rglob("*")]:
+        name, mode = str(entry.relative_to(filesystem)), stat.S_IMODE(entry.lstat().st_mode)
+        if entry.is_symlink(): snapshot[name] = ["link", str(entry.readlink()), mode]
+        elif entry.is_dir(): snapshot[name] = ["directory", "", mode]
+        else: snapshot[name] = ["file", base64.b64encode(entry.read_bytes()).decode(), mode]
+    durable[scope] = snapshot
+database.write_text(json.dumps(durable))
+''')
+        self.shell("s4_install_runner; s4_install_units; s4_write_state bootstrap complete 0 0 0")
+
+    def adverse_reboot(self, persist_visible_unit_deletions=False):
+        durable = json.loads((self.root / "durable.json").read_text())
+        # Unsynced deletion is also allowed to survive. Exercise that choice
+        # separately once completion is committed, rather than always rolling back.
+        deleted = []
+        if persist_visible_unit_deletions:
+            for timer in ("azurelinux3s4-repair.timer", "azurelinux3s4-finalization-recovery.timer"):
+                link = self.root / "units/timers.target.wants" / timer
+                if not link.is_symlink(): deleted.append(timer)
+        for scope, snapshot in durable.items():
+            directory = self.root / scope
+            shutil.rmtree(directory)
+            for name, (kind, payload, mode) in sorted(snapshot.items(), key=lambda item: len(Path(item[0]).parts)):
+                path = directory / name
+                if kind == "directory": path.mkdir(mode=mode)
+                elif kind == "link": path.symlink_to(payload)
+                else: path.write_bytes(base64.b64decode(payload)); path.chmod(mode)
+        for timer in deleted:
+            (self.root / "units/timers.target.wants" / timer).unlink(missing_ok=True)
+        for flag in (self.root / "run").glob("*-active"): flag.unlink()
+        for flag in (self.root / "run").glob("*-enabled"): flag.unlink()
+        activators = []
+        for link in sorted((self.root / "units/timers.target.wants").glob("*.timer")):
+            if not link.is_symlink() or not link.is_file(): continue
+            policy = link.read_text()
+            self.assertIn("WantedBy=timers.target", policy)
+            self.assertIn("OnBootSec=", policy)
+            self.assertIn("Unit=azurelinux3s4-repair.service", policy)
+            service = (self.root / "units/azurelinux3s4-repair.service").read_text()
+            self.assertIn("ExecStart=/bin/bash " + str(self.root / "runner/azurelinux3s4.sh") + " --repair", service)
+            self.assertEqual((self.root / "runner/azurelinux3s4.sh").read_bytes(), SCRIPT.read_bytes())
+            kind = "recovery" if "finalization-recovery" in link.name else "timer"
+            (self.root / ("run/" + kind + "-active")).touch()
+            (self.root / ("run/" + kind + "-enabled")).touch()
+            activators.append(link.name)
+        return activators
+
+    def resume_boot_worker(self):
+        # Dispatch the persisted worker, using the same fixture commands and
+        # trusted-variable overrides. Component health is already closed/scoped.
+        header = self.header.replace(shlex.quote(str(SCRIPT)),
+                                     shlex.quote(str(self.root / "runner/azurelinux3s4.sh")), 1)
+        result = subprocess.run(["bash", "-c", header + "\ns4_lock; s4_verify_bootstrap() { return 0; }; s4_repair no"],
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
+        self.assertEqual(list((self.root / "units/timers.target.wants").glob("*.timer")), [])
+        self.assertFalse((self.root / "run/timer-active").exists())
+        self.assertFalse((self.root / "run/recovery-active").exists())
 
     def test_nonroot_main_refuses_before_mutating(self):
         if os.geteuid() == 0:
@@ -403,6 +527,195 @@ update-ca-trust() {{ return 0; }}
         }; s4_finish_repair''', expected=75)
         self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
         self.shell('s4_timer_state enabled active')
+
+    def test_failed_retry_link_barriers_never_certify_visible_boot_recovery(self):
+        self.durability_model()
+        result = self.shell('''systemctl disable --now "$S4_REPAIR_TIMER"
+            sync -f -- "$S4_SYSTEMD_DIR"
+            export S4_SYNC_FAIL_WANTS=1 S4_ENABLE_FAILURE=43 S4_QUERY_FAILURE=42
+            s4_restore_repair_timer''')
+        self.assertTrue((self.root / "units/timers.target.wants/azurelinux3s4-repair.timer").is_symlink())
+        self.assertFalse((self.root / "run/timer-active").exists())
+        barriers = [json.loads(line) for line in (self.root / "barriers").read_text().splitlines()]
+        failures = [item for item in barriers if not item["ok"]]
+        self.assertEqual(len(failures), 2)  # creation and the existing-link fallback
+        for item in failures:
+            self.assertIn(str(self.root / "units/timers.target.wants"), item["args"])
+            self.assertIn(str(self.root / "units"), item["args"])
+        self.assertNotIn("Boot retry activation is verified", result.stderr)
+        self.assertIn("could not be preserved", result.stderr)
+        self.assertEqual(self.adverse_reboot(), [])  # unflushed visible link is lost
+
+    def test_existing_link_recovery_requires_a_successful_new_barrier(self):
+        self.durability_model()
+        result = self.shell('''systemctl disable --now "$S4_REPAIR_TIMER"
+            sync -f -- "$S4_SYSTEMD_DIR"
+            export S4_SYNC_FAIL_ONCE=1 S4_ENABLE_FAILURE=43
+            s4_restore_repair_timer''')
+        self.assertIn("Boot retry activation is verified", result.stderr)
+        barriers = [json.loads(line) for line in (self.root / "barriers").read_text().splitlines()]
+        self.assertEqual([item["ok"] for item in barriers[-2:]], [False, True])
+        self.assertIn("azurelinux3s4-repair.timer", self.adverse_reboot())
+        self.resume_boot_worker()
+
+    def test_enablement_parent_barrier_failure_is_not_recovery_proof(self):
+        self.durability_model()
+        result = self.shell('''systemctl disable --now "$S4_REPAIR_TIMER"
+            sync -f -- "$S4_SYSTEMD_DIR"
+            export S4_SYNC_FAIL_PARENT=1
+            s4_restore_repair_timer''')
+        self.assertNotIn("Boot retry activation is verified", result.stderr)
+        self.assertEqual(self.adverse_reboot(), [])
+
+    def test_matching_completion_content_still_requires_persistence(self):
+        self.durability_model()
+        self.shell("printf 'status=pending\\n' | s4_atomic_write \"$S4_STATE/finalization\" 0600")
+        self.shell("export S4_SYNC_FAIL_COMPLETION=1; printf 'status=complete\\n' | s4_atomic_write \"$S4_STATE/finalization\" 0600",
+                   expected=42)
+        inode = (self.root / "state/finalization").stat().st_ino
+        self.shell("export S4_SYNC_FAIL_COMPLETION=1; printf 'status=complete\\n' | s4_atomic_write \"$S4_STATE/finalization\" 0600",
+                   expected=42)
+        self.assertEqual((self.root / "state/finalization").stat().st_ino, inode)
+        self.assertIn("azurelinux3s4-repair.timer", self.adverse_reboot())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+        self.resume_boot_worker()
+
+    def test_independent_recovery_must_be_observed_before_primary_disable(self):
+        for setting in ("S4_RECOVERY_ENABLE_FAILURE=43", "S4_RECOVERY_QUERY_FAILURE=42",
+                        "S4_RECOVERY_FILE_STATE=enabled-runtime", "S4_RECOVERY_ACTIVE_STATE=inactive"):
+            with self.subTest(setting=setting):
+                (self.root / "events").unlink(missing_ok=True)
+                result = self.shell("export " + setting + "; s4_finish_repair", expected=75)
+                self.assertIn("Independent finalization recovery could not be verified", result.stderr)
+                self.assertNotIn("disable", (self.root / "events").read_text())
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+                self.shell("s4_timer_state enabled active")
+
+    def test_recovery_payload_persistence_failure_keeps_original_boot_activator(self):
+        self.durability_model()
+        (self.root / "events").unlink()
+        self.shell("export S4_SYNC_FAIL_RUNNER=1; s4_finish_repair", expected=75)
+        self.assertNotIn("disable", (self.root / "events").read_text())
+        self.assertIn("azurelinux3s4-repair.timer", self.adverse_reboot())
+        self.resume_boot_worker()
+
+    def test_foreign_recovery_link_is_preserved_before_primary_disable(self):
+        self.shell("s4_start_repair_timer")
+        link = self.root / "units/timers.target.wants/azurelinux3s4-finalization-recovery.timer"
+        link.symlink_to(self.root / "rpm-key")
+        self.shell("s4_finish_repair", expected=75)
+        self.assertEqual(link.readlink(), self.root / "rpm-key")
+        self.assertNotIn("disable", (self.root / "events").read_text())
+        self.shell("s4_timer_state enabled active")
+
+    def test_interruptions_around_disable_and_observation_recover_at_boot(self):
+        wrappers = {
+            "before-disable": '''saved=$(declare -f s4_stop_timer); eval "${saved/s4_stop_timer/original_stop_timer}"
+                s4_stop_timer() { [[ $1 != "$S4_REPAIR_TIMER" ]] || exit 99; original_stop_timer "$@"; }''',
+            "after-disable-before-observation": '''saved=$(declare -f s4_timer_state); eval "${saved/s4_timer_state/original_timer_state}"
+                s4_timer_state() { if [[ $1 == disabled && $3 == "$S4_REPAIR_TIMER" ]]; then exit 99; fi; original_timer_state "$@"; }''',
+            "after-observation-before-persistence": '''saved=$(declare -f s4_timer_state); eval "${saved/s4_timer_state/original_timer_state}"
+                s4_timer_state() { original_timer_state "$@" || return $?; if [[ $1 == disabled && $3 == "$S4_REPAIR_TIMER" ]]; then exit 99; fi; }''',
+            "after-durable-disable": '''saved=$(declare -f s4_stop_timer); eval "${saved/s4_stop_timer/original_stop_timer}"
+                s4_stop_timer() { original_stop_timer "$@" || return $?; [[ $1 != "$S4_REPAIR_TIMER" ]] || exit 99; }''',
+        }
+        for checkpoint, wrapper in wrappers.items():
+            with self.subTest(checkpoint=checkpoint):
+                self.durability_model()
+                self.shell(wrapper + "\ns4_finish_repair", expected=99)
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+                self.assertTrue((self.root / "run/recovery-active").exists())
+                self.assertIn("azurelinux3s4-finalization-recovery.timer", self.adverse_reboot())
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+                self.resume_boot_worker()
+
+    def test_process_kill_around_completion_rename_preserves_pending_recovery(self):
+        self.command("mv", r'''
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+source, destination = Path(sys.argv[-2]), Path(sys.argv[-1])
+completion = destination.name == "finalization" and source.read_text() == "status=complete\n"
+if completion and os.environ.get("S4_KILL_CHECKPOINT") == "before-rename":
+    os.kill(int(os.environ["S4_WORKER_PID"]), signal.SIGKILL); sys.exit(99)
+result = subprocess.run(["/usr/bin/mv", *sys.argv[1:]])
+if completion and os.environ.get("S4_KILL_CHECKPOINT") == "after-rename":
+    os.kill(int(os.environ["S4_WORKER_PID"]), signal.SIGKILL); sys.exit(99)
+sys.exit(result.returncode)
+''')
+        for checkpoint in ("before-rename", "after-rename"):
+            with self.subTest(checkpoint=checkpoint):
+                self.durability_model()
+                self.shell("export S4_WORKER_PID=$BASHPID S4_KILL_CHECKPOINT=" + checkpoint + "; s4_finish_repair", expected=-9)
+                self.assertIn("azurelinux3s4-finalization-recovery.timer", self.adverse_reboot())
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+                self.resume_boot_worker()
+
+    def test_failed_completion_barrier_keeps_recovery_across_reboot(self):
+        self.durability_model()
+        self.shell("export S4_SYNC_FAIL_COMPLETION=1; s4_finish_repair", expected=75)
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")  # visible only
+        self.assertIn("azurelinux3s4-finalization-recovery.timer", self.adverse_reboot())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+        self.resume_boot_worker()
+
+    def test_interruptions_during_restoration_retain_independent_recovery(self):
+        for stage in ("before", "after"):
+            with self.subTest(stage=stage):
+                self.durability_model()
+                prefix = "saved=$(declare -f s4_restore_repair_timer); eval \"${saved/s4_restore_repair_timer/original_restore}\"\n"
+                body = 'original_restore "$@"; exit 99' if stage == "after" else "exit 99"
+                self.shell(prefix + "s4_restore_repair_timer() { " + body + "; }; export S4_PRIMARY_QUERY_FAILURE=42; s4_finish_repair",
+                           expected=99)
+                self.assertIn("azurelinux3s4-finalization-recovery.timer", self.adverse_reboot())
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+                self.resume_boot_worker()
+
+    def test_durable_completion_precedes_recovery_retirement(self):
+        for stage in ("before-retirement", "after-retirement-rollback", "after-retirement-persist"):
+            with self.subTest(stage=stage):
+                self.durability_model()
+                if stage == "before-retirement":
+                    wrapper = '''saved=$(declare -f s4_stop_timer); eval "${saved/s4_stop_timer/original_stop_timer}"
+                        s4_stop_timer() { [[ $1 != "$S4_RECOVERY_TIMER" ]] || exit 99; original_stop_timer "$@"; }'''
+                else:
+                    wrapper = '''saved=$(declare -f s4_timer_state); eval "${saved/s4_timer_state/original_timer_state}"
+                        s4_timer_state() { if [[ $1 == disabled && $3 == "$S4_RECOVERY_TIMER" ]]; then exit 99; fi; original_timer_state "$@"; }'''
+                self.shell(wrapper + "\ns4_finish_repair", expected=99)
+                activators = self.adverse_reboot(persist_visible_unit_deletions=stage == "after-retirement-persist")
+                self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
+                if stage == "after-retirement-persist":
+                    self.assertEqual(activators, [])  # all work was durably committed first
+                else:
+                    self.assertIn("azurelinux3s4-finalization-recovery.timer", activators)
+                    self.resume_boot_worker()
+
+    def test_recovery_cleanup_query_error_preserves_completion_and_boot_cleanup(self):
+        self.durability_model()
+        result = self.shell('''saved=$(declare -f s4_timer_state); eval "${saved/s4_timer_state/original_timer_state}"
+            s4_timer_state() { if [[ $1 == disabled && $3 == "$S4_RECOVERY_TIMER" ]]; then return 42; fi; original_timer_state "$@"; }
+            s4_finish_repair''', expected=75)
+        self.assertIn("Completion is durable", result.stderr)
+        self.assertNotIn("its repair timer has stopped", result.stderr)
+        self.assertIn("azurelinux3s4-finalization-recovery.timer", self.adverse_reboot())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
+        self.resume_boot_worker()
+
+    def test_stopping_last_timer_accepts_removed_empty_wants_directory(self):
+        self.shell("s4_install_units; export S4_REMOVE_EMPTY_WANTS=1; s4_finish_repair")
+        self.assertFalse((self.root / "units/timers.target.wants").exists())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
+
+    def test_stop_refuses_foreign_link_without_removing_operator_object(self):
+        self.shell("s4_start_repair_timer")
+        link = self.root / "units/timers.target.wants/azurelinux3s4-repair.timer"
+        link.unlink()
+        link.symlink_to(self.root / "rpm-key")
+        self.shell('s4_stop_timer "$S4_REPAIR_TIMER"', expected=78)
+        self.assertEqual(link.readlink(), self.root / "rpm-key")
+        self.assertNotIn("disable", (self.root / "events").read_text())
 
     def test_empty_malformed_and_unloaded_timer_observations_fail(self):
         self.command("systemctl", "import sys\nsys.exit(0)\n")
@@ -609,12 +922,17 @@ update-ca-trust() {{ return 0; }}
         self.shell("s4_install_units")
         service = (self.root / "units/azurelinux3s4-repair.service").read_text()
         timer = (self.root / "units/azurelinux3s4-repair.timer").read_text()
+        recovery = (self.root / "units/azurelinux3s4-finalization-recovery.timer").read_text()
         self.assertIn("KillMode=control-group", service)
         self.assertIn("TimeoutStartSec=20min", service)
         self.assertNotIn("network-online.target", service)
         self.assertIn("OnBootSec=2min", timer)
         self.assertIn("OnUnitInactiveSec=1min", timer)
         self.assertIn("RandomizedDelaySec=30s", timer)
+        for setting in ("OnBootSec=1min", "OnActiveSec=1min", "OnUnitInactiveSec=1min",
+                        "Unit=azurelinux3s4-repair.service", "WantedBy=timers.target"):
+            self.assertIn(setting, recovery)
+        self.assertNotIn("network-online.target", recovery)
 
     def test_status_never_claims_full_hardening(self):
         self.shell("s4_verify_bootstrap() { return 0; }; s4_reconcile_component bootstrap yes")

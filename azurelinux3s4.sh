@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.1.1
+S4_VERSION=0.1.2
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -16,6 +16,7 @@ S4_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.trust.crt
 S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
+S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
 S4_COMPONENTS=(bootstrap)
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
@@ -105,14 +106,17 @@ s4_atomic_write() {
     fi
     if [[ -f $path ]] && cmp -s -- "$temporary" "$path"; then
         rm -f -- "$temporary"
-        chmod "$mode" "$path"
+        chmod "$mode" "$path" || return $?
+        # A previous rename may be visible despite a failed persistence barrier.
+        # Matching content must satisfy the same barrier as a new publication.
+        sync "$path" || return $?
     else
         if ! sync "$temporary" || ! mv -fT -- "$temporary" "$path"; then
             rm -f -- "$temporary"
             return 1
         fi
-        sync "$(dirname -- "$path")"
     fi
+    timeout --kill-after=5s 30s sync -f -- "$(dirname -- "$path")"
 }
 
 s4_prepare_state() {
@@ -539,6 +543,21 @@ Unit=azurelinux3s4-repair.service
 [Install]
 WantedBy=timers.target
 EOF
+    s4_atomic_write "$S4_SYSTEMD_DIR/$S4_RECOVERY_TIMER" 0644 <<'EOF' || return $?
+[Unit]
+Description=Recover interrupted Azure Linux 3 setup finalization
+
+[Timer]
+OnBootSec=1min
+OnActiveSec=1min
+OnUnitInactiveSec=1min
+RandomizedDelaySec=10s
+AccuracySec=5s
+Unit=azurelinux3s4-repair.service
+
+[Install]
+WantedBy=timers.target
+EOF
     # OnBootSec makes an offline reboot resume work; no network-online gate stalls
     # timer installation. Failed one-shots remain eligible for the next attempt.
     timeout --kill-after=5s 30s systemctl daemon-reload || return $?
@@ -546,9 +565,9 @@ EOF
 }
 
 s4_timer_state() {
-    local enabled=$1 active=$2 observed
+    local enabled=$1 active=$2 unit=${3:-$S4_REPAIR_TIMER} observed
     observed=$(timeout --kill-after=5s 30s systemctl show --no-pager \
-        --property=LoadState,UnitFileState,ActiveState "$S4_REPAIR_TIMER") || return 1
+        --property=LoadState,UnitFileState,ActiveState "$unit") || return 1
     # A query error or an unexpected state is never evidence of completion.
     # enabled-runtime does not establish persistence across reboot.
     awk -F= -v enabled="$enabled" -v active="$active" '
@@ -561,9 +580,10 @@ s4_timer_state() {
 }
 
 s4_preserve_retry_link() {
-    local directory=$S4_SYSTEMD_DIR/timers.target.wants link target
-    target=$S4_SYSTEMD_DIR/$S4_REPAIR_TIMER
-    link=$directory/$S4_REPAIR_TIMER
+    local unit=${1:-$S4_REPAIR_TIMER} directory=$S4_SYSTEMD_DIR/timers.target.wants link target
+    [[ $unit == "$S4_REPAIR_TIMER" || $unit == "$S4_RECOVERY_TIMER" ]] || return 78
+    target=$S4_SYSTEMD_DIR/$unit
+    link=$directory/$unit
     s4_safe_path "$target" || return $?
     [[ -f $target ]] || return 78
     s4_directory "$directory" 0755 || return $?
@@ -572,32 +592,90 @@ s4_preserve_retry_link() {
     else
         [[ ! -e $link ]] || return 78
         ln -s -- "$target" "$link" || return $?
-        sync "$directory" || return $?
     fi
+    # Visibility is not durability, including on a repeated recovery attempt.
+    # syncfs covers the link and newly created ancestry on their filesystems.
+    timeout --kill-after=5s 30s sync -f -- "$directory" "$S4_SYSTEMD_DIR" || return $?
     [[ -L $link && $(readlink -f -- "$link") == "$target" ]]
 }
 
-s4_start_repair_timer() {
+s4_start_timer() {
+    local unit=$1
     # Retain a checked boot activation link even when the manager is unavailable
     # or a failed disable operation removed the previous link before failing.
-    s4_preserve_retry_link || return $?
-    timeout --kill-after=5s 30s systemctl enable --now "$S4_REPAIR_TIMER" || return $?
-    s4_preserve_retry_link || return $?
-    s4_timer_state enabled active
+    s4_preserve_retry_link "$unit" || return $?
+    timeout --kill-after=5s 30s systemctl enable --now "$unit" || return $?
+    s4_preserve_retry_link "$unit" || return $?
+    s4_timer_state enabled active "$unit"
+}
+
+s4_start_repair_timer() {
+    s4_start_timer "$S4_REPAIR_TIMER"
+}
+
+s4_arm_finalization_recovery() {
+    local path
+    # These may reside on different filesystems. Flush executable/unit payloads
+    # and their ancestry before relying on a boot activation link.
+    for path in "$S4_INSTALL_DIR/azurelinux3s4.sh" \
+                "$S4_SYSTEMD_DIR/azurelinux3s4-repair.service" \
+                "$S4_SYSTEMD_DIR/$S4_RECOVERY_TIMER"; do
+        s4_safe_path "$path" || return $?
+        [[ -f $path ]] || return 78
+    done
+    timeout --kill-after=5s 30s sync -f -- "$S4_INSTALL_DIR" "$S4_SYSTEMD_DIR" "$S4_STATE" || return $?
+    s4_start_timer "$S4_RECOVERY_TIMER"
+}
+
+s4_stop_timer() {
+    local unit=$1 directory=$S4_SYSTEMD_DIR/timers.target.wants link
+    [[ $unit == "$S4_REPAIR_TIMER" || $unit == "$S4_RECOVERY_TIMER" ]] || return 78
+    link=$directory/$unit
+    s4_safe_path "$directory" || return $?
+    # Do not let systemctl remove an operator's wrong-kind or foreign object.
+    if [[ -L $link ]]; then
+        [[ $(readlink -f -- "$link") == "$S4_SYSTEMD_DIR/$unit" ]] || return 78
+    else
+        [[ ! -e $link ]] || return 78
+    fi
+    timeout --kill-after=5s 30s systemctl disable --now "$unit" || return $?
+    s4_timer_state disabled inactive "$unit" || return 1
+    [[ ! -e $link && ! -L $link ]] || return 1
+    if [[ -d $directory ]]; then
+        timeout --kill-after=5s 30s sync -f -- "$directory" "$S4_SYSTEMD_DIR" || return $?
+    else
+        # systemctl may remove the empty wants directory along with its last link.
+        timeout --kill-after=5s 30s sync -f -- "$S4_SYSTEMD_DIR" || return $?
+    fi
+    [[ ! -e $link && ! -L $link ]]
 }
 
 s4_finish_repair() {
     local result=0
+    # Keep the original boot activation until independent recovery is durable
+    # and positively observed active. Never remove the last pending activator.
+    s4_preserve_retry_link || return 75
     if ! printf 'status=pending\n' | s4_atomic_write "$S4_STATE/finalization" 0600; then
         s4_restore_repair_timer
         return 75
     fi
-    if timeout --kill-after=5s 30s systemctl disable --now "$S4_REPAIR_TIMER"; then
-        if s4_timer_state disabled inactive; then
-            if printf 'status=complete\n' | s4_atomic_write "$S4_STATE/finalization" 0600; then
-                s4_log 'Bootstrap verified; its repair timer has stopped.'
+    if ! s4_arm_finalization_recovery; then
+        s4_log 'Independent finalization recovery could not be verified; keeping automatic repair.'
+        s4_restore_repair_timer
+        return 75
+    fi
+    if s4_stop_timer "$S4_REPAIR_TIMER"; then
+        if printf 'status=complete\n' | s4_atomic_write "$S4_STATE/finalization" 0600; then
+            # Recovery intent is the independent boot link. Retire it only after
+            # completion is durable. A crash before this cleanup re-runs the same
+            # locked, health-checking worker and finishes cleanup automatically.
+            if s4_stop_timer "$S4_RECOVERY_TIMER"; then
+                s4_log 'Bootstrap verified; its repair timer has stopped. Finalization recovery has stopped.'
                 return 0
             fi
+            s4_log 'Completion is durable; finalization recovery timer cleanup remains pending.'
+            s4_restore_repair_timer "$S4_RECOVERY_TIMER"
+            return 75
         fi
         result=1
     else
@@ -609,9 +687,10 @@ s4_finish_repair() {
 }
 
 s4_restore_repair_timer() {
-    if ! s4_start_repair_timer; then
-        if s4_preserve_retry_link; then
-            s4_log 'Boot retry activation is verified; runtime activation could not be verified.'
+    local unit=${1:-$S4_REPAIR_TIMER}
+    if ! s4_start_timer "$unit"; then
+        if s4_preserve_retry_link "$unit"; then
+            s4_log "Boot retry activation is verified for $unit; runtime activation could not be verified."
         else
             s4_log 'Automatic retry activation could not be preserved.'
         fi
