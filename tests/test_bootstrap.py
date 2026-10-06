@@ -1,7 +1,12 @@
+import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import socket
+import shutil
+import stat
 import tempfile
 import unittest
 
@@ -10,6 +15,28 @@ SCRIPT = Path(__file__).resolve().parents[1] / "azurelinux3s4.sh"
 
 
 class BootstrapTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cache = Path.home() / ".cache"
+        cache.mkdir(mode=0o700, exist_ok=True)
+        cls.compiled = tempfile.TemporaryDirectory(prefix="azurelinux3s4-elf-", dir=cache)
+        cls.addClassCleanup(cls.compiled.cleanup)
+        root = Path(cls.compiled.name)
+        cls.dependency = root / "libfixturedependency.so"
+        cls.library = root / "libtdnfrepogpgcheck.so"
+        subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-", "-o", str(cls.dependency)],
+                       input="void fixture_dependency(void) {}\n", text=True, check=True, capture_output=True)
+        subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-", "-L", str(root),
+                        "-lfixturedependency", "-Wl,-rpath,$ORIGIN", "-o", str(cls.library)],
+                       input="""#include <stdint.h>
+extern void fixture_dependency(void);
+uint32_t TDNFPluginLoadInterface(void **functions) {
+    fixture_dependency();
+    for (int i=0; i<5; i++) functions[i] = fixture_dependency;
+    return 0;
+}
+""", text=True, check=True, capture_output=True)
+
     def setUp(self):
         original_umask = os.umask(0o077)
         self.addCleanup(os.umask, original_umask)
@@ -19,14 +46,138 @@ class BootstrapTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="azurelinux3s4-test-", dir=cache)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for name in ("state", "state/components", "state/repos", "run", "runner", "units", "systemd"):
+        for name in ("state", "state/components", "state/repos", "run", "runner", "units", "systemd",
+                     "bin", "plugin", "pluginconf"):
             (self.root / name).mkdir(mode=0o700)
         (self.root / "rpm-key").write_text("fixture key; no real transactions are performed\n")
         bundle = next(path for path in (Path('/etc/ssl/certs/ca-certificates.crt'),
             Path('/etc/pki/tls/certs/ca-bundle.crt')) if path.exists())
         (self.root / 'ca-bundle').write_bytes(bundle.read_bytes())
-        (self.root / 'plugin-library').write_text('fixture; no dynamic library is executed\n')
-        (self.root / 'plugin-config').write_text('[main]\nenabled=1\n')
+        self.plugin = self.root / "plugin/libtdnfrepogpgcheck.so"
+        self.plugin_dependency = self.root / "plugin/libfixturedependency.so"
+        shutil.copyfile(self.library, self.plugin)
+        shutil.copyfile(self.dependency, self.plugin_dependency)
+        self.plugin_config = self.root / "pluginconf/tdnfrepogpgcheck.conf"
+        self.plugin_config.write_text('[main]\nenabled=1\n')
+        self.database = {"files": {"tdnf-plugin-repogpgcheck": {str(self.plugin): self.digest(self.plugin)},
+                                   "plugin-dependency": {str(self.plugin_dependency): self.digest(self.plugin_dependency)}},
+                         "verification": {}}
+        self.write_database()
+        (self.root / "units/azurelinux3s4-repair.timer").write_text("fixture timer\n")
+        self.command("systemctl", r'''
+import os
+from pathlib import Path
+import sys
+root = Path(os.environ["S4_FIXTURE_ROOT"])
+args = sys.argv[1:]
+with (root / "events").open("a") as log:
+    log.write(" ".join(args) + "\n")
+enabled, active = root / "run/timer-enabled", root / "run/timer-active"
+if args[0] == "daemon-reload":
+    sys.exit(int(os.environ.get("S4_DAEMON_FAILURE", "0")))
+if args[0] == "enable":
+    enabled.touch(); active.touch()
+    sys.exit(int(os.environ.get("S4_ENABLE_FAILURE", "0")))
+if args[0] == "disable":
+    enabled.unlink(missing_ok=True); active.unlink(missing_ok=True)
+    (root / "units/timers.target.wants/azurelinux3s4-repair.timer").unlink(missing_ok=True)
+    sys.exit(int(os.environ.get("S4_DISABLE_FAILURE", "0")))
+if args[0] == "show":
+    if os.environ.get("S4_QUERY_FAILURE"):
+        print("manager query failed", file=sys.stderr)
+        sys.exit(int(os.environ["S4_QUERY_FAILURE"]))
+    print("LoadState=" + os.environ.get("S4_LOAD_STATE", "loaded"))
+    print("UnitFileState=" + os.environ.get("S4_FILE_STATE", "enabled" if enabled.exists() else "disabled"))
+    print("ActiveState=" + os.environ.get("S4_ACTIVE_STATE", "active" if active.exists() else "inactive"))
+    sys.exit(0)
+sys.exit(99)
+''')
+        self.command("rpm", r'''
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+data = json.loads((Path(os.environ["S4_FIXTURE_ROOT"]) / "rpm-database.json").read_text())
+args, package = sys.argv[1:], sys.argv[-1]
+packages = {"tdnf-plugin-repogpgcheck", "tdnf", "gnupg2", "plugin-dependency"}
+if "--requires" in args:
+    if package not in packages: sys.exit(1)
+    if package == "tdnf-plugin-repogpgcheck":
+        print("plugin-dependency >= 1\nrpmlib(PayloadIsZstd) <= 5.4.18-1")
+    if package == "tdnf": print("config(tdnf) = 3.5.8")
+    sys.exit(0)
+if "--whatprovides" in args:
+    if package == "config(tdnf)": package = "tdnf"
+    if package not in packages: sys.exit(1)
+    print(package); sys.exit(0)
+if "--qf" in args:
+    for name in data["files"].get(package, {}):
+        print(name + "\t33188\t0")
+    for name, mode, flags in data.get("manifest", {}).get(package, []):
+        print(f"{name}\t{mode}\t{flags}")
+    sys.exit(0)
+if args[0] == "-V":
+    if package in data["verification"]:
+        result = data["verification"][package]
+        print(result.get("stdout", ""), end="")
+        print(result.get("stderr", ""), end="", file=sys.stderr)
+        sys.exit(result["exit"])
+    for name, digest in data["files"].get(package, {}).items():
+        path = Path(name)
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            print("..5......   " + name); sys.exit(1)
+    sys.exit(0)
+if args[0] == "-q": sys.exit(0)
+sys.exit(99)
+''')
+        self.command("gpg2", "import sys\nsys.exit(0)\n")
+        # The host has no native Azure tdnf. This command fixture exercises the
+        # probe's control and evidence rules and actually loads the ELF fixtures.
+        # Native tdnf participation is also validated separately in the local VM.
+        self.command("tdnf", r'''
+import ctypes
+import gzip
+import os
+from pathlib import Path
+import sys
+import time
+import xml.etree.ElementTree as ET
+args = sys.argv[1:]
+config = dict(line.split("=", 1) for line in Path(args[args.index("-c")+1]).read_text().splitlines() if "=" in line)
+home = Path(os.environ.get("GNUPGHOME", ""))
+if home != Path(config["persistdir"]).parent / "gnupg": sys.exit(98)
+if home.stat().st_mode & 0o777 != 0o700: sys.exit(98)
+if "no-autostart\ndisable-dirmngr\n" not in (home / "gpg.conf").read_text(): sys.exit(98)
+repo = Path(config["repodir"]) / "probe.repo"
+if repo.exists():
+    metadata = Path(dict(line.split("=", 1) for line in repo.read_text().splitlines() if "=" in line)["baseurl"].removeprefix("file://"))
+    ET.fromstring((metadata / "repodata/repomd.xml").read_bytes())
+    ET.fromstring(gzip.decompress((metadata / "repodata/primary.xml.gz").read_bytes()))
+else:
+    sys.exit(99)
+if "--noplugins" in args: sys.exit(int(os.environ.get("S4_CONTROL_FAILURE", "0")))
+mode = os.environ.get("S4_TDNF_MODE", "verified")
+if mode == "hang": time.sleep(100)
+if mode == "bypass": sys.exit(0)
+try:
+    library = ctypes.CDLL(str(Path(config["pluginpath"]) / "libtdnfrepogpgcheck.so"))
+    interface = library.TDNFPluginLoadInterface
+    functions = (ctypes.c_void_p * 5)()
+    interface.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    interface.restype = ctypes.c_uint32
+    if interface(functions) or not all(functions): sys.exit(0)
+except (OSError, AttributeError):
+    print("Error loading plugin")
+    sys.exit(0)  # upstream tdnf's fail-open behavior
+print("Loaded plugin: tdnfrepogpgcheck")
+if mode == "load-only": sys.exit(1)
+if mode == "engine-error":
+    print("gpg verify failed: Invalid crypto engine\nError: TDNFVerifySignature 2003")
+else:
+    print("gpg verify failed: No data\nError: TDNFVerifySignature 2003")
+sys.exit(1)
+''')
         self.header = f"""
 source {shlex.quote(str(SCRIPT))}
 S4_STATE={shlex.quote(str(self.root / 'state'))}
@@ -37,28 +188,33 @@ S4_OS_RELEASE={shlex.quote(str(self.root / 'os-release'))}
 S4_SYSTEMD_RUNTIME={shlex.quote(str(self.root / 'systemd'))}
 S4_GPG_KEY={shlex.quote(str(self.root / 'rpm-key'))}
 S4_CA_BUNDLE={shlex.quote(str(self.root / 'ca-bundle'))}
-S4_PLUGIN_LIBRARY={shlex.quote(str(self.root / 'plugin-library'))}
-S4_PLUGIN_CONFIG={shlex.quote(str(self.root / 'plugin-config'))}
+S4_PLUGIN_LIBRARY={shlex.quote(str(self.plugin))}
+S4_PLUGIN_CONFIG={shlex.quote(str(self.plugin_config))}
+export S4_FIXTURE_ROOT={shlex.quote(str(self.root))}
+export PATH={shlex.quote(str(self.root / 'bin'))}:$PATH
 S4_ARCH=x86_64
 S4_NOW=1000000
 update-ca-trust() {{ return 0; }}
-systemctl() {{
-    printf '%s\\n' "$*" >> {shlex.quote(str(self.root / 'events'))}
-    case $1 in
-        enable) touch "$S4_RUN/timer-enabled" ;;
-        disable) rm -f "$S4_RUN/timer-enabled" ;;
-        is-enabled|is-active) [[ -f $S4_RUN/timer-enabled ]] ;;
-        *) return 0 ;;
-    esac
-}}
 """
 
-    def shell(self, body, expected=0):
+    @staticmethod
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def write_database(self):
+        (self.root / "rpm-database.json").write_text(json.dumps(self.database))
+
+    def command(self, name, program):
+        path = self.root / "bin" / name
+        path.write_text("#!/usr/bin/python3\n" + program.lstrip())
+        path.chmod(0o700)
+
+    def shell(self, body, expected=0, timeout=30):
         result = subprocess.run(
             ["bash", "-c", self.header + "\n" + body],
             text=True,
             capture_output=True,
-            timeout=15,
+            timeout=timeout,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
@@ -187,6 +343,7 @@ systemctl() {{
         events = (self.root / "events").read_text()
         self.assertIn("disable --now azurelinux3s4-repair.timer", events)
         self.assertFalse((self.root / "run/timer-enabled").exists())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
 
     def test_failure_keeps_repair_timer_enabled(self):
         self.shell("s4_verify_bootstrap() { return 1; }; s4_run_component() { return 1; }; s4_repair yes", expected=75)
@@ -194,33 +351,189 @@ systemctl() {{
         self.assertNotIn("disable", (self.root / "events").read_text())
 
     def test_timer_stop_is_verified(self):
-        self.shell('s4_verify_bootstrap() { return 0; }; systemctl() { return 0; }; s4_repair no', expected=75)
+        self.shell('s4_verify_bootstrap() { return 0; }; export S4_ACTIVE_STATE=active; s4_repair no', expected=75)
+
+    def test_timer_query_error_preserves_pending_boot_retry(self):
+        result = self.shell('s4_verify_bootstrap() { return 0; }; export S4_QUERY_FAILURE=42; s4_repair no', expected=75)
+        self.assertNotIn("its repair timer has stopped", result.stderr)
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+        self.assertEqual((self.root / "units/timers.target.wants/azurelinux3s4-repair.timer").resolve(),
+                         self.root / "units/azurelinux3s4-repair.timer")
+
+    def test_timer_persistent_and_runtime_states_are_distinct(self):
+        for state in ("enabled", "enabled-runtime", "masked", "not-found", "static"):
+            with self.subTest(state=state):
+                result = self.shell('s4_verify_bootstrap() { return 0; }; export S4_FILE_STATE='
+                                    + shlex.quote(state) + '; s4_repair no', expected=75)
+                self.assertNotIn("its repair timer has stopped", result.stderr)
+        self.shell('export S4_FILE_STATE=disabled S4_ACTIVE_STATE=active; s4_timer_state disabled inactive', expected=1)
+        self.shell('export S4_FILE_STATE=enabled-runtime S4_ACTIVE_STATE=active; s4_timer_state enabled active', expected=1)
+
+    def test_partial_disable_failure_restores_verified_retry(self):
+        self.shell('s4_verify_bootstrap() { return 0; }; export S4_DISABLE_FAILURE=42; s4_repair no', expected=75)
+        self.shell('s4_timer_state enabled active')
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+        self.assertTrue((self.root / "units/timers.target.wants/azurelinux3s4-repair.timer").is_symlink())
+
+    def test_manager_activation_failure_retains_checked_boot_link(self):
+        self.shell('s4_verify_bootstrap() { return 0; }; export S4_QUERY_FAILURE=42 S4_ENABLE_FAILURE=43; s4_repair no', expected=75)
+        self.assertTrue((self.root / "units/timers.target.wants/azurelinux3s4-repair.timer").is_symlink())
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+
+    def test_retry_link_does_not_replace_foreign_objects(self):
+        directory = self.root / "units/timers.target.wants"
+        directory.mkdir()
+        link = directory / "azurelinux3s4-repair.timer"
+        link.write_text("operator object")
+        self.shell('s4_start_repair_timer', expected=78)
+        self.assertEqual(link.read_text(), "operator object")
+        link.unlink()
+        link.symlink_to(self.root / "rpm-key")
+        self.shell('s4_start_repair_timer', expected=78)
+        self.assertEqual(link.readlink(), self.root / "rpm-key")
+
+    def test_finalization_write_failure_restores_retry(self):
+        self.shell('s4_atomic_write() { return 42; }; s4_finish_repair', expected=75)
+        self.shell('s4_timer_state enabled active')
+
+    def test_completion_write_failure_restores_retry_and_keeps_pending(self):
+        self.shell('''s4_atomic_write() {
+            if [[ -f $S4_STATE/finalization ]]; then return 42; fi
+            command cat >"$1"
+        }; s4_finish_repair''', expected=75)
+        self.assertEqual((self.root / "state/finalization").read_text(), "status=pending\n")
+        self.shell('s4_timer_state enabled active')
+
+    def test_empty_malformed_and_unloaded_timer_observations_fail(self):
+        self.command("systemctl", "import sys\nsys.exit(0)\n")
+        self.shell('s4_timer_state disabled inactive', expected=1)
+        self.command("systemctl", 'print("LoadState=loaded=bad\\nUnitFileState=disabled\\nActiveState=inactive")\n')
+        self.shell('s4_timer_state disabled inactive', expected=1)
+        self.command("systemctl", 'print("LoadState=not-found\\nUnitFileState=disabled\\nActiveState=inactive")\n')
+        self.shell('s4_timer_state disabled inactive', expected=1)
 
     def test_bootstrap_checks_each_package_and_executable(self):
         self.shell('rpm() { [[ $2 != python3 ]]; }; s4_verify_bootstrap', expected=1)
-        self.shell('rpm() { return 0; }; s4_verify_bootstrap')
+        self.shell('s4_verify_bootstrap')
 
     def test_installed_packages_with_broken_ca_are_not_complete(self):
         (self.root / 'ca-bundle').write_text('not a certificate bundle\n')
         self.shell('rpm() { return 0; }; s4_verify_bootstrap', expected=1)
 
     def test_installed_but_disabled_metadata_verifier_is_not_complete(self):
-        (self.root / 'plugin-config').write_text('[main]\nenabled=0\n')
+        self.plugin_config.write_text('[main]\nenabled=0\n')
         self.shell('rpm() { return 0; }; s4_verify_bootstrap', expected=1)
-        self.shell('s4_activate_verifier; rpm() { return 0; }; s4_verify_bootstrap')
+        self.shell('s4_activate_verifier; s4_verify_bootstrap')
 
     def test_misleading_plugin_section_is_not_accepted(self):
-        (self.root / 'plugin-config').write_text('[unrelated]\nenabled=1\n[main]\nenabled=0\n')
+        self.plugin_config.write_text('[unrelated]\nenabled=1\n[main]\nenabled=0\n')
         self.shell('rpm() { return 0; }; s4_verify_bootstrap', expected=1)
+
+    def test_corrupt_registered_verifier_is_pending(self):
+        self.plugin.write_text("not an ELF shared library\n")
+        result = self.shell("s4_verifier_damage")
+        self.assertIn("tdnf-plugin-repogpgcheck", result.stdout)
+        self.shell("s4_verify_bootstrap", expected=1)
+        self.shell('s4_run_component() { return 42; }; s4_repair yes', expected=75)
+        self.assertEqual(self.state()["status"], "pending")
+        self.assertTrue((self.root / "run/timer-enabled").exists())
+
+    def test_native_probe_rejects_unloadable_library_even_with_integrity_standin(self):
+        self.plugin.write_text("not an ELF shared library\n")
+        self.shell("s4_verifier_damage() { return 0; }; s4_verify_metadata", expected=1)
+
+    def test_native_probe_rejects_missing_interface_symbol(self):
+        subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-", "-o", str(self.plugin)],
+                       input="void unrelated_symbol(void) {}\n", text=True, check=True, capture_output=True)
+        self.shell("s4_verifier_damage() { return 0; }; s4_verify_metadata", expected=1)
+
+    def test_damaged_or_missing_runtime_dependency_is_not_healthy(self):
+        self.plugin_dependency.write_text("corrupted dependency\n")
+        result = self.shell("s4_verifier_damage")
+        self.assertIn("plugin-dependency", result.stdout)
+        self.shell("s4_verify_metadata", expected=1)
+        self.plugin_dependency.unlink()
+        self.shell("s4_verifier_damage() { return 0; }; s4_verify_metadata", expected=1)
+
+    def test_native_participation_requires_control_and_signature_rejection(self):
+        for mode in ("bypass", "load-only", "engine-error"):
+            with self.subTest(mode=mode):
+                self.shell("export S4_TDNF_MODE=" + shlex.quote(mode) + "; s4_probe_verifier", expected=1)
+        self.shell("export S4_CONTROL_FAILURE=42; s4_probe_verifier", expected=1)
+
+    def test_probe_uses_private_gpg_home_and_removes_its_fixture(self):
+        home = self.root / "operator-keyring"
+        home.mkdir(mode=0o700)
+        config = home / "gpg.conf"
+        config.write_text("operator configuration must remain unchanged\n")
+        self.shell("export GNUPGHOME=" + shlex.quote(str(home)) + "; s4_probe_verifier")
+        self.assertEqual(config.read_text(), "operator configuration must remain unchanged\n")
+        self.assertEqual(list((self.root / "run").glob("verifier.*")), [])
+
+    def test_verifier_probe_is_bounded_when_native_process_hangs(self):
+        self.shell("export S4_TDNF_MODE=hang; timeout() { shift 2; command timeout --kill-after=1s 1s \"$@\"; }; s4_probe_verifier",
+                   expected=124, timeout=5)
+
+    def test_integrity_query_errors_do_not_certify_empty_damage(self):
+        self.command("rpm", "import sys\nsys.exit(42)\n")
+        self.shell("s4_verify_metadata", expected=1)
+
+    def test_only_omitted_documentation_is_excluded_from_payload_integrity(self):
+        self.database["verification"]["plugin-dependency"] = {"exit": 1, "stdout": "missing     d /usr/share/doc/fixture/info\n"}
+        self.database["manifest"] = {"plugin-dependency": [("/usr/share/doc/fixture/info", stat.S_IFREG | 0o644, 2)]}
+        self.write_database()
+        self.assertEqual(self.shell("s4_verifier_damage").stdout, "")
+        self.database["verification"]["plugin-dependency"]["stdout"] += "..5......   /usr/lib64/libfixturedependency.so\n"
+        self.write_database()
+        self.assertIn("plugin-dependency", self.shell("s4_verifier_damage").stdout)
+
+    def test_mutable_state_is_excluded_using_the_rpm_manifest(self):
+        self.database["manifest"] = {"tdnf": [("/var/cache/tdnf", stat.S_IFDIR | 0o755, 0),
+                                               ("/var/log/fixture", stat.S_IFREG | 0o600, 0)]}
+        self.database["verification"]["tdnf"] = {"exit": 1, "stdout": "missing     /var/cache/tdnf\nSM5......   /var/log/fixture\n"}
+        self.write_database()
+        self.assertEqual(self.shell("s4_verifier_damage").stdout, "")
+        self.database["verification"]["tdnf"]["stdout"] += "verification could not be completed\n"
+        self.write_database()
+        self.assertIn("tdnf", self.shell("s4_verifier_damage").stdout)
+
+    def test_normal_transactions_refuse_unverified_metadata(self):
+        self.shell('s4_verify_metadata() { return 1; }; s4_tdnf install example', expected=75)
+
+    def test_recovery_transaction_does_not_load_damaged_plugins(self):
+        result = self.shell('timeout() { printf "%s\\n" "$*"; if read -r line; then return 9; fi; }; s4_tdnf_recovery reinstall tdnf-plugin-repogpgcheck')
+        self.assertIn("--noplugins reinstall tdnf-plugin-repogpgcheck", result.stdout)
+        self.assertNotIn("--enableplugin", result.stdout)
+
+    def test_registered_broken_payloads_are_reinstalled_then_reverified(self):
+        for path in (self.plugin, self.plugin_dependency):
+            shutil.copyfile(path, self.root / ("trusted-" + path.name))
+            path.write_text("damaged registered payload\n")
+        self.shell('''s4_tdnf_recovery() {
+            printf '%s\\n' "$*" >> "$S4_FIXTURE_ROOT/transactions"
+            [[ $1 == reinstall ]] || return 99
+            cp "$S4_FIXTURE_ROOT/trusted-libtdnfrepogpgcheck.so" "$S4_PLUGIN_LIBRARY"
+            cp "$S4_FIXTURE_ROOT/trusted-libfixturedependency.so" "$(dirname "$S4_PLUGIN_LIBRARY")/libfixturedependency.so"
+        }; s4_apply_bootstrap''')
+        self.assertEqual((self.root / "transactions").read_text(),
+                         "reinstall plugin-dependency tdnf-plugin-repogpgcheck\n")
+        self.shell("s4_verify_metadata")
+
+    def test_failed_payload_reinstall_keeps_verified_retry_active(self):
+        self.plugin.write_text("damaged registered library\n")
+        self.shell('s4_tdnf_recovery() { return 42; }; s4_run_component() { s4_apply_bootstrap; }; s4_repair yes', expected=75)
+        self.assertEqual(self.state()["status"], "pending")
+        self.assertEqual(self.state()["last_exit"], "42")
+        self.shell("s4_timer_state enabled active")
 
     def test_failed_trust_rebuild_blocks_network_transaction(self):
         self.shell('update-ca-trust() { return 42; }; s4_tdnf() { touch "$S4_RUN/executed"; }; s4_apply_bootstrap', expected=42)
         self.assertFalse((self.root / 'run/executed').exists())
 
     def test_transactions_have_timeout_refresh_and_no_stdin(self):
-        result = self.shell('timeout() { printf "%s\\n" "$*"; if read -r line; then return 9; fi; }; s4_tdnf install example')
+        result = self.shell('s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; if read -r line; then return 9; fi; }; s4_tdnf install example')
         self.assertIn("--kill-after=30s 15m tdnf -c", result.stdout)
-        self.assertIn("--releasever=3.0 --refresh -y install example", result.stdout)
+        self.assertIn("--releasever=3.0 --refresh -y --disableplugin=* --enableplugin=tdnfrepogpgcheck install example", result.stdout)
 
     def test_repository_policy_is_production_only(self):
         self.shell("s4_repositories")
@@ -258,8 +571,38 @@ systemctl() {{
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.shell("s4_lock", expected=75)
 
+    def test_fifo_lock_refuses_promptly_without_changing_operator_object(self):
+        path = self.root / "run/operation.lock"
+        os.mkfifo(path, 0o600)
+        inode = path.stat().st_ino
+        self.shell("s4_lock", expected=78, timeout=2)
+        self.assertEqual(path.stat().st_ino, inode)
+
+    def test_socket_directory_and_symlink_locks_are_rejected(self):
+        path = self.root / "run/operation.lock"
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(str(path))
+            inode = path.stat().st_ino
+            self.shell("s4_lock", expected=78, timeout=2)
+            self.assertEqual(path.stat().st_ino, inode)
+        path.unlink()
+        path.mkdir(mode=0o700)
+        self.shell("s4_lock", expected=78, timeout=2)
+        path.rmdir()
+        path.symlink_to(self.root / "rpm-key")
+        self.shell("s4_lock", expected=78, timeout=2)
+        self.assertEqual(path.readlink(), self.root / "rpm-key")
+
+    def test_device_lock_objects_are_refused(self):
+        self.shell("s4_lock_object /dev/null", expected=78, timeout=2)
+        self.shell("s4_lock_object /dev/zero", expected=78, timeout=2)
+
+    def test_inherited_lock_must_match_the_regular_file_inode(self):
+        self.shell('s4_lock; stat() { if [[ $1 == -Lc ]]; then printf "wrong:inode\\n"; else command stat "$@"; fi; }; s4_lock',
+                   expected=78)
+
     def test_unit_installation_failure_is_not_masked(self):
-        self.shell('systemctl() { [[ $1 != daemon-reload ]]; }; s4_install_units', expected=1)
+        self.shell('export S4_DAEMON_FAILURE=42; s4_install_units', expected=42)
         self.assertFalse((self.root / "run/timer-enabled").exists())
 
     def test_units_resume_at_boot_without_network_online_dependency(self):
