@@ -1,0 +1,33 @@
+# Internal working material, including symlinks
+**/docs/internal
+.codex/
+**/[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+**/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs, temporary files, and generated output
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+.cache/
+/build/
+/dist/
+/out/
+/artifacts/
+/coverage/
