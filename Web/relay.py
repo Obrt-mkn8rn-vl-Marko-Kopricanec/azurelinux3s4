@@ -276,6 +276,64 @@ def verify_seal(connection):
     connection.getpeername()  # The challenge must leave the accepted connection intact.
 
 
+def confine_filesystem():
+    # No allow rules: deny every known handled filesystem right. ABI3 adds
+    # truncate, ABI5 device ioctl. Later network/scope fields stay zero. This
+    # is a calling-thread layer; final TSYNC clone denial must precede the
+    # single-task check. Metadata/O_PATH and already-open FDs remain separate.
+    if (platform.machine() not in ("x86_64", "aarch64")
+            or ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_long) != 8):
+        raise ValueError("unsupported Landlock native architecture or ABI")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.argtypes = [ctypes.c_long]
+    libc.syscall.restype = ctypes.c_long
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                          ctypes.c_ulong, ctypes.c_ulong]
+    if libc.prctl(39, 0, 0, 0, 0) != 1 or libc.prctl(21, 0, 0, 0, 0) != 2:
+        raise RuntimeError("filesystem confinement requires NNP and seccomp")
+    # Linux x86_64 and asm-generic/aarch64 use these native syscall numbers.
+    abi = libc.syscall(ctypes.c_long(444), ctypes.c_void_p(), ctypes.c_size_t(0), ctypes.c_uint(1))
+    if abi < 0:
+        raise OSError(ctypes.get_errno(), "Landlock ABI query refused")
+    if abi < 3:
+        raise ValueError("Landlock ABI3 or newer is required")
+    with os.scandir("/proc/self/task") as tasks:
+        observed = [entry.name for _, entry in zip(range(2), tasks)]
+    if observed != [str(os.getpid())]:
+        raise RuntimeError("filesystem confinement requires one live task")
+    rights = (1 << 15) - 1
+    if abi >= 5:
+        rights |= 1 << 15
+    attribute = ctypes.c_uint64(rights)  # Eight-byte handled_access_fs prefix.
+    probe = os.open("/proc/self/status", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(probe).st_mode) or not os.read(probe, 1):
+            raise ValueError("filesystem read challenge has no regular readable baseline")
+        ruleset = libc.syscall(ctypes.c_long(444), ctypes.byref(attribute),
+                               ctypes.c_size_t(ctypes.sizeof(attribute)), ctypes.c_uint(0))
+        if ruleset < 0:
+            raise OSError(ctypes.get_errno(), "Landlock ruleset creation refused")
+        try:
+            if libc.syscall(ctypes.c_long(446), ctypes.c_int(ruleset), ctypes.c_uint(0)) != 0:
+                raise OSError(ctypes.get_errno(), "Landlock restriction refused")
+        finally:
+            os.close(ruleset)
+        # Check both the namespace path and trusted kernel fd-link reopening.
+        # Only EACCES after a successful baseline certifies this challenge.
+        for path in ("/proc/self/status", f"/proc/self/fd/{probe}"):
+            try:
+                opened = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            except OSError as error:
+                if error.errno != errno.EACCES:
+                    raise
+            else:
+                os.close(opened)
+                raise RuntimeError("filesystem read-denial challenge failed")
+    finally:
+        os.close(probe)
+    return abi, rights
+
+
 def forward(client, backend):
     # At most two BUFFER-sized queues; half-close each destination only after
     # its queued data drains. No connection setup, recvmsg or flagged send calls.
@@ -406,6 +464,7 @@ def main():
                 close_runtime_extras(backend)
                 restrict(True)
                 verify_seal(client)
+                confine_filesystem()
                 forward(client, backend)
     except (OSError, ValueError, RuntimeError, MemoryError, KeyError) as error:
         print("Web relay refused: " + str(error), file=sys.stderr)

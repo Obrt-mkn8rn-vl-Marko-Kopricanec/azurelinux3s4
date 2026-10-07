@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.13.0
+S4_VERSION=0.14.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -2791,6 +2791,64 @@ def verify_seal(connection):
     connection.getpeername()  # The challenge must leave the accepted connection intact.
 
 
+def confine_filesystem():
+    # No allow rules: deny every known handled filesystem right. ABI3 adds
+    # truncate, ABI5 device ioctl. Later network/scope fields stay zero. This
+    # is a calling-thread layer; final TSYNC clone denial must precede the
+    # single-task check. Metadata/O_PATH and already-open FDs remain separate.
+    if (platform.machine() not in ("x86_64", "aarch64")
+            or ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_long) != 8):
+        raise ValueError("unsupported Landlock native architecture or ABI")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.argtypes = [ctypes.c_long]
+    libc.syscall.restype = ctypes.c_long
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                          ctypes.c_ulong, ctypes.c_ulong]
+    if libc.prctl(39, 0, 0, 0, 0) != 1 or libc.prctl(21, 0, 0, 0, 0) != 2:
+        raise RuntimeError("filesystem confinement requires NNP and seccomp")
+    # Linux x86_64 and asm-generic/aarch64 use these native syscall numbers.
+    abi = libc.syscall(ctypes.c_long(444), ctypes.c_void_p(), ctypes.c_size_t(0), ctypes.c_uint(1))
+    if abi < 0:
+        raise OSError(ctypes.get_errno(), "Landlock ABI query refused")
+    if abi < 3:
+        raise ValueError("Landlock ABI3 or newer is required")
+    with os.scandir("/proc/self/task") as tasks:
+        observed = [entry.name for _, entry in zip(range(2), tasks)]
+    if observed != [str(os.getpid())]:
+        raise RuntimeError("filesystem confinement requires one live task")
+    rights = (1 << 15) - 1
+    if abi >= 5:
+        rights |= 1 << 15
+    attribute = ctypes.c_uint64(rights)  # Eight-byte handled_access_fs prefix.
+    probe = os.open("/proc/self/status", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(probe).st_mode) or not os.read(probe, 1):
+            raise ValueError("filesystem read challenge has no regular readable baseline")
+        ruleset = libc.syscall(ctypes.c_long(444), ctypes.byref(attribute),
+                               ctypes.c_size_t(ctypes.sizeof(attribute)), ctypes.c_uint(0))
+        if ruleset < 0:
+            raise OSError(ctypes.get_errno(), "Landlock ruleset creation refused")
+        try:
+            if libc.syscall(ctypes.c_long(446), ctypes.c_int(ruleset), ctypes.c_uint(0)) != 0:
+                raise OSError(ctypes.get_errno(), "Landlock restriction refused")
+        finally:
+            os.close(ruleset)
+        # Check both the namespace path and trusted kernel fd-link reopening.
+        # Only EACCES after a successful baseline certifies this challenge.
+        for path in ("/proc/self/status", f"/proc/self/fd/{probe}"):
+            try:
+                opened = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            except OSError as error:
+                if error.errno != errno.EACCES:
+                    raise
+            else:
+                os.close(opened)
+                raise RuntimeError("filesystem read-denial challenge failed")
+    finally:
+        os.close(probe)
+    return abi, rights
+
+
 def forward(client, backend):
     # At most two BUFFER-sized queues; half-close each destination only after
     # its queued data drains. No connection setup, recvmsg or flagged send calls.
@@ -2921,6 +2979,7 @@ def main():
                 close_runtime_extras(backend)
                 restrict(True)
                 verify_seal(client)
+                confine_filesystem()
                 forward(client, backend)
     except (OSError, ValueError, RuntimeError, MemoryError, KeyError) as error:
         print("Web relay refused: " + str(error), file=sys.stderr)
@@ -3132,6 +3191,7 @@ def bundle():
             "Trusted Python/libseccomp/close_range and per-connection worker sealing BEFORE forwarding, including connect/Fast Open/FD-acquisition refusals and same-connection byte/half-close proof.",
             "Only the accepted stdin TCP socket and connected root journal logging descriptors may be inherited; verify aggregate slice/MaxConnections and per-worker limits.",
             "Native SAME-byte worker credential, protected backend ancestry/held socket and peer-credential admission, with conflict-safe caller/manager authorization independent of names or PIDs; trusted NSS and the single dynamic identity lookup socket must be available.",
+            "Enabled native Landlock ABI3+; final TSYNC process-creation denial and one live task before an empty filesystem ruleset, successful native installation and namespace/fd-link read-denial challenges BEFORE forwarding.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
@@ -3139,6 +3199,7 @@ def bundle():
             "Candidate HTTP files only; generation does not install, activate or inspect the host.",
             "The worker retains an inherited IP connection; socket creation restrictions alone do not stop reconnects. No activation or native Azure worker/unit enforcement is certified by emission.",
             "The worker checks dedicated process IDs/groups/NNP/zero capabilities, journal descriptors, protected fixed backend ancestry and a held socket inode plus connect/listen-time Unix peer IDs, scrubs lookup/extra descriptors, then seals before forwarding. The read-only dynamic identity socket bind does not make its IPC protocol read-only. These observations do not authenticate native runtime or current peer executable, authorize the caller, certify manager launch, prevent UID reuse or establish atomic/ABA/concurrent-root protection.",
+            "The relay additionally denies all known Landlock filesystem rights after startup; ABI3 handles file read/write/execute, directory reads, namespace creation/removal/reparenting and truncation, with device ioctl on ABI5+. Missing support or a failed challenge refuses. Existing descriptor rights, metadata/O_PATH, shared mappings, other processes and backend nginx filesystem access are separate; kernel/base/runtime/procfs are trusted. This is a calling-thread layer after final TSYNC and a bounded single-task check, not whole-host or full MAC enforcement.",
             "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",
