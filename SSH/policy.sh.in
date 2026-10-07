@@ -1,0 +1,7 @@
+s4_ssh_policy() {
+    # Candidate bytes only; no observation, package/account/key/file/service
+    # installation. LAN/caller/key authorization remains a later prerequisite.
+    timeout --kill-after=5s 30s python3 -I - <<'PY'
+# @s4-include SSH/policy.py
+PY
+}
