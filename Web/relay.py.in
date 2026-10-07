@@ -20,6 +20,7 @@ import time
 
 
 # @s4-include Web/runtime.py
+# @s4-include Web/memory.py
 
 
 BACKEND_USER = "azurelinux3s4-web-backend"
@@ -511,6 +512,7 @@ def main():
                     if process_identity() != credentials:
                         raise ValueError("web account observations changed during startup")
                     observe_runtime()
+                    protect_memory()
                     close_runtime_extras(backend)
                     restrict(True)
                     verify_seal(client)

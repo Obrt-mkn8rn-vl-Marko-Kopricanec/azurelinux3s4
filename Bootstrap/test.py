@@ -25,6 +25,7 @@ MODULES = (
     "test_web_filesystem",
     "test_web_operations",
     "test_web_runtime",
+    "test_web_memory",
 )
 
 
