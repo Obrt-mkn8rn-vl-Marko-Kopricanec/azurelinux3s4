@@ -29,6 +29,7 @@ MODULES = (
     "test_web_descriptors",
     "test_web_resources",
     "test_ssh_policy",
+    "test_ssh_keys",
 )
 
 

@@ -1,0 +1,6 @@
+s4_inspect_ssh_keys() {
+    # Optional read-only public-key diagnostic, never credential provisioning.
+    timeout --kill-after=5s 30s python3 -I - "$1" <<'PY'
+# @s4-include SSH/keys.py
+PY
+}
