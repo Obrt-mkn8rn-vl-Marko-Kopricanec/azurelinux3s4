@@ -14,9 +14,9 @@ import test_update_compatibility as compatibility
 
 SOURCE = Path(__file__).resolve().parents[1] / 'azurelinux3s4.sh'
 
-# Only mounted-device identities/statvfs/proc delivery are modeled. Traversal,
-# ownership, actual wrong-kind objects, copying, parsing and budgets remain the
-# unchanged production program over a private disposable directory tree.
+# Mount/statvfs/proc delivery and the explicit leaf-owner/mount failure controls
+# are modeled. Directory traversal and real link/regular/FIFO/socket objects,
+# copy/hash/parse/budgets and the deliberate inode-swap control are actual.
 OBSERVATION_FIXTURE = r'''
 import types as _fixture_types
 _fixture = Path(os.environ['S4_CAPACITY_FIXTURE'])
@@ -39,14 +39,26 @@ def _which(path):
     return 1
 def _adjust(value, path):
     number = _which(path)
-    if number == 2 and not _configuration.get('bind_alias'):
+    owner = _configuration.get('untrusted_leaf_owner') and str(path).endswith('/payload-link')
+    if number == 2 and not _configuration.get('bind_alias') or owner:
         fields = {name:getattr(value,name) for name in dir(value) if name.startswith('st_')}
-        fields['st_dev'] = _device + 1
+        if number == 2 and not _configuration.get('bind_alias'):
+            fields['st_dev'] = _device + 1
+        if owner:
+            fields['st_uid'] = os.geteuid() + 1
         return _fixture_types.SimpleNamespace(**fields)
     return value
 def _open(path, flags, mode=0o777, *, dir_fd=None):
     if path == '/' and dir_fd is None:
         path = _filesystem
+    if dir_fd is not None and path == 'payload-link':
+        if _configuration.get('audit_leaf_open'):
+            with (_fixture / 'leaf-open-flags.json').open('a') as audit:
+                audit.write(json.dumps({'flags':flags,'name':path})+'\n')
+        if _configuration.get('swap_leaf_before_open'):
+            leaf = Path(_physical(dir_fd)) / path
+            leaf.rename(leaf.with_name('prior-payload-link'))
+            leaf.symlink_to('changed-target')
     return _real_open(path, flags, mode, dir_fd=dir_fd)
 def _stat(path, *, dir_fd=None, follow_symlinks=True):
     value = _real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
@@ -72,6 +84,8 @@ def _read_bytes(path):
 def _read_text(path,*args,**kwargs):
     if str(path).startswith('/proc/self/fdinfo/'):
         fd = int(path.name)
+        if _configuration.get('leaf_mount_mismatch') and _physical(fd).endswith('/payload-link'):
+            return 'mnt_id: 2\n'
         return 'mnt_id: '+str(_which(_physical(fd)))+'\n'
     return _real_read_text(path,*args,**kwargs)
 def _capacity(fd):
@@ -282,6 +296,107 @@ class PayloadCapacityTests(unittest.TestCase):
         inventory=self.workspace/'inventory.json';inventory.write_bytes(inventory.read_bytes()+b' ')
         self.run_guard(expected=75)
 
+    def test_existing_matching_symlink_leaf_passes_without_changing_link_or_referent(self):
+        parent=self.root/'filesystem/usr/share'
+        target=parent/'operator-target';target.write_bytes(b'operator bytes');target.chmod(0o600)
+        leaf=parent/'payload-link';leaf.symlink_to('operator-target')
+        content=target.read_bytes()
+        before=leaf.lstat(),target.stat(),content
+        self.assertEqual(stat.S_IMODE(before[0].st_mode),0o777)
+        self.inventory([self.entry('/usr/share/payload-link',14,stat.S_IFLNK|0o777,link='operator-target')])
+        self.run_guard()
+        self.assertEqual(leaf.lstat(),before[0])
+        self.assertEqual(target.stat(),before[1])
+        self.assertEqual(target.read_bytes(),before[2])
+        self.assertEqual(os.readlink(leaf),'operator-target')
+
+    def test_existing_dangling_matching_symlink_leaf_passes_without_creating_target(self):
+        parent=self.root/'filesystem/usr/share'
+        leaf=parent/'payload-link';leaf.symlink_to('missing-target')
+        before=leaf.lstat()
+        self.inventory([self.entry('/usr/share/payload-link',14,stat.S_IFLNK|0o777,link='missing-target')])
+        self.run_guard()
+        self.assertEqual(leaf.lstat(),before)
+        self.assertEqual(os.readlink(leaf),'missing-target')
+        self.assertFalse((parent/'missing-target').exists())
+
+    def test_existing_leaf_fifo_referent_is_not_opened_or_mutated(self):
+        parent=self.root/'filesystem/usr/share'
+        target=parent/'operator-fifo';os.mkfifo(target,0o600)
+        leaf=parent/'payload-link';leaf.symlink_to('operator-fifo')
+        before=leaf.lstat(),target.lstat()
+        self.inventory([self.entry('/usr/share/payload-link',13,stat.S_IFLNK|0o777,link='operator-fifo')])
+        self.configure(audit_leaf_open=True)
+        self.run_guard()
+        opens=[json.loads(line) for line in (self.root/'leaf-open-flags.json').read_text().splitlines()]
+        self.assertTrue(opens)
+        self.assertTrue(all(item['flags'] & os.O_PATH and item['flags'] & os.O_NOFOLLOW for item in opens))
+        self.assertEqual((leaf.lstat(),target.lstat()),before)
+
+    def test_existing_symlink_leaf_untrusted_owner_is_refused_without_operator_changes(self):
+        leaf=self.root/'filesystem/usr/share/payload-link';leaf.symlink_to('missing-target')
+        before=leaf.lstat()
+        self.inventory([self.entry('/usr/share/payload-link',14,stat.S_IFLNK|0o777,link='missing-target')])
+        self.configure(untrusted_leaf_owner=True)
+        result=self.run_guard(expected=75)
+        self.assertIn('untrusted',result.stderr)
+        self.assertEqual(leaf.lstat(),before)
+        self.assertEqual(os.readlink(leaf),'missing-target')
+
+    def test_signed_symlink_leaf_wrong_existing_kinds_are_preserved_and_refused(self):
+        leaf=self.root/'filesystem/usr/share/payload-link'
+        self.inventory([self.entry('/usr/share/payload-link',6,stat.S_IFLNK|0o777,link='target')])
+        for kind in ('regular','directory','fifo','socket'):
+            with self.subTest(kind=kind):
+                sock=None
+                if kind=='regular':leaf.write_bytes(b'operator');leaf.chmod(0o600)
+                elif kind=='directory':leaf.mkdir(mode=0o700)
+                elif kind=='fifo':os.mkfifo(leaf,0o600)
+                else:
+                    sock=socket.socket(socket.AF_UNIX);sock.bind(str(leaf));leaf.chmod(0o600)
+                before=leaf.lstat()
+                self.run_guard(expected=75)
+                self.assertEqual(leaf.lstat(),before)
+                if kind=='regular':self.assertEqual(leaf.read_bytes(),b'operator')
+                if sock:sock.close()
+                if kind=='directory':leaf.rmdir()
+                else:leaf.unlink()
+
+    def test_existing_regular_and_directory_write_bits_remain_strict(self):
+        leaf=self.root/'filesystem/usr/share/payload-file'
+        leaf.write_bytes(b'operator');leaf.chmod(0o666)
+        self.inventory([self.entry('/usr/share/payload-file')])
+        before=leaf.lstat();self.run_guard(expected=75)
+        self.assertEqual(leaf.lstat(),before)
+        self.assertEqual(leaf.read_bytes(),b'operator')
+        leaf.chmod(0o600);self.run_guard()
+        directory=self.root/'filesystem/usr/share/payload-directory';directory.mkdir(mode=0o777);directory.chmod(0o777)
+        self.inventory([self.entry('/usr/share/payload-directory',0,stat.S_IFDIR|0o755)])
+        before=directory.lstat();self.run_guard(expected=75)
+        self.assertEqual(directory.lstat(),before)
+        directory.chmod(0o700);self.run_guard()
+
+    def test_existing_symlink_inode_swap_before_open_is_a_real_refusal(self):
+        parent=self.root/'filesystem/usr/share';leaf=parent/'payload-link';leaf.symlink_to('original-target')
+        before=leaf.lstat()
+        self.inventory([self.entry('/usr/share/payload-link',15,stat.S_IFLNK|0o777,link='original-target')])
+        self.configure(swap_leaf_before_open=True)
+        result=self.run_guard(expected=75)
+        self.assertIn('changed or a file mount',result.stderr)
+        prior=parent/'prior-payload-link'
+        self.assertEqual(prior.lstat().st_ino,before.st_ino)
+        self.assertEqual(os.readlink(prior),'original-target')
+        self.assertEqual(os.readlink(leaf),'changed-target')
+
+    def test_existing_symlink_leaf_mount_mismatch_still_refuses(self):
+        leaf=self.root/'filesystem/usr/share/payload-link';leaf.symlink_to('missing-target')
+        before=leaf.lstat()
+        self.inventory([self.entry('/usr/share/payload-link',14,stat.S_IFLNK|0o777,link='missing-target')])
+        self.configure(leaf_mount_mismatch=True)
+        result=self.run_guard(expected=75)
+        self.assertIn('changed or a file mount',result.stderr)
+        self.assertEqual(leaf.lstat(),before)
+
 
 CAPACITY_LIBRARY = compatibility.LIBRARY + r'''
 typedef struct { int index, count; } FI;
@@ -423,3 +538,25 @@ s4_repair yes >/dev/null
         deadline=int(self.shell('s4_repair_timeout_seconds').stdout)
         self.assertEqual(deadline,11800+2295+305+4*35)
         self.assertLess(deadline,5*60*60)
+
+    def test_existing_matching_fixture_link_passes_fresh_native_inventory_check(self):
+        self.prepare()
+        parent=self.root/'filesystem/usr/share'
+        target=parent/'fixture';target.write_bytes(b'operator target');target.chmod(0o600)
+        leaf=parent/'fixture-link';leaf.symlink_to('fixture')
+        before=leaf.lstat(),target.stat(),(self.root/'state/updates/current.json').read_bytes()
+        result=json.loads(self.shell('s4_check_update_capacity').stdout)
+        self.assertTrue(result['payload_capacity_checked'])
+        self.assertFalse(result['installation_authorized'])
+        self.assertEqual(result['payload_inventory']['files'],2)
+        self.assertEqual((leaf.lstat(),target.stat(),(self.root/'state/updates/current.json').read_bytes()),before)
+        self.assertEqual(target.read_bytes(),b'operator target')
+
+    def test_existing_dangling_fixture_link_completes_capacity_reconciliation(self):
+        self.prepare()
+        parent=self.root/'filesystem/usr/share';leaf=parent/'fixture-link';leaf.symlink_to('fixture')
+        before=leaf.lstat(),(self.root/'state/updates/current.json').read_bytes()
+        self.shell('s4_reconcile_component update-capacity yes')
+        self.assertIn('status=complete',(self.root/'state/components/update-capacity').read_text())
+        self.assertEqual((leaf.lstat(),(self.root/'state/updates/current.json').read_bytes()),before)
+        self.assertFalse((parent/'fixture').exists())

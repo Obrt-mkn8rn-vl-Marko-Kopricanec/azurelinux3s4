@@ -1579,7 +1579,14 @@ try:
                 except FileNotFoundError:
                     entry = None
                 if entry is not None:
-                    trusted(entry)
+                    # Ordinary symlink mode0777 is not an access permission.
+                    # Check its owner; protected parent traversal and the kind,
+                    # no-follow descriptor identity/mount checks still apply.
+                    if stat.S_ISLNK(entry.st_mode):
+                        if entry.st_uid not in (0, os.geteuid()):
+                            raise ValueError("capacity destination symlink has an untrusted owner")
+                    else:
+                        trusted(entry)
                     if stat.S_IFMT(entry.st_mode) != types[path][0]:
                         raise ValueError("existing destination kind differs from the signed payload")
                     descriptor = os.open(PurePosixPath(path).name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
