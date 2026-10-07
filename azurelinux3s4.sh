@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.5.1
+S4_VERSION=0.6.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,7 +21,7 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility)
 S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
 # Internal dynamic-scope options; never accept inherited environment values.
 S4_ADMISSION_DESTINATION=
@@ -858,10 +858,15 @@ try:
         barrier(root, root.parent)
         validate(new, True)
         print(json.dumps(new, sort_keys=True))
-    elif action == "verify":
+    elif action in ("verify", "plan"):
         if pointer is None:
             raise ValueError("no signed update batch is prepared")
-        validate(pointer, True)
+        slot = validate(pointer, True)
+        if action == "plan":
+            proof = json.loads(read(slot / "manifest.json"))
+            print(json.dumps({"schema": 1, "manifest_sha256": pointer["manifest_sha256"],
+                              "packages": [{**record, "path": str(slot / record["file"])}
+                                           for record in proof["packages"]]}, sort_keys=True))
     else:
         raise ValueError("unknown update-store operation")
 except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
@@ -904,12 +909,406 @@ s4_prepare_updates() (
     printf '%s\n' "$evidence"
 )
 
+s4_rpm_test_program() {
+    # The public RPM 4.18.2 ABI permits mixed upgrade/install-only elements.
+    # TEST only: no plugins/scripts/triggers. Capacity is explicitly unproved;
+    # RPM treats a read-only mount as zero available blocks even in TEST mode.
+    cat <<'PY'
+import ctypes as C
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+try:
+    root, database, architecture = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+    if (any(int(status[name].strip(), 16) for name in ("CapEff", "CapPrm", "CapBnd", "CapAmb"))
+            or status["NoNewPrivs"].strip() != "1"):
+        raise ValueError("RPM test sandbox lacks its privilege restriction")
+    for path in (Path("/"), Path("/etc"), Path("/usr"), Path("/var/lib"), database,
+                 root / "packages", root / "vendor.asc"):
+        if not os.statvfs(path).f_flag & os.ST_RDONLY:
+            raise ValueError("RPM test sandbox lacks read-only protection: " + str(path))
+    for path in ("/run/systemd/private", "/run/dbus/system_bus_socket"):
+        if os.access(path, os.R_OK | os.W_OK):
+            raise ValueError("RPM test sandbox exposes a privileged manager socket")
+    if {entry.name for entry in Path("/sys/class/net").iterdir()} != {"lo"}:
+        raise ValueError("RPM test sandbox exposes host network interfaces")
+
+    plan = json.loads((root / "plan.json").read_text())
+    admitted = json.loads((root / "admission.json").read_text())
+    records = plan["packages"]
+    if (set(plan) != {"schema", "manifest_sha256", "packages"} or plan["schema"] != 1
+            or not re.fullmatch(r"[0-9a-f]{64}", plan["manifest_sha256"])
+            or not isinstance(records, list) or len(records) > 128
+            or admitted.get("snapshots_retained") is not True or admitted.get("installs_performed") is not False
+            or admitted.get("freshness_proven") is not False or admitted.get("schema") != 1
+            or admitted.get("vendor_fingerprint") != "2BC94FFF7015A5F28F1537AD0CD9FED33135CE90"
+            or len(admitted["artifacts"]) != len(records)):
+        raise ValueError("batch context or repeated admission is malformed")
+    paths, total = [], 0
+    def digest(path):
+        observed = path.lstat()
+        if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid()
+                or observed.st_mode & 0o777 != 0o400 or observed.st_nlink != 1
+                or not 0 < observed.st_size <= 512 * 1024 * 1024):
+            raise ValueError("test input is not the private read-only snapshot")
+        value = hashlib.sha256()
+        with path.open("rb") as source:
+            while block := source.read(1024 * 1024):
+                value.update(block)
+        return value.hexdigest(), observed.st_size
+    for index, (record, artifact) in enumerate(zip(records, admitted["artifacts"])):
+        if (set(record) != {"file", "path", "bytes", "sha256"}
+                or record["file"] != "packages/" + str(index) + ".rpm"
+                or set(artifact) != {"path", "bytes", "sha256"}
+                or artifact != {"path": record["path"], "bytes": record["bytes"], "sha256": record["sha256"]}):
+            raise ValueError("repeated admission differs from the retained manifest")
+        path = root / "packages" / (str(index) + ".rpm")
+        if digest(path) != (record["sha256"], record["bytes"]):
+            raise ValueError("native test bytes differ from the admitted snapshots")
+        paths.append(os.fsencode(path))
+        total += record["bytes"]
+    if total > 1024 * 1024 * 1024:
+        raise ValueError("test batch exceeds its aggregate bound")
+    key = root / "vendor.asc"
+    if digest(key) != ("1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89", 983):
+        raise ValueError("native test key differs from its vetted pin")
+
+    lib = C.CDLL("librpm.so.9", mode=os.RTLD_NOW | os.RTLD_LOCAL)
+    if C.c_char_p.in_dll(lib, "RPMVERSION").value != b"4.18.2":
+        raise ValueError("native RPM ABI has not been vetted for this test")
+    pointer, integer, unsigned, string = C.c_void_p, C.c_int, C.c_uint, C.c_char_p
+    def bind(name, result, *arguments):
+        function = getattr(lib, name)
+        function.restype, function.argtypes = result, arguments
+        return function
+    signatures = {
+        "rpmReadConfigFiles": (integer, string, string), "rpmtsCreate": (pointer,),
+        "rpmPushMacro": (integer, pointer, string, string, string, integer),
+        "rpmtsFree": (pointer, pointer), "rpmtsSetRootDir": (integer, pointer, string),
+        "rpmtsSetDBMode": (integer, pointer, integer), "rpmtsOpenDB": (integer, pointer, integer),
+        "rpmtsSetFlags": (unsigned, pointer, unsigned), "rpmtsFlags": (unsigned, pointer),
+        "rpmtsSetVSFlags": (unsigned, pointer, unsigned), "rpmtsSetVfyFlags": (unsigned, pointer, unsigned),
+        "rpmtsSetVfyLevel": (integer, pointer, integer), "rpmtsSetKeyring": (integer, pointer, pointer),
+        "rpmKeyringNew": (pointer,), "rpmPubkeyRead": (pointer, string),
+        "rpmKeyringAddKey": (integer, pointer, pointer), "rpmPubkeyFree": (pointer, pointer),
+        "rpmKeyringFree": (pointer, pointer), "Fopen": (pointer, string, string),
+        "Ferror": (integer, pointer), "Fclose": (integer, pointer),
+        "rpmReadPackageFile": (integer, pointer, pointer, string, C.POINTER(pointer)),
+        "headerGetString": (string, pointer, integer), "headerFree": (pointer, pointer),
+        "headerIsEntry": (integer, pointer, integer),
+        "rpmtsAddInstallElement": (integer, pointer, pointer, string, integer, pointer),
+        "rpmtsCheck": (integer, pointer), "rpmtsOrder": (integer, pointer),
+        "rpmtsRun": (integer, pointer, pointer, unsigned), "rpmtsProblems": (pointer, pointer),
+        "rpmpsNumProblems": (integer, pointer), "rpmpsFree": (pointer, pointer),
+        "rpmtsNElements": (integer, pointer), "rpmtsElement": (pointer, pointer, integer),
+        "rpmteType": (integer, pointer), "rpmteN": (string, pointer),
+        "rpmteNEVRA": (string, pointer), "rpmteKey": (string, pointer),
+        "rpmtsInitIterator": (pointer, pointer, integer, pointer, C.c_size_t),
+        "rpmdbNextIterator": (pointer, pointer), "rpmdbGetIteratorOffset": (unsigned, pointer),
+        "rpmdbFreeIterator": (pointer, pointer), "headerExport": (pointer, pointer, C.POINTER(unsigned)),
+        "rpmlogGetNrecsByMask": (integer, unsigned), "rpmlogSetMask": (integer, integer),
+    }
+    api = {name: bind(name, *signature) for name, signature in signatures.items()}
+    libc = C.CDLL(None)
+    libc.free.argtypes, libc.free.restype = [pointer], None
+    if api["rpmReadConfigFiles"](None, None):
+        raise ValueError("native RPM configuration could not be loaded")
+    if api["rpmPushMacro"](None, b"_dbpath", None, os.fsencode(database), -7):
+        raise ValueError("native RPM could not select the checked installed database")
+    api["rpmlogSetMask"](15)  # Emergency through error; native warnings are not success records.
+    def errors():
+        if api["rpmlogGetNrecsByMask"](15):
+            raise ValueError("native RPM reported an error")
+    flags = 1 | 4 | 16 | 128  # TEST, NOSCRIPTS, NOTRIGGERS, NOPLUGINS.
+    def transaction():
+        ts = api["rpmtsCreate"]()
+        if not ts:
+            raise ValueError("native transaction allocation failed")
+        try:
+            if api["rpmtsSetRootDir"](ts, b"/") or api["rpmtsSetDBMode"](ts, os.O_RDONLY):
+                raise ValueError("native read-only transaction policy failed")
+            api["rpmtsSetFlags"](ts, flags)
+            api["rpmtsSetVSFlags"](ts, 0)
+            api["rpmtsSetVfyFlags"](ts, 0)
+            api["rpmtsSetVfyLevel"](ts, 3)  # Digest AND signature, without administrator relaxation.
+            keyring, pubkey = api["rpmKeyringNew"](), api["rpmPubkeyRead"](os.fsencode(key))
+            try:
+                if not keyring or not pubkey or api["rpmKeyringAddKey"](keyring, pubkey) or api["rpmtsSetKeyring"](ts, keyring):
+                    raise ValueError("native in-memory pinned keyring could not be established")
+            finally:
+                if pubkey:
+                    api["rpmPubkeyFree"](pubkey)
+                if keyring:
+                    api["rpmKeyringFree"](keyring)
+            if api["rpmtsFlags"](ts) != flags or api["rpmtsOpenDB"](ts, os.O_RDONLY):
+                raise ValueError("native TEST/read-only state was not observed")
+            errors()
+            return ts
+        except BaseException:
+            api["rpmtsFree"](ts)
+            raise
+    def baseline():
+        # Header content + instance IDs observed before and after; not an RPM
+        # mutation lock or authority to reuse this observation for installation.
+        ts, iterator = transaction(), None
+        try:
+            iterator = api["rpmtsInitIterator"](ts, 0, None, 0)
+            if not iterator:
+                raise ValueError("installed header iteration failed")
+            entries, total = [], 0
+            while header := api["rpmdbNextIterator"](iterator):
+                size = unsigned()
+                material = api["headerExport"](header, C.byref(size))
+                if not material:
+                    raise ValueError("installed header export failed")
+                try:
+                    total += size.value
+                    if not 0 < size.value <= 8 * 1024 * 1024 or total > 512 * 1024 * 1024 or len(entries) >= 32768:
+                        raise ValueError("installed baseline exceeds its finite inspection bounds")
+                    entries.append((api["rpmdbGetIteratorOffset"](iterator),
+                                    hashlib.sha256(C.string_at(material, size.value)).hexdigest()))
+                finally:
+                    libc.free(material)
+            errors()
+            if not entries or len({entry[0] for entry in entries}) != len(entries):
+                raise ValueError("installed header baseline is empty or ambiguous")
+            return {"headers": len(entries), "sha256": hashlib.sha256(
+                json.dumps(sorted(entries), separators=(",", ":")).encode()).hexdigest()}
+        finally:
+            if iterator:
+                api["rpmdbFreeIterator"](iterator)
+            api["rpmtsFree"](ts)
+    before = baseline()
+    ts = transaction()
+    install_only = {b"kernel", b"kernel-mshv", b"kernel-uvm", b"kernel-uki", b"kernel-64k", b"kernel-hwe"}
+    additions, removals = [], []
+    pretrans = {}
+    opened, consumed, callback_errors = {}, set(), []
+    callback_type = C.CFUNCTYPE(pointer, pointer, integer, C.c_uint64, C.c_uint64, pointer, pointer)
+    @callback_type
+    def notify(header, what, amount, total, key, data):
+        try:
+            if what & ((1 << 15) | (1 << 16) | (1 << 17)):
+                raise ValueError("native TEST attempted package script execution")
+            if what in (4, 8):
+                path = C.string_at(key) if key else None
+                if path not in paths:
+                    raise ValueError("native callback requested bytes outside the admitted snapshots")
+                if what == 4:
+                    if path in opened:
+                        raise ValueError("native callback requested an already-open snapshot")
+                    fd = api["Fopen"](path, b"r.ufdio")
+                    if not fd or api["Ferror"](fd):
+                        if fd:
+                            api["Fclose"](fd)
+                        raise ValueError("native callback could not open its admitted snapshot")
+                    opened[path] = fd
+                    consumed.add(path)
+                    return fd
+                fd = opened.pop(path, None)
+                if not fd or api["Fclose"](fd):
+                    raise ValueError("native callback could not close its snapshot")
+        except (ValueError, OSError) as error:
+            callback_errors.append(str(error))
+        return None
+    set_notify = bind("rpmtsSetNotifyCallback", integer, pointer, callback_type, pointer)
+    try:
+        if set_notify(ts, notify, None):
+            raise ValueError("native snapshot callback could not be established")
+        for path in paths:
+            fd, header = api["Fopen"](path, b"r.ufdio"), pointer()
+            try:
+                if not fd or api["Ferror"](fd) or api["rpmReadPackageFile"](ts, fd, path, C.byref(header)) or not header:
+                    raise ValueError("native signed snapshot header read failed")
+                name, arch = api["headerGetString"](header, 1000), api["headerGetString"](header, 1022)
+                if not name or not re.fullmatch(rb"[A-Za-z0-9][A-Za-z0-9+._-]{0,255}", name) or arch not in (architecture.encode(), b"noarch"):
+                    raise ValueError("snapshot is not a target-architecture binary RPM")
+                if api["rpmtsAddInstallElement"](ts, header, path, int(name not in install_only), None):
+                    raise ValueError("native mixed transaction could not admit every input")
+                pretrans[path] = bool(api["headerIsEntry"](header, 1151))
+            finally:
+                if header:
+                    api["headerFree"](header)
+                if fd and api["Fclose"](fd):
+                    raise ValueError("native snapshot descriptor close failed")
+        if api["rpmtsCheck"](ts):
+            raise ValueError("native dependency check failed")
+        def no_problems():
+            problems = api["rpmtsProblems"](ts)
+            try:
+                if api["rpmpsNumProblems"](problems):
+                    raise ValueError("native transaction has unresolved problems")
+            finally:
+                if problems:
+                    api["rpmpsFree"](problems)
+            errors()
+        no_problems()
+        if api["rpmtsOrder"](ts):
+            raise ValueError("native transaction ordering failed")
+        count = api["rpmtsNElements"](ts)
+        if not len(paths) <= count <= 32768 + 128:
+            raise ValueError("native transaction element count is inconsistent")
+        for index in range(count):
+            element = api["rpmtsElement"](ts, index)
+            if not element:
+                raise ValueError("native transaction element is missing")
+            kind, name = api["rpmteType"](element), api["rpmteN"](element)
+            identity = api["rpmteNEVRA"](element)
+            if not identity or len(identity) > 1024:
+                raise ValueError("native transaction identity is malformed")
+            if kind == 1:
+                additions.append({"snapshot": os.fsdecode(api["rpmteKey"](element)),
+                                  "nevra": identity.decode("ascii"), "install_only": name in install_only})
+            elif kind == 2 and name not in install_only:
+                removals.append(identity.decode("ascii"))
+            else:
+                raise ValueError("native plan would remove a retained kernel or has an unknown element")
+        if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
+            raise ValueError("native plan replaced or dropped an admitted input")
+        if api["rpmtsFlags"](ts) != flags or api["rpmtsRun"](ts, None, (1 << 7) | (1 << 8)):
+            # Only capacity/inode filters: all signature, dependency, file,
+            # architecture and older/already-installed package checks remain.
+            raise ValueError("native TEST transaction rejected the batch")
+        if callback_errors or opened or consumed != set(paths):
+            raise ValueError("native TEST did not consume and close exactly the admitted snapshots")
+        no_problems()
+    finally:
+        for fd in opened.values():
+            api["Fclose"](fd)
+        api["rpmtsFree"](ts)
+    after = baseline()
+    if after != before:
+        raise ValueError("installed header context changed during compatibility inspection")
+    for index, record in enumerate(records):
+        if digest(root / "packages" / (str(index) + ".rpm")) != (record["sha256"], record["bytes"]):
+            raise ValueError("native test snapshots changed")
+    for addition in additions:
+        path = os.fsencode(addition.pop("snapshot"))
+        index = paths.index(path)
+        addition.update(file=records[index]["file"], sha256=records[index]["sha256"], bytes=records[index]["bytes"])
+        addition["pretrans_present"] = pretrans[path]
+    print(json.dumps({"schema": 1, "manifest_sha256": plan["manifest_sha256"],
+                      "baseline": before, "additions": additions, "removals": removals,
+                      "rpm_test_performed": bool(paths), "test_passed": True,
+                      "installs_performed": False, "scripts_executed": False,
+                      "installation_authorized": False, "storage_capacity_checked": False,
+                      "freshness_proven": False}, sort_keys=True))
+except (ValueError, KeyError, TypeError, OSError, UnicodeError, AttributeError) as error:
+    print("azurelinux3s4: RPM compatibility deferred: " + str(error), file=sys.stderr)
+    sys.exit(75)
+PY
+}
+
+s4_check_updates() (
+    command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
+    local directory database evidence
+    database=$(s4_rpm_database_path) || return 75
+    directory=$(mktemp -d "$S4_RUN/update-check.XXXXXX") || return 75
+    trap 'rm -rf -- "$directory"' EXIT
+    s4_update_store plan >"$directory/plan.json" || return 75
+    mkdir -m 0700 -- "$directory/packages" "$directory/home" || return 75
+    timeout --kill-after=5s 1m python3 -I - "$directory/plan.json" >"$directory/files" <<'PY' || return 75
+import json
+import os
+import sys
+plan = json.load(open(sys.argv[1]))
+for record in plan["packages"]:
+    sys.stdout.buffer.write(os.fsencode(record["path"]) + b"\0")
+PY
+    local -a packages=()
+    mapfile -d '' -t packages <"$directory/files"
+    if (( ${#packages[@]} )); then
+        local S4_ADMISSION_DESTINATION=$directory/packages
+        s4_verify_rpm_artifacts "${packages[@]}" >"$directory/admission.json" || return 75
+    else
+        printf '{"schema":1,"vendor_fingerprint":"%s","artifacts":[],"installs_performed":false,"snapshots_retained":true,"freshness_proven":false}\n' \
+            "$S4_VENDOR_FINGERPRINT" >"$directory/admission.json"
+    fi
+    s4_vendor_key_matches || return 75
+    cp -- "$S4_GPG_KEY" "$directory/vendor.asc" || return 75
+    chmod 0400 -- "$directory/vendor.asc" || return 75
+    if (( ${#packages[@]} )); then
+        chmod 0400 -- "$directory/packages/"*.rpm || return 75
+    fi
+    s4_rpm_test_program >"$directory/test.py" || return 75
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" <<'PY'
+import json
+import os
+from pathlib import Path
+import resource
+import subprocess
+import sys
+try:
+    root = Path(sys.argv[1])
+    unit = "azurelinux3s4-check-" + root.name.removeprefix("update-check.") + ".service"
+    if any(character not in "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in str(root) + sys.argv[2]):
+        raise ValueError("test workspace or database path is unsupported")
+    command = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec", "--unit=" + unit,
+        "--property=RuntimeMaxSec=12min", "--property=TimeoutStopSec=15s", "--property=KillMode=control-group",
+        "--property=ProtectSystem=strict", "--property=ReadWritePaths=" + str(root),
+        "--property=ReadOnlyPaths=" + str(root / "packages") + " " + str(root / "vendor.asc") + " " + sys.argv[2],
+        "--property=PrivateNetwork=yes", "--property=ProtectHome=yes", "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes", "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
+        "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectKernelLogs=yes",
+        "--property=ProtectControlGroups=yes", "--property=RestrictNamespaces=yes", "--property=RestrictRealtime=yes",
+        "--property=LockPersonality=yes", "--property=UMask=0077", "--property=MemoryMax=768M",
+        "--property=LimitFSIZE=1048576", "--property=InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket",
+        "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH",
+        "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
+        "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root), *sys.argv[2:]]
+    def limits():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1048576, 1048576))
+    with (root / "native.log").open("xb") as output:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=output, preexec_fn=limits)
+        completed = False
+        try:
+            code = process.wait(timeout=750)
+            completed = True
+        finally:
+            if not completed:
+                stopped = subprocess.run(["systemctl", "stop", unit], stdin=subprocess.DEVNULL,
+                                         capture_output=True, timeout=30)
+                process.kill()
+                process.wait(timeout=15)
+                if stopped.returncode:
+                    raise ValueError("native test shutdown could not be confirmed")
+    data = (root / "native.log").read_bytes()
+    if code or not 0 < len(data) <= 1048576:
+        print(data[:65536].decode("utf-8", "replace"), file=sys.stderr)
+        raise ValueError("native RPM test did not provide bounded successful evidence")
+    proof = json.loads(data)
+    if (proof.get("schema") != 1 or proof.get("test_passed") is not True
+            or any(proof.get(name) is not False for name in ("installs_performed", "scripts_executed", "installation_authorized", "storage_capacity_checked", "freshness_proven"))):
+        raise ValueError("native test evidence is incomplete")
+    (root / "result.json").write_text(json.dumps(proof, sort_keys=True) + "\n")
+except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+    print("azurelinux3s4: update compatibility deferred: " + str(error), file=sys.stderr)
+    sys.exit(75)
+PY
+    then
+        evidence=$(cat -- "$directory/result.json") || return 75
+    else
+        return 75
+    fi
+    rm -rf -- "$directory" || return 75
+    trap - EXIT
+    s4_log 'Retained signed RPM batch passed its read-only transaction test; installation is unfinished.'
+    printf '%s\n' "$evidence"
+)
+
 s4_verify_component() {
     case $1 in
         trust-anchor) s4_verify_trust_anchor ;;
         bootstrap) s4_verify_bootstrap ;;
         repository-trust) s4_verify_repository_trust ;;
         update-preparation) s4_update_store verify && s4_timer_state enabled active "$S4_UPDATE_TIMER" ;;
+        update-compatibility) s4_check_updates ;;
         *) return 78 ;;
     esac
 }
@@ -1159,10 +1558,10 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation ]] || return 78
-    if [[ $component == repository-trust || $component == update-preparation ]]; then
-        # Its health check IS an online signed refresh. Honor backoff before
-        # network work and do not repeat the same failed refresh in a child.
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility ]]; then
+        # Always obtain fresh online/preparation/transaction-test evidence.
+        # Honor backoff before work and do not repeat a failed operation in a child.
         attempts=$(s4_state_value "$component" attempts)
         next=$(s4_state_value "$component" next_attempt)
         (( next <= S4_NOW + 3630 )) || next=0
@@ -1182,6 +1581,7 @@ s4_reconcile_component() {
                 else
                     result=$?
                 fi ;;
+            update-compatibility) s4_check_updates || result=$? ;;
         esac
         if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0
@@ -1243,13 +1643,15 @@ s4_repair_timeout_seconds() {
     local health=$((5 * (integrity + participation) + integrity))
     # Up to two recovery transactions (install + reinstall), one signed refresh,
     # one download, and begin/list/commit store operations, followed by admission.
-    local stages=$((2 * recovery + refresh + download + 3 * store + admission))
+    local compatibility=$((2 * control + key + store + 65 + admission + 930))
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
     # Another ten minutes cover trusted local tools, file fsync, cleanup and
     # scheduling outside leaf wrappers. Excessive IO still fails finitely and
     # retains retry ownership; this is not a promise for arbitrary slow storage.
-    local housekeeping=$((40 * control + 600))
+    # Compatibility adds component state writes; four more reserved controls.
+    local housekeeping=$((44 * control + 600))
     printf '%s\n' "$((trust + health + stages + housekeeping))"
 }
 
@@ -1520,11 +1922,11 @@ s4_main() {
     local action=${1:-install}
     case $action in
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: trust, bootstrap and signed-update preparation; server hardening and update installation are incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: signed-update preparation and read-only RPM transaction tests; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair|--prepare-updates) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates|--check-updates) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -1544,12 +1946,18 @@ s4_main() {
         s4_prepare_updates
         return $?
     fi
+    if [[ $action == --check-updates ]]; then
+        s4_verify_trust_anchor || return 75
+        s4_check_updates
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
             bootstrap) s4_apply_bootstrap ;;
             repository-trust) s4_verify_repository_trust ;;
             update-preparation) s4_prepare_updates ;;
+            update-compatibility) s4_check_updates ;;
         esac
         return $?
     fi
@@ -1557,7 +1965,7 @@ s4_main() {
         s4_install_runner || return $?
         s4_install_units || return $?
         s4_repair yes || return $?
-        s4_log 'INCOMPLETE: trust, bootstrap and update preparation only. Host hardening and automatic package installation remain unfinished.'
+        s4_log 'INCOMPLETE: trust, preparation and read-only update tests only. Host hardening and automatic package installation remain unfinished.'
         return 78
     fi
     s4_repair no

@@ -211,6 +211,9 @@ with (root / 'slow-stages').open('a') as log:
     log.write(json.dumps({{'stage': name, 'event': 'end'}}) + '\\n')
 ''')
         body = r'''
+# This model isolates the accepted preparation-deadline path. Compatibility has
+# separate ABI/default-dispatch tests and genuine native Azure execution.
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation)
 s4_verify_trust_anchor() { return 0; }
 s4_repositories() { return 0; }
 s4_verify_bootstrap() { slow-stage bootstrap-health 240 280; }
