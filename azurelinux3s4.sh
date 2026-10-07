@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.7.0
+S4_VERSION=0.8.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,12 +21,13 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity update-effects)
 S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
 # Internal dynamic-scope options; never accept inherited environment values.
 S4_ADMISSION_DESTINATION=
 S4_DOWNLOAD_DIRECTORY=
 S4_CAPACITY_MODE=
+S4_EFFECTS_MODE=
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -910,6 +911,85 @@ s4_prepare_updates() (
     printf '%s\n' "$evidence"
 )
 
+s4_rpm_effects_program() {
+    # Decode bounded native exports, never evaluate script text or macros.
+    # This inventory does not predict trigger selection or approve execution.
+    cat <<'PY'
+import hashlib
+import struct
+
+EFFECT_TAGS = {}
+for name, body, program, flags in (
+    ("prein", 1023, 1085, 5020), ("postin", 1024, 1086, 5021),
+    ("preun", 1025, 1087, 5022), ("postun", 1026, 1088, 5023),
+    ("pretrans", 1151, 1153, 5024), ("posttrans", 1152, 1154, 5025),
+    ("verify", 1079, 1091, 5026),
+):
+    EFFECT_TAGS.update({body: (name + "_body", 6, False),
+                        program: (name + "_program", 8, True),
+                        flags: (name + "_flags", 4, True)})
+for name, body, program, flags, names, versions, senses, indexes, priority in (
+    ("trigger", 1065, 1092, 5027, 1066, 1067, 1068, 1069, None),
+    ("filetrigger", 5066, 5067, 5068, 5069, 5071, 5072, 5070, 5084),
+    ("transfiletrigger", 5076, 5077, 5078, 5079, 5081, 5082, 5080, 5085),
+):
+    EFFECT_TAGS.update({body: (name + "_bodies", 8, False),
+                        program: (name + "_programs", 8, True),
+                        flags: (name + "_script_flags", 4, True),
+                        names: (name + "_names", 8, False),
+                        versions: (name + "_versions", 8, False),
+                        senses: (name + "_senses", 4, True),
+                        indexes: (name + "_indexes", 4, True)})
+    if priority:
+        EFFECT_TAGS[priority] = (name + "_priorities", 4, True)
+
+def audit_header(material):
+    # headerExport: two network-order uint32 sizes, 16-byte indexes, data.
+    if not 8 <= len(material) <= 8 * 1024 * 1024:
+        raise ValueError("effects header export exceeds its bound")
+    entries, size = struct.unpack_from(">II", material)
+    if not 0 < entries <= 65536 or 8 + 16 * entries + size != len(material):
+        raise ValueError("effects header export layout is inconsistent")
+    start, seen, tags = 8 + 16 * entries, set(), []
+    for index in range(entries):
+        tag, kind, offset, count = struct.unpack_from(">IIII", material, 8 + 16 * index)
+        if tag not in EFFECT_TAGS:
+            continue
+        label, expected, disclose = EFFECT_TAGS[tag]
+        scalar = tag in (1023, 1024, 1025, 1026, 1079, 1151, 1152,
+                         5020, 5021, 5022, 5023, 5024, 5025, 5026)
+        # RPM's HEADERGET_ARGV also accepts an ordinary interpreter encoded
+        # as one scalar string. Genuine Azure headers commonly use this form.
+        legacy_program = tag in (1085, 1086, 1087, 1088, 1091, 1153, 1154) and kind == 6 and count == 1
+        if (tag in seen or (kind != expected and not legacy_program) or not 0 < count <= 4096
+                or (scalar and count != 1) or offset >= size):
+            raise ValueError("effects tag type/count/identity is unsupported: " + str(tag))
+        seen.add(tag)
+        cursor, values = start + offset, []
+        if kind == 4:
+            end = cursor + 4 * count
+            if offset % 4 or end > len(material):
+                raise ValueError("effects integer array exceeds the header")
+            values = list(struct.unpack_from(">" + "I" * count, material, cursor))
+            cursor = end
+        else:
+            for _ in range(count):
+                end = material.find(b"\0", cursor)
+                limit = 4096 if disclose else 1024 * 1024
+                if end < cursor or end - cursor > limit:
+                    raise ValueError("effects string is unterminated or excessive")
+                value = material[cursor:end]
+                values.append(value.decode("utf-8") if disclose else {
+                    "bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()})
+                cursor = end + 1
+        encoded = material[start + offset:cursor]
+        tags.append({"tag": tag, "name": label, "type": kind, "count": count,
+                     "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(), "values": values})
+    return {"header_bytes": len(material), "header_sha256": hashlib.sha256(material).hexdigest(),
+            "tags": sorted(tags, key=lambda value: value["tag"])}
+PY
+}
+
 s4_rpm_test_program() {
     # The public RPM 4.18.2 ABI permits mixed upgrade/install-only elements.
     # TEST only: no plugins/scripts/triggers. Capacity is explicitly unproved;
@@ -926,9 +1006,9 @@ import sys
 
 try:
     root, database, architecture = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-    if sys.argv[4:] not in ([], ["capacity"]):
+    if sys.argv[4:] not in ([], ["capacity"], ["effects"]):
         raise ValueError("unsupported RPM diagnostic mode")
-    capacity = bool(sys.argv[4:])
+    capacity, effects = sys.argv[4:] == ["capacity"], sys.argv[4:] == ["effects"]
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
     if (any(int(status[name].strip(), 16) for name in ("CapEff", "CapPrm", "CapBnd", "CapAmb"))
             or status["NoNewPrivs"].strip() != "1"):
@@ -1019,6 +1099,9 @@ try:
         "rpmlogGetNrecsByMask": (integer, unsigned), "rpmlogSetMask": (integer, integer),
     }
     api = {name: bind(name, *signature) for name, signature in signatures.items()}
+    if effects:
+        api["rpmteDBInstance"] = bind("rpmteDBInstance", unsigned, pointer)
+        api["headerGetAsString"] = bind("headerGetAsString", pointer, pointer, integer)
     if capacity:
         extra = {
             "rpmfiNew": (pointer, pointer, pointer, integer, unsigned),
@@ -1071,7 +1154,31 @@ try:
         except BaseException:
             api["rpmtsFree"](ts)
             raise
-    def baseline():
+    def effect_identity(header):
+        name, identity = api["headerGetString"](header, 1000), None
+        material = api["headerGetAsString"](header, 5016)
+        try:
+            if material:
+                identity = C.string_at(material)
+            if (not name or not re.fullmatch(rb"[A-Za-z0-9][A-Za-z0-9+._-]{0,255}", name)
+                    or not identity or not 0 < len(identity) <= 1024
+                    or any(value < 33 or value > 126 for value in identity)):
+                raise ValueError("effects package identity is unsupported")
+            return {"name": name.decode("ascii"), "nevra": identity.decode("ascii")}
+        finally:
+            if material:
+                libc.free(material)
+    effects_bytes, signed_header_bytes = 0, 0
+    def observe_effects(header, exported):
+        global effects_bytes
+        value = {**effect_identity(header), **audit_header(exported)}
+        effects_bytes += len(json.dumps(value, sort_keys=True).encode("utf-8"))
+        # Retain at most 16MiB of metadata before plan/removal duplication;
+        # the final 32MiB output cap is separate and positively checked.
+        if effects_bytes > 16 * 1024 * 1024:
+            raise ValueError("effects observations exceed their aggregate bound")
+        return value
+    def baseline(observations=None):
         # Header content + instance IDs observed before and after; not an RPM
         # mutation lock or authority to reuse this observation for installation.
         ts, iterator = transaction(), None
@@ -1089,8 +1196,13 @@ try:
                     total += size.value
                     if not 0 < size.value <= 8 * 1024 * 1024 or total > 512 * 1024 * 1024 or len(entries) >= 32768:
                         raise ValueError("installed baseline exceeds its finite inspection bounds")
-                    entries.append((api["rpmdbGetIteratorOffset"](iterator),
-                                    hashlib.sha256(C.string_at(material, size.value)).hexdigest()))
+                    instance = api["rpmdbGetIteratorOffset"](iterator)
+                    exported = C.string_at(material, size.value)
+                    entries.append((instance, hashlib.sha256(exported).hexdigest()))
+                    if observations is not None:
+                        if not instance or instance in observations:
+                            raise ValueError("effects installed instance is missing or duplicated")
+                        observations[instance] = {"instance": instance, **observe_effects(header, exported)}
                 finally:
                     libc.free(material)
             errors()
@@ -1102,7 +1214,8 @@ try:
             if iterator:
                 api["rpmdbFreeIterator"](iterator)
             api["rpmtsFree"](ts)
-    before = baseline()
+    installed_effects, incoming_effects, removal_effects, removed_instances = {}, [], [], set()
+    before = baseline(installed_effects if effects else None)
     ts = transaction()
     install_only = {b"kernel", b"kernel-mshv", b"kernel-uvm", b"kernel-uki", b"kernel-64k", b"kernel-hwe"}
     additions, removals = [], []
@@ -1234,6 +1347,21 @@ try:
                 pretrans[path] = bool(api["headerIsEntry"](header, 1151))
                 if capacity:
                     payload(header, index)
+                if effects:
+                    size = unsigned()
+                    exported = api["headerExport"](header, C.byref(size))
+                    try:
+                        if not exported or not 0 < size.value <= 8 * 1024 * 1024:
+                            raise ValueError("effects signed header export exceeds its bound")
+                        signed_header_bytes += size.value
+                        if signed_header_bytes > 64 * 1024 * 1024:
+                            raise ValueError("effects signed headers exceed their aggregate bound")
+                        incoming_effects.append({"file": records[index]["file"],
+                            "sha256": records[index]["sha256"], "bytes": records[index]["bytes"],
+                            **observe_effects(header, C.string_at(exported, size.value))})
+                    finally:
+                        if exported:
+                            libc.free(exported)
             finally:
                 if header:
                     api["headerFree"](header)
@@ -1269,6 +1397,17 @@ try:
                                   "nevra": identity.decode("ascii"), "install_only": name in install_only})
             elif kind == 2 and name not in install_only:
                 removals.append(identity.decode("ascii"))
+                if effects:
+                    instance = api["rpmteDBInstance"](element)
+                    observed = installed_effects.get(instance)
+                    if (not observed or observed["nevra"] != identity.decode("ascii")
+                            or observed["name"].encode("ascii") != name
+                            or instance in removed_instances):
+                        raise ValueError("native removal differs from the observed installed instance")
+                    removed_instances.add(instance)
+                    removal_effects.append({**observed, "classification": "same-name-replacement"
+                        if any(value["name"] == observed["name"] for value in incoming_effects)
+                        else "other-removal"})
             else:
                 raise ValueError("native plan would remove a retained kernel or has an unknown element")
         if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
@@ -1310,7 +1449,21 @@ try:
             output.write(data)
         proof["payload_inventory"] = {"sha256": hashlib.sha256(data).hexdigest(),
                                       "bytes": len(data), "files": file_total}
-    print(json.dumps(proof, sort_keys=True))
+    if effects:
+        binding = lambda value: (value["file"], value["sha256"], value["bytes"], value["nevra"])
+        if sorted(map(binding, incoming_effects)) != sorted(map(binding, additions)):
+            raise ValueError("native additions differ from the observed admitted header identities")
+        proof["effects"] = {"schema": 1, "incoming": incoming_effects, "removals": removal_effects,
+            "installed_script_owners": [value for _, value in sorted(installed_effects.items()) if value["tags"]],
+            "installed_headers_observed": before["headers"], "script_metadata_observed": True,
+            "removals_bound_to_installed_instances": True, "installed_headers_authenticated": False,
+            "trigger_selection_complete": False, "script_execution_plan_complete": False,
+            "script_policy_satisfied": False, "removal_policy_satisfied": False,
+            "rollback_policy_satisfied": False}
+    data = json.dumps(proof, sort_keys=True)
+    if effects and len(data.encode("utf-8")) > 32 * 1024 * 1024:
+        raise ValueError("effects report exceeds its output bound")
+    print(data)
 except (ValueError, KeyError, TypeError, OSError, UnicodeError, AttributeError) as error:
     print("azurelinux3s4: RPM compatibility deferred: " + str(error), file=sys.stderr)
     sys.exit(75)
@@ -1742,8 +1895,14 @@ PY
     if (( ${#packages[@]} )); then
         chmod 0400 -- "$directory/packages/"*.rpm || return 75
     fi
-    s4_rpm_test_program >"$directory/test.py" || return 75
-    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" <<'PY'
+    if [[ $S4_EFFECTS_MODE == yes ]]; then
+        [[ -z $S4_CAPACITY_MODE ]] || return 75
+        s4_rpm_effects_program >"$directory/test.py" || return 75
+    else
+        : >"$directory/test.py"
+    fi
+    s4_rpm_test_program >>"$directory/test.py" || return 75
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$S4_EFFECTS_MODE" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -1753,9 +1912,11 @@ import sys
 try:
     root = Path(sys.argv[1])
     capacity = sys.argv[4] == "yes"
-    if sys.argv[4] not in ("", "yes"):
-        raise ValueError("unsupported internal capacity mode")
-    output_limit = 32 * 1024 * 1024 if capacity else 1048576
+    effects = sys.argv[5] == "yes"
+    if sys.argv[4] not in ("", "yes") or sys.argv[5] not in ("", "yes") or (capacity and effects):
+        raise ValueError("unsupported internal diagnostic mode")
+    output_limit = 32 * 1024 * 1024 if capacity or effects else 1048576
+    evidence_limit = 32 * 1024 * 1024 if effects else 1048576
     unit = "azurelinux3s4-check-" + root.name.removeprefix("update-check.") + ".service"
     if any(character not in "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in str(root) + sys.argv[2]):
         raise ValueError("test workspace or database path is unsupported")
@@ -1772,7 +1933,7 @@ try:
         "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH",
         "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
         "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root),
-        *sys.argv[2:4], *(["capacity"] if capacity else [])]
+        *sys.argv[2:4], *(["capacity"] if capacity else ["effects"] if effects else [])]
     def limits():
         resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     with (root / "native.log").open("xb") as output:
@@ -1790,13 +1951,24 @@ try:
                 if stopped.returncode:
                     raise ValueError("native test shutdown could not be confirmed")
     data = (root / "native.log").read_bytes()
-    if code or not 0 < len(data) <= 1048576:
+    if code or not 0 < len(data) <= evidence_limit:
         print(data[:65536].decode("utf-8", "replace"), file=sys.stderr)
         raise ValueError("native RPM test did not provide bounded successful evidence")
     proof = json.loads(data)
     if (proof.get("schema") != 1 or proof.get("test_passed") is not True
             or any(proof.get(name) is not False for name in ("installs_performed", "scripts_executed", "installation_authorized", "storage_capacity_checked", "freshness_proven"))):
         raise ValueError("native test evidence is incomplete")
+    if effects:
+        observed = proof.get("effects", {})
+        if (observed.get("schema") != 1 or observed.get("script_metadata_observed") is not True
+                or observed.get("removals_bound_to_installed_instances") is not True
+                or observed.get("installed_headers_observed") != proof["baseline"]["headers"]
+                or len(observed["incoming"]) != len(proof["additions"])
+                or [value["nevra"] for value in observed["removals"]] != proof["removals"]
+                or any(observed.get(name) is not False for name in ("installed_headers_authenticated",
+                    "trigger_selection_complete", "script_execution_plan_complete", "script_policy_satisfied",
+                    "removal_policy_satisfied", "rollback_policy_satisfied"))):
+            raise ValueError("native effects evidence is incomplete")
     (root / "result.json").write_text(json.dumps(proof, sort_keys=True) + "\n")
 except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
     print("azurelinux3s4: update compatibility deferred: " + str(error), file=sys.stderr)
@@ -1814,7 +1986,9 @@ PY
     fi
     rm -rf -- "$directory" || return 75
     trap - EXIT
-    if [[ $S4_CAPACITY_MODE == yes ]]; then
+    if [[ $S4_EFFECTS_MODE == yes ]]; then
+        s4_log 'Declared script metadata and installed removal identities observed; execution policy remains unfinished.'
+    elif [[ $S4_CAPACITY_MODE == yes ]]; then
         s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
     else
         s4_log 'Retained signed RPM batch passed its read-only transaction test; installation is unfinished.'
@@ -1827,6 +2001,11 @@ s4_check_update_capacity() (
     s4_check_updates
 )
 
+s4_check_update_effects() (
+    local S4_EFFECTS_MODE=yes
+    s4_check_updates
+)
+
 s4_verify_component() {
     case $1 in
         trust-anchor) s4_verify_trust_anchor ;;
@@ -1835,6 +2014,7 @@ s4_verify_component() {
         update-preparation) s4_update_store verify && s4_timer_state enabled active "$S4_UPDATE_TIMER" ;;
         update-compatibility) s4_check_updates ;;
         update-capacity) s4_check_update_capacity ;;
+        update-effects) s4_check_update_effects ;;
         *) return 78 ;;
     esac
 }
@@ -2084,8 +2264,8 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity ]] || return 78
-    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity ]]; then
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects ]]; then
         # Always obtain fresh online/preparation/transaction-test evidence.
         # Honor backoff before work and do not repeat a failed operation in a child.
         attempts=$(s4_state_value "$component" attempts)
@@ -2109,6 +2289,7 @@ s4_reconcile_component() {
                 fi ;;
             update-compatibility) s4_check_updates || result=$? ;;
             update-capacity) s4_check_update_capacity || result=$? ;;
+            update-effects) s4_check_update_effects || result=$? ;;
         esac
         if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0
@@ -2173,14 +2354,17 @@ s4_repair_timeout_seconds() {
     local compatibility=$((2 * control + key + store + 65 + admission + 930))
     # Capacity repeats same-byte admission/native TEST, then a 5min+5s observer.
     local capacity=$((compatibility + 305))
-    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity))
+    # Effects repeats current admission/TEST and inventories bounded exports
+    # within that same native/parent cap; no script is executed by the observer.
+    local effects=$compatibility
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
     # Another ten minutes cover trusted local tools, file fsync, cleanup and
     # scheduling outside leaf wrappers. Excessive IO still fails finitely and
     # retains retry ownership; this is not a promise for arbitrary slow storage.
-    # Compatibility and capacity add component state writes: four reserves each.
-    local housekeeping=$((48 * control + 600))
+    # Compatibility, capacity and effects each add four state-control reserves.
+    local housekeeping=$((52 * control + 600))
     printf '%s\n' "$((trust + health + stages + housekeeping))"
 }
 
@@ -2453,9 +2637,9 @@ s4_main() {
         --help)
             printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: signed-update preparation and read-only RPM transaction tests; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity || $2 == update-effects ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -2485,6 +2669,11 @@ s4_main() {
         s4_check_update_capacity
         return $?
     fi
+    if [[ $action == --audit-update-effects ]]; then
+        s4_verify_trust_anchor || return 75
+        s4_check_update_effects
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
@@ -2493,6 +2682,7 @@ s4_main() {
             update-preparation) s4_prepare_updates ;;
             update-compatibility) s4_check_updates ;;
             update-capacity) s4_check_update_capacity ;;
+            update-effects) s4_check_update_effects ;;
         esac
         return $?
     fi

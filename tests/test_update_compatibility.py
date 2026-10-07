@@ -358,6 +358,7 @@ s4_prepare_updates() {{ return 0; }}
 # Capacity has separate current-default coverage; keep this accepted case's
 # purpose focused on compatibility refusal and its finalization dependency.
 s4_check_update_capacity() {{ return 0; }}
+s4_check_update_effects() {{ return 0; }}
 s4_start_timer() {{ return 0; }}
 s4_start_repair_timer() {{ touch {shlex.quote(str(self.root / 'retry'))}; }}
 s4_finish_repair() {{ touch {shlex.quote(str(self.root / 'finished'))}; }}
