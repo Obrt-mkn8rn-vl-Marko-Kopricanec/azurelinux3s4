@@ -51,14 +51,44 @@ def sources(prefixes, listeners):
             tuple(sorted(addresses, key=lambda value: (value.version, int(value)))))
 
 
+def cryptography():
+    # Fixed prospective profile, not provider/FIPS/peer or negotiated proof.
+    # Use replacement lists: never append to unobserved vendor defaults.
+    return {
+        "profile": "hybrid-required-aes-gcm-ed25519-rsa-sha2-v1",
+        "directives": {
+            "KexAlgorithms": "sntrup761x25519-sha512@openssh.com",
+            "Ciphers": "aes256-gcm@openssh.com,aes128-gcm@openssh.com",
+            "MACs": "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com",
+            "HostKeyAlgorithms": "ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
+            "PubkeyAcceptedAlgorithms": "ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
+            "CASignatureAlgorithms": "ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
+            "RequiredRSASize": "3072", "FingerprintHash": "sha256", "RekeyLimit": "256M 1h",
+        },
+        "authority": {name: False for name in (
+            "native_provider_usable", "native_azure_policy_proven", "peer_compatibility_proven",
+            "transport_algorithms_negotiated", "signature_algorithms_authenticated",
+            "fips_compliance_proven", "post_quantum_authentication_proven",
+        )},
+        "limits": [
+            "Hybrid-only KEX requires peer support and has no classical fallback. This is not a FIPS profile or proof of post-quantum authentication: Ed25519 and RSA signatures remain classical.",
+            "AES-GCM supplies its own authentication; the separate MACs list does not add another MAC or provide a non-AEAD cipher fallback. Cipher ordering cannot force a client's preference.",
+            "RSA SHA-2 signature names are distinct from the ssh-rsa public-key blob type; RequiredRSASize declares a minimum, not key-generation/prime/possession or host-key availability proof.",
+            "Rekey data/time limits are declarations, not measured negotiation or physical session deadlines. Algorithm-name listings and offline parser output do not establish provider usability, live handshake/authentication, actual invocation, target cryptographic policy or FIPS compliance.",
+        ],
+    }
+
+
 def bundle(prefixes=DEFAULT_PREFIXES, listeners=DEFAULT_LISTEN):
     networks, addresses = sources(prefixes, listeners)
+    crypto = cryptography()
     lines = [
         "# Standalone candidate only; use a checked dedicated -f configuration.",
         "Port 22", "AddressFamily any",
         *("ListenAddress " + str(address) for address in addresses),
         "HostKey /etc/azurelinux3s4/ssh/ssh_host_ed25519_key",
         "HostKey /etc/azurelinux3s4/ssh/ssh_host_rsa_key",
+        *(name + " " + value for name, value in crypto["directives"].items()),
         "PermitRootLogin no", "PubkeyAuthentication yes", "AuthenticationMethods publickey",
         "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitEmptyPasswords no",
         "HostbasedAuthentication no", "GSSAPIAuthentication no", "UsePAM yes", "StrictModes yes",
@@ -81,6 +111,7 @@ def bundle(prefixes=DEFAULT_PREFIXES, listeners=DEFAULT_LISTEN):
         "admin_account_name": ADMIN,
         "source_prefixes": [network.with_prefixlen for network in networks],
         "listen_addresses": [str(address) for address in addresses],
+        "cryptography": crypto,
         "files": [{"file": "ssh/sshd_config", "mode": "0644", "bytes": len(data),
                    "sha256": hashlib.sha256(data).hexdigest(), "content": content}],
         "authority": {name: False for name in (
@@ -99,7 +130,7 @@ def bundle(prefixes=DEFAULT_PREFIXES, listeners=DEFAULT_LISTEN):
         "limits": [
             "The CLI emits loopback-only bindings. The internal compiler accepts canonical explicit loopback, RFC1918 or IPv6 ULA prefixes and matching listeners only; no wildcard, public/GUA, link-local/zone, hostname or host-bit inference. Address classes and membership do not prove physical adjacency, interface assignment or original-client identity. NAT/proxies/VPN/tunnels and another local process can obscure origin; topology/firewall/caller/key authorization is separate.",
             "Key-only and source-qualified AllowUsers are configuration declarations, not created accounts, authenticated/provisioned keys or native login/refusal evidence. Root/strict ownership, host-key availability/PAM/console recovery/privilege handling and actual Azure service invocation remain unfinished. No sudo removal or administrative entitlement is inferred.",
-            "The file is a standalone candidate, not a vendor drop-in. OpenSSH first-value and additive-list semantics require checked complete effective configuration and invocation. Local parser evidence is not service activation, account/PAM/key/origin enforcement or target version proof. No cryptographic algorithm allowlist is emitted; target-specific compiled/vendor cryptographic policy admission remains unfinished.",
+            "The file is a standalone candidate, not a vendor drop-in. OpenSSH first-value and additive-list semantics require checked complete effective configuration and invocation. Local parser evidence is not service activation, account/PAM/key/origin enforcement or target version proof. Explicit replacement cryptographic allowlists are prospective; target-specific compiled/vendor cryptographic policy admission remains unfinished. Unsupported providers or peers must defer installation, not silently weaken this profile.",
             "Disabled protocol forwarding does not prevent a permitted shell user from running another forwarder. Channel/session limits and timeouts do not prove process cleanup, complete shell/host/LAN containment or availability. Kernel/root/base/OpenSSH/PAM/private ancestry and finite honest IO/scheduling remain assumptions; all earlier readiness gates persist.",
         ],
     }

@@ -49,8 +49,8 @@ class SSHPolicyTests(unittest.TestCase):
             self.assertEqual(directives[key], [value])
         self.assertNotIn("Include", directives)
         self.assertNotIn("Match", directives)
-        self.assertNotIn("Ciphers", directives)
-        self.assertNotIn("MACs", directives)
+        self.assertEqual(directives["Ciphers"], ["aes256-gcm@openssh.com,aes128-gcm@openssh.com"])
+        self.assertEqual(directives["MACs"], ["hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"])
         self.assertEqual(directives["AllowUsers"], ["azurelinux3s4-admin@127.0.0.1/32 azurelinux3s4-admin@::1/128"])
 
     def test_bounded_explicit_rfc1918_and_ula_lan_inputs_compile(self):
