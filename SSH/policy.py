@@ -93,6 +93,7 @@ def bundle(prefixes=DEFAULT_PREFIXES, listeners=DEFAULT_LISTEN):
         "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitEmptyPasswords no",
         "HostbasedAuthentication no", "GSSAPIAuthentication no", "UsePAM yes", "StrictModes yes",
         "UseDNS no", "AuthorizedKeysFile /etc/azurelinux3s4/ssh/admin_authorized_keys",
+        "RevokedKeys /etc/azurelinux3s4/ssh/admin_revoked_keys",
         "AuthorizedKeysCommand none", "AuthorizedPrincipalsFile none", "AuthorizedPrincipalsCommand none",
         "TrustedUserCAKeys none",
         "AllowUsers " + " ".join(ADMIN + "@" + network.with_prefixlen for network in networks),

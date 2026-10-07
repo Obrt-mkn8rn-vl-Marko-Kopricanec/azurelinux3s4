@@ -31,6 +31,7 @@ MODULES = (
     "test_ssh_policy",
     "test_ssh_keys",
     "test_ssh_crypto",
+    "test_ssh_revocations",
 )
 
 

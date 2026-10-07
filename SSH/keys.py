@@ -27,10 +27,10 @@ def identity(value):
             value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def snapshot(path):
+def snapshot(path, allow_empty=False):
     before = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
-            or before.st_mode & 0o022 or not 0 < before.st_size <= SOURCE_LIMIT):
+            or before.st_mode & 0o022 or not (0 if allow_empty is True else 1) <= before.st_size <= SOURCE_LIMIT):
         raise ValueError('source must be a bounded protected regular file owned by the inspecting user')
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -75,8 +75,9 @@ def positive_mpint(value):
     return int.from_bytes(value, 'big')
 
 
-def parse(data):
-    if (not 0 < len(data) <= SOURCE_LIMIT or not data.endswith(b'\n')
+def parse(data, allow_empty=False):
+    if (not (0 if allow_empty is True else 1) <= len(data) <= SOURCE_LIMIT
+            or data and not data.endswith(b'\n')
             or any(value > 126 or value < 32 and value not in (9, 10) for value in data)):
         raise ValueError('public-key source must use bounded ASCII lines with a final LF')
     keys, seen = [], set()
@@ -119,7 +120,7 @@ def parse(data):
         seen.add(fingerprint)
         keys.append({'type': kind, 'bits': bits, 'fingerprint': fingerprint, 'native_kind': native_kind,
                      'entry': 'restrict,pty ' + kind + ' ' + pieces[1].decode('ascii') + ' ' + COMMENT + '\n'})
-    if not keys:
+    if not keys and allow_empty is not True:
         raise ValueError('no supported public keys')
     return keys
 
@@ -190,15 +191,134 @@ def inspect(path):
     }
 
 
+def native_revocations(keys, revoked):
+    """Check known positive/negative controls and complete supplied membership."""
+    receipts = []
+    with tempfile.TemporaryDirectory(prefix='s4-ssh-revocation-inspection-') as directory:
+        base, private = Path(directory), {}
+
+        def remember(path, content=None):
+            observed = snapshot(path, allow_empty=True)
+            if content is not None and observed != content:
+                raise ValueError('private revocation input differs from admitted bytes')
+            private[path] = (observed, identity(path.stat(follow_symlinks=False)))
+            return observed
+
+        def write(name, content):
+            path = base / name
+            with path.open('xb') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(content)
+            remember(path, content)
+            return path
+
+        def run(label, arguments):
+            output, errors = base / (label + '.stdout'), base / (label + '.stderr')
+            with output.open('xb') as stdout, errors.open('xb') as stderr:
+                os.fchmod(stdout.fileno(), 0o600); os.fchmod(stderr.fileno(), 0o600)
+                result = subprocess.run([KEYGEN, *arguments], stdin=subprocess.DEVNULL,
+                                        stdout=stdout, stderr=stderr, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+                                        timeout=10, check=False)
+            actual, diagnostics = bounded_output(output, 32768), bounded_output(errors, 8192)
+            if diagnostics:
+                raise ValueError('native revocation diagnostics refused')
+            return result.returncode, actual
+
+        def build(label, source):
+            path = base / (label + '.krl')
+            result, output = run('build-' + label, ['-k', '-q', '-f', str(path), str(source)])
+            if result != 0 or output:
+                raise ValueError('native KRL construction refused')
+            content = remember(path)
+            if not content.startswith(b'SSHKRL\n\0'):
+                raise ValueError('native KRL header refused')
+            return path
+
+        def query(label, krl, paths, states):
+            result, output = run('query-' + label, ['-Q', '-f', str(krl), *(str(path) for path in paths)])
+            expected = ''.join(str(path) + ' (' + COMMENT + '): ' + ('REVOKED' if state else 'ok') + '\n'
+                               for path, state in zip(paths, states)).encode()
+            if result != int(any(states)) or output != expected:
+                raise ValueError('complete native revocation records do not match supplied membership')
+            receipts.append({'control': label, 'keys_compared': len(paths), 'revoked_records': sum(states),
+                             'actual_native_exit': result, 'complete_record_sha256': hashlib.sha256(output).hexdigest()})
+
+        candidate_paths = [write('candidate-' + str(index).zfill(3) + '.pub', key['entry'].removeprefix('restrict,pty ').encode())
+                           for index, key in enumerate(keys)]
+        revoked_paths = [write('revoked-' + str(index).zfill(3) + '.pub', key['entry'].removeprefix('restrict,pty ').encode())
+                         for index, key in enumerate(revoked)]
+        empty = write('empty.pub', b'')
+        positive = write('positive.pub', keys[0]['entry'].removeprefix('restrict,pty ').encode())
+        supplied = write('supplied.pub', ''.join(key['entry'].removeprefix('restrict,pty ') for key in revoked).encode())
+        query('known-negative', build('empty', empty), candidate_paths[:1], [False])
+        query('known-positive', build('positive', positive), candidate_paths[:1], [True])
+        revoked_fingerprints = {key['fingerprint'] for key in revoked}
+        candidate_states = [key['fingerprint'] in revoked_fingerprints for key in keys]
+        query('supplied', build('supplied', supplied), [*candidate_paths, *revoked_paths],
+              [*candidate_states, *([True] * len(revoked))])
+        for path, (content, observed) in private.items():
+            if snapshot(path, allow_empty=True) != content or identity(path.stat(follow_symlinks=False)) != observed:
+                raise ValueError('private revocation snapshot changed during native comparison')
+        if any(candidate_states):
+            raise ValueError('candidate contains a listed revoked public key')
+    return receipts
+
+
+def inspect_policy(path, revoked_path):
+    data, revoked_data = snapshot(path), snapshot(revoked_path, allow_empty=True)
+    keys, revoked = parse(data), parse(revoked_data, allow_empty=True)
+    authorized_content = ''.join(key['entry'] for key in keys).encode()
+    revoked_content = ''.join(key['entry'].removeprefix('restrict,pty ') for key in revoked).encode()
+    native_fingerprints(authorized_content, keys)
+    if revoked:
+        native_fingerprints(revoked_content, revoked)
+    receipts = native_revocations(keys, revoked)
+    return {
+        'scope': 'SUPPLIED PUBLIC-KEY / PLAIN REVOCATION SNAPSHOT COMPARISON ONLY',
+        'sources': {'candidate_keys': {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()},
+                    'revocations': {'bytes': len(revoked_data), 'sha256': hashlib.sha256(revoked_data).hexdigest()}},
+        'candidate_fingerprints': [key['fingerprint'] for key in keys],
+        'revoked_fingerprints': [key['fingerprint'] for key in revoked],
+        'explicit_empty_revocation_declaration': not revoked,
+        'files': [{'file': name, 'mode': '0600', 'bytes': len(content), 'sha256': hashlib.sha256(content).hexdigest(),
+                   'content': content.decode()} for name, content in (
+                       ('ssh/admin_authorized_keys', authorized_content), ('ssh/admin_revoked_keys', revoked_content))],
+        'native_comparison': receipts,
+        'attempt_budget': {'native_operations_max': 8, 'native_operation_timeout_seconds': 10,
+                           'local_work_cleanup_reserve_seconds': 70, 'outer_timeout_seconds': 150,
+                           'outer_kill_grace_seconds': 5},
+        'authority': {name: False for name in (
+            'administrator_credential_authorized', 'owner_authority_verified', 'revocation_source_authenticated',
+            'revocation_policy_complete', 'revocation_freshness_proven', 'private_key_possession_proven',
+            'cryptographic_validity_proven', 'root_managed_destination_proven', 'trusted_source_ancestry_proven',
+            'native_azure_policy_proven', 'native_sshd_revocation_enforced', 'ssh_authentication_executed',
+            'keys_provisioned', 'installation_authorized', 'services_activated', 'server_ready')},
+        'limits': [
+            'Both inputs are explicit inspecting-user-owned snapshots; no source discovery or default empty substitution. '
+            'An empty or comment-only supplied list is an unauthenticated declaration, not current/complete revocation policy.',
+            'Only the accepted strong bare Ed25519/RSA public-key profile is supported. Certificates, KRL inputs, '
+            'fingerprint-only records, options and unsupported/weak legacy keys defer rather than being silently ignored.',
+            'Known revoked/unrevoked native controls and all supplied membership records are checked using private generated '
+            'KRLs; those KRLs are not emitted or installed. The prospective deterministic server file is plain public keys.',
+            'Comparing supplied lists is not authority, freshness, cryptographic validity or native sshd enforcement. '
+            'Future installation must authorize and consume SAME candidate/plain-revocation bytes under checked root-owned '
+            'destination and complete effective invocation. Missing/unreadable RevokedKeys must remain fail-closed.',
+            'Sequential snapshots are not atomic/ABA/concurrent-root or parent-provenance guarantees. Trusted native '
+            'base/OpenSSH/Python/private ancestry and finite honest IO/scheduling remain assumptions; normal cleanup precedes '
+            'success, abrupt termination may leave owned PUBLIC-only temporary files. No login/activation/readiness proof.'
+        ],
+    }
+
+
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         return 64
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (20, 25))
+        resource.setrlimit(resource.RLIMIT_CPU, (85, 90) if len(sys.argv) == 3 else (20, 25))
         resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024,) * 2)
         resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 1024,) * 2)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        result = inspect(sys.argv[1])
+        result = inspect_policy(sys.argv[1], sys.argv[2]) if len(sys.argv) == 3 else inspect(sys.argv[1])
     except (OSError, ValueError, subprocess.SubprocessError):
         # Never echo source data: a mistaken private/secret input must not leak.
         print('SSH public-key inspection refused', file=sys.stderr)
