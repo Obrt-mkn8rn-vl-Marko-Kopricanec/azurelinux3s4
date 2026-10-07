@@ -848,7 +848,7 @@ sys.exit(result.returncode)
         self.assertIn("tdnf", self.shell("s4_verifier_damage").stdout)
 
     def test_normal_transactions_refuse_unverified_metadata(self):
-        self.shell('s4_verify_metadata() { return 1; }; s4_tdnf install example', expected=75)
+        self.shell('s4_verify_metadata() { return 1; }; s4_tdnf makecache', expected=75)
 
     def test_recovery_transaction_does_not_load_damaged_plugins(self):
         result = self.shell('timeout() { printf "%s\\n" "$*"; if read -r line; then return 9; fi; }; s4_tdnf_recovery reinstall tdnf-plugin-repogpgcheck')
@@ -881,10 +881,10 @@ sys.exit(result.returncode)
         self.assertFalse((self.root / 'run/executed').exists())
 
     def test_transactions_have_timeout_refresh_and_no_stdin(self):
-        result = self.shell('s4_repositories; s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; command timeout "$@"; }; s4_tdnf install example')
-        self.assertIn("--kill-after=30s 15m python3 -I -", result.stdout)
+        result = self.shell('s4_repositories; s4_verify_metadata() { return 0; }; timeout() { printf "%s\\n" "$*"; command timeout "$@"; }; s4_tdnf makecache')
+        self.assertIn("--kill-after=30s 5m python3 -I -", result.stdout)
         transaction = json.loads((self.root / "native-transactions").read_text())
-        self.assertIn("--releasever=3.0 --refresh -y --disableplugin=* --enableplugin=tdnfrepogpgcheck install example",
+        self.assertIn("--releasever=3.0 --refresh -y --disableplugin=* --enableplugin=tdnfrepogpgcheck makecache",
                       " ".join(transaction["args"]))
         self.assertEqual(transaction["stdin"], "")
 
