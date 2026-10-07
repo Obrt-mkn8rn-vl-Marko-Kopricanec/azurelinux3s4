@@ -1,0 +1,50 @@
+s4_verify_repository_trust() {
+    # A stored success marker is insufficient. Re-import the pinned key and
+    # require a fresh native signed refresh of both enabled production repos.
+    s4_tdnf makecache
+}
+
+s4_update_store() {
+    # Two bounded slots preserve the last durable batch while preparing its
+    # replacement. A visible pointer is re-flushed before the other slot is reused.
+    local action=$1 directory=${2:-} receipt=${3:-}
+    s4_safe_path "$S4_STATE/updates" || return 75
+    timeout --kill-after=5s 5m python3 -I - "$action" "$S4_STATE/updates" \
+        "$S4_VENDOR_FINGERPRINT" "$directory" "$receipt" <<'PY'
+# @s4-include Updates/store.py
+PY
+}
+
+s4_prepare_updates() (
+    command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
+    s4_directory "$S4_STATE/updates" 0700 || return 75
+    local directory slot evidence
+    slot=$(s4_update_store begin) || return 75
+    directory=$(mktemp -d "$S4_RUN/updates.XXXXXX") || return 75
+    trap 'rm -rf -- "$directory"' EXIT
+    mkdir -m 0700 -- "$directory/incoming" || return 75
+    local S4_DOWNLOAD_DIRECTORY=$directory/incoming
+    if ! s4_tdnf upgrade --downloadonly "--downloaddir=$S4_DOWNLOAD_DIRECTORY" >"$directory/download.log"; then
+        cat -- "$directory/download.log" >&2
+        return 75
+    fi
+    cat -- "$directory/download.log" >&2
+    s4_update_store list "$directory/incoming" >"$directory/files" || return 75
+    local -a packages=()
+    mapfile -d '' -t packages <"$directory/files"
+    if (( ${#packages[@]} )); then
+        local S4_ADMISSION_DESTINATION=$slot/packages
+        s4_verify_rpm_artifacts "${packages[@]}" >"$directory/receipt.json" || return 75
+    else
+        # Empty output is not proof that the solver found no work. Require its
+        # explicit native no-action observation after the signed refresh.
+        awk '$0 == "Nothing to do." { found=1 } END { exit !found }' "$directory/download.log" || return 75
+        printf '{"schema":1,"vendor_fingerprint":"%s","artifacts":[],"installs_performed":false,"snapshots_retained":true,"freshness_proven":false}\n' \
+            "$S4_VENDOR_FINGERPRINT" >"$directory/receipt.json"
+    fi
+    evidence=$(s4_update_store commit "$slot" "$directory/receipt.json") || return 75
+    rm -rf -- "$directory" || return 75
+    trap - EXIT
+    s4_log 'Signed update batch prepared; no packages were installed.'
+    printf '%s\n' "$evidence"
+)

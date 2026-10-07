@@ -1,0 +1,91 @@
+s4_rpm_effects_program() {
+    # Decode bounded native exports, never evaluate script text or macros.
+    # This inventory does not predict trigger selection or approve execution.
+    cat <<'PY'
+# @s4-include Updates/effects.py
+PY
+}
+
+s4_rpm_test_program() {
+    # The public RPM 4.18.2 ABI permits mixed upgrade/install-only elements.
+    # TEST only: no plugins/scripts/triggers. Capacity is explicitly unproved;
+    # RPM treats a read-only mount as zero available blocks even in TEST mode.
+    cat <<'PY'
+# @s4-include Updates/rpm_test.py
+PY
+}
+
+s4_update_capacity_program() {
+    # Observe advertised capacity only; scripts/rollback and reservation remain unproved.
+    cat <<'PY'
+# @s4-include Updates/capacity.py
+PY
+}
+
+s4_check_updates() (
+    command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
+    local directory database evidence
+    database=$(s4_rpm_database_path) || return 75
+    directory=$(mktemp -d "$S4_RUN/update-check.XXXXXX") || return 75
+    trap 'rm -rf -- "$directory"' EXIT
+    s4_update_store plan >"$directory/plan.json" || return 75
+    mkdir -m 0700 -- "$directory/packages" "$directory/home" || return 75
+    timeout --kill-after=5s 1m python3 -I - "$directory/plan.json" >"$directory/files" <<'PY' || return 75
+# @s4-include Updates/plan.py
+PY
+    local -a packages=()
+    mapfile -d '' -t packages <"$directory/files"
+    if (( ${#packages[@]} )); then
+        local S4_ADMISSION_DESTINATION=$directory/packages
+        s4_verify_rpm_artifacts "${packages[@]}" >"$directory/admission.json" || return 75
+    else
+        printf '{"schema":1,"vendor_fingerprint":"%s","artifacts":[],"installs_performed":false,"snapshots_retained":true,"freshness_proven":false}\n' \
+            "$S4_VENDOR_FINGERPRINT" >"$directory/admission.json"
+    fi
+    s4_vendor_key_matches || return 75
+    cp -- "$S4_GPG_KEY" "$directory/vendor.asc" || return 75
+    chmod 0400 -- "$directory/vendor.asc" || return 75
+    if (( ${#packages[@]} )); then
+        chmod 0400 -- "$directory/packages/"*.rpm || return 75
+    fi
+    if [[ $S4_EFFECTS_MODE == yes ]]; then
+        [[ -z $S4_CAPACITY_MODE ]] || return 75
+        s4_rpm_effects_program >"$directory/test.py" || return 75
+    else
+        : >"$directory/test.py"
+    fi
+    s4_rpm_test_program >>"$directory/test.py" || return 75
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$S4_EFFECTS_MODE" <<'PY'
+# @s4-include Updates/sandbox.py
+PY
+    then
+        if [[ $S4_CAPACITY_MODE == yes ]]; then
+            s4_update_capacity_program >"$directory/capacity.py" || return 75
+            evidence=$(timeout --kill-after=5s 5m python3 -I "$directory/capacity.py" "$directory" "$database") || return 75
+        else
+            evidence=$(cat -- "$directory/result.json") || return 75
+        fi
+    else
+        return 75
+    fi
+    rm -rf -- "$directory" || return 75
+    trap - EXIT
+    if [[ $S4_EFFECTS_MODE == yes ]]; then
+        s4_log 'Declared script metadata and installed removal identities observed; execution policy remains unfinished.'
+    elif [[ $S4_CAPACITY_MODE == yes ]]; then
+        s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
+    else
+        s4_log 'Retained signed RPM batch passed its read-only transaction test; installation is unfinished.'
+    fi
+    printf '%s\n' "$evidence"
+)
+
+s4_check_update_capacity() (
+    local S4_CAPACITY_MODE=yes
+    s4_check_updates
+)
+
+s4_check_update_effects() (
+    local S4_EFFECTS_MODE=yes
+    s4_check_updates
+)

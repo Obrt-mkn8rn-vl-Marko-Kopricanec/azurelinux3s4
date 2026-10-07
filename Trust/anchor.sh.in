@@ -1,0 +1,82 @@
+s4_vendor_key_material() {
+    # Public release key carried by this single executable; no network or GnuPG
+    # prerequisite is needed to recover its vetted bytes. Never trust a new key
+    # merely because a remote endpoint offers it.
+    cat <<'S4_VENDOR_KEY'
+# @s4-include Trust/vendor-key.asc
+S4_VENDOR_KEY
+}
+
+s4_vendor_key_matches() {
+    local digest
+    s4_safe_path "$S4_GPG_KEY" || return 1
+    [[ -f $S4_GPG_KEY && ! -L $S4_GPG_KEY ]] || return 1
+    [[ $(stat -c %s -- "$S4_GPG_KEY") == 983 ]] || return 1
+    digest=$(timeout --kill-after=5s 15s sha256sum -- "$S4_GPG_KEY") || return 1
+    [[ ${digest%% *} == "$S4_VENDOR_KEY_SHA256" ]]
+}
+
+s4_rpm_database_path() {
+    local keyring database
+    keyring=$(timeout --kill-after=5s 30s rpm --eval '%{?_keyring}') || return 75
+    # RPM 4.18 defaults to rpmdb for an unset keyring selector. A filesystem
+    # keyring must not be falsely certified by observing a different database.
+    [[ -z $keyring || $keyring == rpmdb ]] || return 75
+    database=$(timeout --kill-after=5s 30s rpm --eval '%{_dbpath}') || return 75
+    [[ $database == /* && ${#database} -le 4096 ]] || return 75
+    # A distro-owned leaf alias is allowed only inside trusted ancestry. Check
+    # that ancestry before following it so an unprivileged alias cannot redirect
+    # RPM while the persistence check observes an unrelated safe directory.
+    s4_safe_path "$(dirname -- "$database")" || return 75
+    if [[ -L $database ]]; then
+        [[ $(stat -c %u -- "$database") == 0 ]] || return 75
+    fi
+    database=$(readlink -e -- "$database") || return 75
+    s4_safe_path "$database" || return 75
+    [[ -d $database ]] || return 75
+    printf '%s\n' "$database"
+}
+
+s4_rpm_vendor_key_matches() {
+    local encoded digest
+    # PUBKEYS is the actual base64 packet material RPM loads, not a description
+    # or a short key ID. Bound output and compare the complete decoded keyblock.
+    encoded=$(timeout --kill-after=5s 30s rpm -q --qf '[%{PUBKEYS}\n]' \
+        gpg-pubkey-3135ce90-5e6fda74 | head -c 2049) || return 1
+    (( ${#encoded} > 0 && ${#encoded} <= 2048 )) || return 1
+    digest=$(printf '%s\n' "$encoded" | base64 --decode | sha256sum) || return 1
+    [[ ${digest%% *} == 38ced48482bda02f404a772c09c3572440a3f597bf15cc3b7abadaef60be2e81 ]]
+}
+
+s4_verify_trust_anchor() {
+    local database
+    s4_vendor_key_matches || return 1
+    database=$(s4_rpm_database_path) || return 1
+    s4_rpm_vendor_key_matches || return 1
+    # An earlier failed publication/import barrier can leave correct bytes
+    # visible. Re-establish persistence even on the existing healthy path.
+    timeout --kill-after=5s 30s sync -f -- "$(dirname -- "$S4_GPG_KEY")" \
+        "$database" "$(dirname -- "$database")" || return 1
+    s4_vendor_key_matches && s4_rpm_vendor_key_matches
+}
+
+s4_apply_trust_anchor() {
+    local material digest database
+    database=$(s4_rpm_database_path) || return 75
+    material=$(s4_vendor_key_material) || return 75
+    digest=$(printf '%s\n' "$material" | sha256sum) || return 75
+    [[ ${digest%% *} == "$S4_VENDOR_KEY_SHA256" ]] || {
+        s4_log 'Embedded vendor material differs from its vetted pin; repair is deferred.'
+        return 75
+    }
+    # Only our own regular-file target is replaced. Wrong-kind, linked or
+    # untrusted paths remain untouched under the accepted write contract.
+    s4_atomic_write "$S4_GPG_KEY" 0600 <<<"$material" || return $?
+    s4_vendor_key_matches || return 75
+    if ! s4_rpm_vendor_key_matches; then
+        timeout --kill-after=5s 30s rpm --import "$S4_GPG_KEY" </dev/null || return 75
+    fi
+    # Import exit zero is insufficient; require actual admitted packets and a
+    # persistence barrier, including on an already-registered retry.
+    s4_verify_trust_anchor || return 75
+}

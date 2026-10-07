@@ -11,7 +11,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'azurelinux3s4.sh'
-KEY = SCRIPT.parent / 'tests/fixtures/azurelinux-rpm-key.asc'
+KEY = SCRIPT.parent / 'Trust/vendor-key.asc'
 
 
 class PackageAdmissionTests(unittest.TestCase):

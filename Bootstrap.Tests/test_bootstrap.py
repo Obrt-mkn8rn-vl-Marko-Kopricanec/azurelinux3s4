@@ -50,7 +50,7 @@ uint32_t TDNFPluginLoadInterface(void **functions) {
         for name in ("state", "state/components", "state/repos", "run", "runner", "units", "systemd",
                      "bin", "plugin", "pluginconf", "rpmdb"):
             (self.root / name).mkdir(mode=0o700)
-        material = (SCRIPT.parent / "tests/fixtures/azurelinux-rpm-key.asc").read_bytes()
+        material = (SCRIPT.parent / "Trust/vendor-key.asc").read_bytes()
         (self.root / "rpm-key").write_bytes(material)
         packets = base64.b64decode("".join(line for line in material.decode('ascii').splitlines()
             if line and not line.startswith(("-----", "Version:", "="))), validate=True)
@@ -998,7 +998,7 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
 
     def test_embedded_anchor_is_exact_reviewed_public_material(self):
         result = self.shell('s4_vendor_key_material')
-        self.assertEqual(result.stdout.encode(), (SCRIPT.parent / 'tests/fixtures/azurelinux-rpm-key.asc').read_bytes())
+        self.assertEqual(result.stdout.encode(), (SCRIPT.parent / 'Trust/vendor-key.asc').read_bytes())
         self.assertEqual(hashlib.sha256(result.stdout.encode()).hexdigest(),
                          '1092f37ec429e58bf9c7f898df17c3c32eb2ce3c4c037afb8ffe2d2b42e16e89')
 
@@ -1009,7 +1009,7 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
         self.command('gpg2', 'raise SystemExit(99)\n')
         self.command('tdnf', 'raise SystemExit(99)\n')
         self.shell('s4_apply_trust_anchor; s4_verify_trust_anchor')
-        self.assertEqual((self.root / 'rpm-key').read_bytes(), (SCRIPT.parent / 'tests/fixtures/azurelinux-rpm-key.asc').read_bytes())
+        self.assertEqual((self.root / 'rpm-key').read_bytes(), (SCRIPT.parent / 'Trust/vendor-key.asc').read_bytes())
         self.assertEqual((self.root / 'rpm-key').stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.root / 'rpm-imports').read_text().splitlines(), [str(self.root / 'rpm-key')])
 

@@ -1,0 +1,61 @@
+s4_verify_rpm_artifacts() (
+    # Admission evidence only. A future update executor must consume the same
+    # admitted snapshots; this API never installs or promises freshness.
+    (( $# >= 1 && $# <= 128 )) || return 64
+    command -v python3 >/dev/null && command -v rpmkeys >/dev/null || return 75
+    s4_safe_path "$S4_RUN" && s4_safe_path "$S4_GPG_KEY" || return 75
+    local path directory result=0 evidence
+    if [[ -n $S4_ADMISSION_DESTINATION ]]; then
+        s4_safe_path "$S4_ADMISSION_DESTINATION" || return 75
+    fi
+    for path in "$@"; do
+        s4_safe_path "$path" || return 75
+    done
+    directory=$(mktemp -d "$S4_RUN/package-admission.XXXXXX") || return 75
+    trap 'rm -rf -- "$directory"' EXIT
+    if timeout --signal=TERM --kill-after=5s 15m python3 -I - \
+        "$directory" "$S4_GPG_KEY" "$S4_VENDOR_KEY_SHA256" \
+        "$S4_VENDOR_FINGERPRINT" "$S4_ADMISSION_DESTINATION" "$@" >"$directory/result.json" <<'PY'
+# @s4-include Packages/admission.py
+PY
+    then
+        evidence=$(head -c 1048577 -- "$directory/result.json") || result=75
+        (( ${#evidence} <= 1048576 )) || result=75
+    else
+        result=75
+    fi
+    # Publish no success until ordinary success/failure/timeout cleanup finishes.
+    if ! rm -rf -- "$directory"; then
+        s4_log 'Private package admission cleanup failed.'
+        return 75
+    fi
+    trap - EXIT
+    (( result == 0 )) || return 75
+    printf '%s\n' "$evidence"
+)
+
+s4_tdnf() {
+    if [[ -n $S4_DOWNLOAD_DIRECTORY ]]; then
+        [[ $# == 3 && $1 == upgrade && $2 == --downloadonly && $3 == "--downloaddir=$S4_DOWNLOAD_DIRECTORY" ]] || return 78
+        s4_safe_path "$S4_DOWNLOAD_DIRECTORY" || return 75
+        [[ -d $S4_DOWNLOAD_DIRECTORY && ! -L $S4_DOWNLOAD_DIRECTORY ]] || return 75
+    else
+        [[ $# == 1 && $1 == makecache ]] || {
+        s4_log 'The signed update executor is unfinished; package-changing operations are deferred.'
+            return 78
+        }
+    fi
+    s4_verify_metadata || return 75
+    s4_safe_path "$S4_GPG_KEY" || return 75
+    [[ -f $S4_GPG_KEY && ! -L $S4_GPG_KEY ]] || return 75
+    local limit=15m
+    [[ ${1:-} != makecache ]] || limit=5m
+    # The native plugin uses GnuPG's keyring, not the repository's gpgkey option.
+    # Build a new keyring per operation; never inherit an administrator's keys,
+    # trust database, home configuration, agent, or network key retrieval.
+    timeout --signal=TERM --kill-after=30s "$limit" \
+        python3 -I - "$S4_RUN" "$S4_GPG_KEY" "$S4_VENDOR_KEY_SHA256" \
+        "$S4_VENDOR_FINGERPRINT" "$S4_STATE/tdnf.conf" "$limit" "$S4_DOWNLOAD_DIRECTORY" "$@" <<'PY'
+# @s4-include Packages/download.py
+PY
+}

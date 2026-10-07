@@ -1,0 +1,110 @@
+s4_verify_component() {
+    case $1 in
+        trust-anchor) s4_verify_trust_anchor ;;
+        bootstrap) s4_verify_bootstrap ;;
+        repository-trust) s4_verify_repository_trust ;;
+        update-preparation) s4_update_store verify && s4_timer_state enabled active "$S4_UPDATE_TIMER" ;;
+        update-compatibility) s4_check_updates ;;
+        update-capacity) s4_check_update_capacity ;;
+        update-effects) s4_check_update_effects ;;
+        *) return 78 ;;
+    esac
+}
+
+s4_tdnf_recovery() {
+    # Never load a known-damaged plugin to repair that plugin. This narrowly
+    # scoped bootstrap/recovery path retains TLS and RPM signature enforcement;
+    # its first-fetch metadata limitation is reported before it is used.
+    timeout --signal=TERM --kill-after=30s 15m \
+        tdnf -c "$S4_STATE/tdnf.conf" --releasever=3.0 --refresh -y \
+        --noplugins "$@" </dev/null
+}
+
+s4_verifier_damage() {
+    # Check the registered runtime dependency closure before any plugin is loaded.
+    # Queries and verification scripts must not execute package-supplied scripts.
+    timeout --kill-after=5s 3m python3 -I - <<'PY'
+# @s4-include Bootstrap/integrity.py
+PY
+}
+
+s4_probe_verifier() {
+    # No network, RPM transaction, global cache or imported test key is involved.
+    # The control proves the fixture is readable; the enabled verifier must then
+    # load through native tdnf and reject its deliberately invalid signature.
+    timeout --kill-after=5s 90s python3 -I - "$S4_RUN" \
+        "$S4_PLUGIN_LIBRARY" "$S4_PLUGIN_CONFIG" <<'PY'
+# @s4-include Bootstrap/participation.py
+PY
+}
+
+s4_verify_metadata() {
+    local damage tool executable library
+    [[ -f $S4_PLUGIN_LIBRARY && ! -L $S4_PLUGIN_LIBRARY && -f $S4_PLUGIN_CONFIG ]] || return 1
+    # Azure Linux's RPM-owned /usr/lib64 alias may resolve to /usr/lib.
+    library=$(readlink -e -- "$S4_PLUGIN_LIBRARY") || return 1
+    s4_safe_path "$library" || return 1
+    s4_safe_path "$S4_PLUGIN_CONFIG" || return 1
+    for tool in tdnf rpm python3 gpg2; do
+        # Distro executable aliases (such as python3) may be RPM-owned symlinks.
+        executable=$(readlink -e -- "$(command -v "$tool")") || return 1
+        s4_safe_path "$executable" || return 1
+        [[ -f $executable && -x $executable ]] || return 1
+    done
+    cmp -s -- "$S4_PLUGIN_CONFIG" <(printf '[main]\nenabled=1\n') || return 1
+    damage=$(s4_verifier_damage) || return 1
+    [[ -z $damage ]] || { s4_log "Damaged verifier runtime packages: $damage"; return 1; }
+    s4_probe_verifier
+}
+
+s4_verify_bootstrap() {
+    local package
+    for package in "${S4_BOOTSTRAP_PACKAGES[@]}"; do
+        rpm -q "$package" >/dev/null 2>&1 || return 1
+    done
+    command -v curl >/dev/null || return 1
+    command -v python3 >/dev/null || return 1
+    command -v update-ca-trust >/dev/null || return 1
+    [[ -s $S4_CA_BUNDLE ]] || return 1
+    openssl x509 -in "$S4_CA_BUNDLE" -noout >/dev/null 2>&1 || return 1
+    s4_verify_metadata
+}
+
+s4_activate_verifier() {
+    [[ -f $S4_PLUGIN_LIBRARY ]] || return 1
+    s4_directory "$(dirname -- "$S4_PLUGIN_CONFIG")" 0755 || return $?
+    s4_atomic_write "$S4_PLUGIN_CONFIG" 0644 <<'EOF'
+[main]
+enabled=1
+EOF
+}
+
+s4_apply_bootstrap() {
+    local package missing=no damage
+    local -a damaged=()
+    s4_repositories || return $?
+    # Rebuild already-installed trust assets before HTTPS operations. A broken
+    # RPM post-install hook must not be mistaken for a functional CA bundle.
+    if command -v update-ca-trust >/dev/null; then
+        update-ca-trust extract || return $?
+    fi
+    if [[ -f $S4_PLUGIN_LIBRARY ]]; then
+        s4_activate_verifier || return $?
+    fi
+    for package in "${S4_BOOTSTRAP_PACKAGES[@]}"; do
+        rpm -q "$package" >/dev/null 2>&1 || missing=yes
+    done
+    if [[ $missing == yes ]]; then
+        s4_log 'Bootstrapping the verifier using TLS and distro-signed RPMs; first-fetch metadata trust remains limited.'
+        s4_tdnf_recovery install "${S4_BOOTSTRAP_PACKAGES[@]}" || return $?
+    fi
+    damage=$(s4_verifier_damage) || return 75
+    if [[ -n $damage ]]; then
+        mapfile -t damaged <<<"$damage"
+        s4_log 'Restoring damaged verifier payloads using TLS and distro-signed RPMs; recovery metadata trust remains limited.'
+        s4_tdnf_recovery reinstall "${damaged[@]}" || return $?
+    fi
+    s4_activate_verifier || return $?
+    update-ca-trust extract || return $?
+    s4_verify_bootstrap
+}
