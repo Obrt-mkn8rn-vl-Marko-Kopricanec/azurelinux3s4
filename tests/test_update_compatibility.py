@@ -355,6 +355,9 @@ s4_verify_bootstrap() {{ return 0; }}
 s4_repositories() {{ return 0; }}
 s4_verify_repository_trust() {{ return 0; }}
 s4_prepare_updates() {{ return 0; }}
+# Capacity has separate current-default coverage; keep this accepted case's
+# purpose focused on compatibility refusal and its finalization dependency.
+s4_check_update_capacity() {{ return 0; }}
 s4_start_timer() {{ return 0; }}
 s4_start_repair_timer() {{ touch {shlex.quote(str(self.root / 'retry'))}; }}
 s4_finish_repair() {{ touch {shlex.quote(str(self.root / 'finished'))}; }}
@@ -372,4 +375,4 @@ s4_repair yes
     def test_generated_deadline_covers_readmission_store_test_and_state_controls(self):
         deadline = int(self.shell('s4_repair_timeout_seconds').stdout)
         self.assertGreaterEqual(deadline, 9365 + 2 * 35 + 20 + 305 + 65 + 905 + 930 + 4 * 35)
-        self.assertLessEqual(deadline, 4 * 60 * 60)
+        self.assertLessEqual(deadline, 5 * 60 * 60)

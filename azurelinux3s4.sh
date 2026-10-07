@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.6.0
+S4_VERSION=0.7.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,11 +21,12 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity)
 S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
 # Internal dynamic-scope options; never accept inherited environment values.
 S4_ADMISSION_DESTINATION=
 S4_DOWNLOAD_DIRECTORY=
+S4_CAPACITY_MODE=
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -925,6 +926,9 @@ import sys
 
 try:
     root, database, architecture = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    if sys.argv[4:] not in ([], ["capacity"]):
+        raise ValueError("unsupported RPM diagnostic mode")
+    capacity = bool(sys.argv[4:])
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
     if (any(int(status[name].strip(), 16) for name in ("CapEff", "CapPrm", "CapBnd", "CapAmb"))
             or status["NoNewPrivs"].strip() != "1"):
@@ -1015,6 +1019,20 @@ try:
         "rpmlogGetNrecsByMask": (integer, unsigned), "rpmlogSetMask": (integer, integer),
     }
     api = {name: bind(name, *signature) for name, signature in signatures.items()}
+    if capacity:
+        extra = {
+            "rpmfiNew": (pointer, pointer, pointer, integer, unsigned),
+            "rpmfiFree": (pointer, pointer), "rpmfiInit": (pointer, pointer, integer),
+            "rpmfiNext": (integer, pointer), "rpmfiFC": (unsigned, pointer),
+            "rpmfiFN": (string, pointer), "rpmfiFSize": (C.c_uint64, pointer),
+            "rpmfiFMode": (C.c_uint16, pointer), "rpmfiFFlags": (unsigned, pointer),
+            "rpmfiFLink": (string, pointer),
+            "headerGet": (integer, pointer, integer, pointer, unsigned),
+            "rpmtdNew": (pointer,), "rpmtdFree": (pointer, pointer),
+            "rpmtdFreeData": (None, pointer), "rpmtdCount": (unsigned, pointer),
+            "rpmtdType": (integer, pointer),
+        }
+        api.update({name: bind(name, *signature) for name, signature in extra.items()})
     libc = C.CDLL(None)
     libc.free.argtypes, libc.free.restype = [pointer], None
     if api["rpmReadConfigFiles"](None, None):
@@ -1089,6 +1107,88 @@ try:
     install_only = {b"kernel", b"kernel-mshv", b"kernel-uvm", b"kernel-uki", b"kernel-64k", b"kernel-hwe"}
     additions, removals = [], []
     pretrans = {}
+    inventory, file_total, header_total, payload_total = [], 0, 0, 0
+    def tag_info(header, tag):
+        td = api["rpmtdNew"]()
+        if not td:
+            raise ValueError("signed file tag allocation failed")
+        try:
+            present = api["headerGet"](header, tag, td, 0)
+            if present not in (0, 1):
+                raise ValueError("signed file tag observation failed")
+            return (api["rpmtdType"](td), api["rpmtdCount"](td)) if present else None
+        finally:
+            api["rpmtdFreeData"](td)
+            api["rpmtdFree"](td)
+    def payload(header, index):
+        global file_total, header_total, payload_total
+        fi, material = None, None
+        try:
+            names = tag_info(header, 1117)  # BASENAMES, string array.
+            if names is None:
+                if tag_info(header, 1027) is not None:
+                    raise ValueError("obsolete signed file paths are unsupported")
+                count = 0
+            else:
+                if names[0] != 8:
+                    raise ValueError("signed basename array type is invalid")
+                count = names[1]
+            file_total += count
+            if file_total > 131072:
+                raise ValueError("signed file inventory exceeds its count bound")
+            # rpmfi otherwise silently defaults missing attributes to zero;
+            # validate types/counts BEFORE its C iterator indexes those arrays.
+            short, long = tag_info(header, 1028), tag_info(header, 5008)
+            arrays = [(tag_info(header, 1030), 3), (tag_info(header, 1037), 4)]
+            if short is not None:
+                arrays.append((short, 4))
+            if long is not None:
+                arrays.append((long, 5))
+            if count and short is None and long is None:
+                raise ValueError("signed file size array is missing")
+            for entry, kind in arrays:
+                if (count and entry != (kind, count)) or (entry is not None and entry != (kind, count)):
+                    raise ValueError("signed file attribute array type/count differs")
+            links = tag_info(header, 1036)
+            if links is not None and links != (8, count):
+                raise ValueError("signed symlink array type/count differs")
+            # Load only sizes/modes/flags/links and the validated path triplet.
+            # The earlier independent cryptographic admission and native TEST
+            # continue to verify signatures/digests; this is inventory control.
+            fi_flags = ((1 << 20) - 2) & ~((1 << 6) | (1 << 7) | (1 << 9) | (1 << 17))
+            fi = api["rpmfiNew"](ts, header, 0, fi_flags)
+            if not fi or api["rpmfiFC"](fi) != count or not api["rpmfiInit"](fi, 0):
+                raise ValueError("signed file inventory could not be loaded consistently")
+            size = unsigned()
+            material = api["headerExport"](header, C.byref(size))
+            header_total += size.value
+            if not material or not 0 < size.value <= 8 * 1024 * 1024 or header_total > 64 * 1024 * 1024:
+                raise ValueError("signed header inventory exceeds its bound")
+            files, seen = [], set()
+            for expected in range(count):
+                if api["rpmfiNext"](fi) != expected:
+                    raise ValueError("signed file inventory ended or changed unexpectedly")
+                name, link = api["rpmfiFN"](fi), api["rpmfiFLink"](fi)
+                length, mode, flags = api["rpmfiFSize"](fi), api["rpmfiFMode"](fi), api["rpmfiFFlags"](fi)
+                if not name or len(name) > 4096 or name in seen or length > 16 * 1024 ** 3:
+                    raise ValueError("signed file metadata is missing, duplicated or excessive")
+                if stat.S_ISLNK(mode) and (links is None or not link):
+                    raise ValueError("signed symlink target is missing")
+                seen.add(name)
+                payload_total += length
+                if payload_total > 64 * 1024 ** 3:
+                    raise ValueError("expanded signed payload exceeds its bound")
+                files.append({"path": name.decode("utf-8"), "bytes": length, "mode": mode,
+                              "flags": flags, "link": link.decode("utf-8") if link else ""})
+            if api["rpmfiNext"](fi) != -1:
+                raise ValueError("signed file inventory has unexpected trailing entries")
+            inventory.append({"file": records[index]["file"], "sha256": records[index]["sha256"],
+                              "bytes": records[index]["bytes"], "header_bytes": size.value, "files": files})
+        finally:
+            if material:
+                libc.free(material)
+            if fi:
+                api["rpmfiFree"](fi)
     opened, consumed, callback_errors = {}, set(), []
     callback_type = C.CFUNCTYPE(pointer, pointer, integer, C.c_uint64, C.c_uint64, pointer, pointer)
     @callback_type
@@ -1121,7 +1221,7 @@ try:
     try:
         if set_notify(ts, notify, None):
             raise ValueError("native snapshot callback could not be established")
-        for path in paths:
+        for index, path in enumerate(paths):
             fd, header = api["Fopen"](path, b"r.ufdio"), pointer()
             try:
                 if not fd or api["Ferror"](fd) or api["rpmReadPackageFile"](ts, fd, path, C.byref(header)) or not header:
@@ -1132,6 +1232,8 @@ try:
                 if api["rpmtsAddInstallElement"](ts, header, path, int(name not in install_only), None):
                     raise ValueError("native mixed transaction could not admit every input")
                 pretrans[path] = bool(api["headerIsEntry"](header, 1151))
+                if capacity:
+                    payload(header, index)
             finally:
                 if header:
                     api["headerFree"](header)
@@ -1193,15 +1295,412 @@ try:
         index = paths.index(path)
         addition.update(file=records[index]["file"], sha256=records[index]["sha256"], bytes=records[index]["bytes"])
         addition["pretrans_present"] = pretrans[path]
-    print(json.dumps({"schema": 1, "manifest_sha256": plan["manifest_sha256"],
+    proof = {"schema": 1, "manifest_sha256": plan["manifest_sha256"],
                       "baseline": before, "additions": additions, "removals": removals,
                       "rpm_test_performed": bool(paths), "test_passed": True,
                       "installs_performed": False, "scripts_executed": False,
                       "installation_authorized": False, "storage_capacity_checked": False,
-                      "freshness_proven": False}, sort_keys=True))
+                      "freshness_proven": False}
+    if capacity:
+        data = json.dumps({"schema": 1, "manifest_sha256": plan["manifest_sha256"],
+                           "artifacts": inventory}, sort_keys=True).encode("utf-8")
+        if len(data) > 32 * 1024 * 1024:
+            raise ValueError("signed file inventory exceeds its output bound")
+        with (root / "inventory.json").open("xb") as output:
+            output.write(data)
+        proof["payload_inventory"] = {"sha256": hashlib.sha256(data).hexdigest(),
+                                      "bytes": len(data), "files": file_total}
+    print(json.dumps(proof, sort_keys=True))
 except (ValueError, KeyError, TypeError, OSError, UnicodeError, AttributeError) as error:
     print("azurelinux3s4: RPM compatibility deferred: " + str(error), file=sys.stderr)
     sys.exit(75)
+PY
+}
+
+s4_update_capacity_program() {
+    # Observe advertised capacity only; scripts/rollback and reservation remain unproved.
+    cat <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import resource
+import stat
+import sys
+
+def private(path, limit):
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+            or not 0 < before.st_size <= limit):
+        raise ValueError("capacity input is not a bounded private regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as source:
+        opened = os.fstat(source.fileno())
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("capacity input changed before opening")
+        data = source.read(limit + 1)
+        after = os.fstat(source.fileno())
+    if ((after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+            (before.st_size, before.st_mtime_ns, before.st_ctime_ns) or len(data) != before.st_size):
+        raise ValueError("capacity input changed during reading")
+    return data
+
+def pathname(value):
+    if (not isinstance(value, str) or not value.startswith("/") or "//" in value
+            or len(value.encode("utf-8")) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value)
+            or (value != "/" and value.endswith("/"))
+            or any(part in (".", "..") for part in value.split("/"))):
+        raise ValueError("signed destination path is not canonical")
+    return value
+
+def trusted(observed):
+    if observed.st_uid not in (0, os.geteuid()) or observed.st_mode & 0o022:
+        raise ValueError("capacity destination has untrusted writable ancestry")
+
+def identity(observed):
+    return (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_uid, observed.st_gid)
+
+def mount_id(fd):
+    entries = re.findall(r"^mnt_id:\s*([0-9]+)$", Path(f"/proc/self/fdinfo/{fd}").read_text(), re.M)
+    if len(entries) != 1:
+        raise ValueError("descriptor mount identity could not be observed")
+    return int(entries[0])
+
+def dir_open(name, fd=None):
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                   dir_fd=fd)
+
+held = []
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_CPU, (240, 245))
+    _, descriptor_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    descriptor_limit = min(256, descriptor_hard) if descriptor_hard > 0 else 256
+    resource.setrlimit(resource.RLIMIT_NOFILE, (descriptor_limit, descriptor_hard))
+    workspace, database = Path(sys.argv[1]), pathname(sys.argv[2])
+    proof = json.loads(private(workspace / "result.json", 1024 * 1024))
+    data = private(workspace / "inventory.json", 32 * 1024 * 1024)
+    inventory = json.loads(data)
+    receipt = proof["payload_inventory"]
+    if (proof.get("test_passed") is not True or proof.get("installation_authorized") is not False
+            or receipt.get("sha256") != hashlib.sha256(data).hexdigest() or receipt.get("bytes") != len(data)
+            or set(inventory) != {"schema", "manifest_sha256", "artifacts"} or inventory["schema"] != 1
+            or inventory["manifest_sha256"] != proof["manifest_sha256"]
+            or not isinstance(inventory["artifacts"], list) or len(inventory["artifacts"]) > 128):
+        raise ValueError("capacity inventory is not bound to the successful same-byte TEST")
+    expected = {item["file"]: (item["sha256"], item["bytes"]) for item in proof["additions"]}
+    if len(expected) != len(proof["additions"]) or len(expected) != len(inventory["artifacts"]):
+        raise ValueError("capacity inventory batch count differs")
+    files, header_bytes, payload_bytes, seen_packages, types = [], 0, 0, set(), {}
+    for package in inventory["artifacts"]:
+        if (set(package) != {"file", "sha256", "bytes", "header_bytes", "files"}
+                or package["file"] in seen_packages
+                or expected.get(package["file"]) != (package["sha256"], package["bytes"])
+                or type(package["header_bytes"]) is not int or not 0 < package["header_bytes"] <= 8 * 1024 * 1024
+                or not isinstance(package["files"], list)):
+            raise ValueError("capacity inventory does not preserve the admitted package identity")
+        seen_packages.add(package["file"])
+        header_bytes += package["header_bytes"]
+        seen_paths = set()
+        for entry in package["files"]:
+            if (set(entry) != {"path", "bytes", "mode", "flags", "link"}
+                    or type(entry["bytes"]) is not int or not 0 <= entry["bytes"] <= 16 * 1024 ** 3
+                    or type(entry["mode"]) is not int or not 0 <= entry["mode"] <= 65535
+                    or type(entry["flags"]) is not int or not 0 <= entry["flags"] < 2 ** 32
+                    or not isinstance(entry["link"], str) or len(entry["link"].encode("utf-8")) > 4096
+                    or any(ord(c) < 32 or ord(c) == 127 for c in entry["link"])):
+                raise ValueError("signed capacity file record is malformed")
+            path = pathname(entry["path"])
+            if path in seen_paths:
+                raise ValueError("signed capacity inventory duplicates a package path")
+            seen_paths.add(path)
+            files.append(entry)
+            payload_bytes += entry["bytes"]
+            if not entry["flags"] & 64:  # Ghost entries have no packaged payload.
+                kind = stat.S_IFMT(entry["mode"])
+                if kind not in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK) or (path == "/" and kind != stat.S_IFDIR):
+                    raise ValueError("capacity refuses special destination objects")
+                layout = (kind, entry["link"] if kind == stat.S_IFLNK else "")
+                if path in types and types[path] != layout:
+                    raise ValueError("batch changes a shared destination kind or link")
+                types[path] = layout
+    if (len(files) != receipt.get("files") or len(files) > 131072
+            or header_bytes > 64 * 1024 * 1024 or payload_bytes > 64 * 1024 ** 3):
+        raise ValueError("capacity inventory exceeds its bounds")
+
+    mount_data = Path("/proc/self/mountinfo").read_bytes()
+    if not 0 < len(mount_data) <= 4 * 1024 * 1024:
+        raise ValueError("mount inventory exceeds its bounds")
+    mounts = {}
+    for line in mount_data.decode("utf-8").splitlines():
+        left, right = line.split(" - ", 1)
+        fields, details = left.split(), right.split()
+        number = int(fields[0])
+        if number in mounts or len(fields) < 6 or len(details) != 3:
+            raise ValueError("mount inventory is malformed")
+        mounts[number] = {"device": tuple(map(int, fields[2].split(":"))), "fs": details[0],
+                          "source": details[1], "options": set(fields[5].split(",") + details[2].split(","))}
+    if not 0 < len(mounts) <= 4096:
+        raise ValueError("mount count is unsupported")
+
+    def forbidden(path):
+        return any(path == prefix or path.startswith(prefix + "/") for prefix in
+                   ("/dev", "/proc", "/sys", "/run", "/tmp", "/var/tmp", "/var/run", "/var/lock"))
+
+    def resolve(path):
+        # Traverse only directories. Never open a FIFO/device/socket as input.
+        pending = list(PurePosixPath(path).parts[1:])
+        if len(pending) > 64:
+            raise ValueError("destination ancestry exceeds its depth bound")
+        fd, parts, trace, missing, links = dir_open("/"), [], [], [], 0
+        try:
+            observed = os.fstat(fd)
+            trusted(observed)
+            trace.append(("/", identity(observed), mount_id(fd)))
+            while pending:
+                name = pending.pop(0)
+                if name in ("", "."):
+                    continue
+                if name == "..":
+                    raise ValueError("destination symlink contains unsupported parent traversal")
+                current = "/" + "/".join(parts + [name])
+                if forbidden(current):
+                    raise ValueError("capacity destination is a runtime or special filesystem path")
+                planned = types.get(current)
+                if missing:
+                    entry = None
+                else:
+                    try:
+                        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        entry = None
+                if entry is None:
+                    if planned and planned[0] != stat.S_IFDIR:
+                        raise ValueError("batch creates a non-directory destination ancestor")
+                    parts.append(name)
+                    missing.append(current)
+                    continue
+                if stat.S_ISLNK(entry.st_mode):
+                    if entry.st_uid not in (0, os.geteuid()):
+                        raise ValueError("destination symlink owner is untrusted")
+                    target = os.readlink(name, dir_fd=fd)
+                    if planned and planned != (stat.S_IFLNK, target):
+                        raise ValueError("batch changes a destination symlink ancestor")
+                    links += 1
+                    if links > 40 or not target or len(target.encode("utf-8")) > 4096:
+                        raise ValueError("destination symlink traversal exceeds its bound")
+                    trace.append((current, identity(entry), target))
+                    if target.startswith("/"):
+                        os.close(fd)
+                        fd, parts = dir_open("/"), []
+                    pending = list(PurePosixPath(target).parts[1:] if target.startswith("/")
+                                   else PurePosixPath(target).parts) + pending
+                    if len(parts) + len(pending) > 64:
+                        raise ValueError("resolved destination ancestry exceeds its bound")
+                    continue
+                if not stat.S_ISDIR(entry.st_mode) or (planned and planned[0] != stat.S_IFDIR):
+                    raise ValueError("destination ancestor is not a retained directory")
+                trusted(entry)
+                next_fd = dir_open(name, fd)
+                if identity(os.fstat(next_fd)) != identity(entry):
+                    os.close(next_fd)
+                    raise ValueError("destination changed during descriptor traversal")
+                trace.append((current, identity(entry), mount_id(next_fd)))
+                os.close(fd)
+                fd = next_fd
+                parts.append(name)
+            return fd, (tuple(trace), tuple(missing), "/" + "/".join(parts))
+        except BaseException:
+            os.close(fd)
+            raise
+
+    volumes, observations, missing_dirs = {}, {}, set()
+    def availability(fd):
+        value = os.fstatvfs(fd)
+        if (value.f_flag & os.ST_RDONLY or any(type(getattr(value, key)) is not int for key in
+                ("f_frsize", "f_bsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree", "f_favail"))
+                or not 512 <= value.f_frsize <= 1024 * 1024 or value.f_frsize & (value.f_frsize - 1)
+                or not 512 <= value.f_bsize <= 1024 * 1024 or value.f_bsize & (value.f_bsize - 1)
+                or not 0 <= value.f_bavail <= value.f_bfree <= value.f_blocks or value.f_blocks <= 0
+                or not 0 <= value.f_favail <= value.f_ffree <= value.f_files or value.f_files <= 0):
+            raise ValueError("filesystem does not advertise bounded writable block/inode availability")
+        return {"allocation": max(value.f_frsize, value.f_bsize), "unit": value.f_frsize,
+                "blocks": value.f_blocks, "inodes": value.f_files,
+                "available_bytes": value.f_bavail * value.f_frsize, "available_inodes": value.f_favail}
+
+    def volume(fd):
+        observed, number = os.fstat(fd), mount_id(fd)
+        mount = mounts.get(number)
+        if (not mount or mount["device"] != (os.major(observed.st_dev), os.minor(observed.st_dev))
+                or mount["fs"] not in ("ext4", "xfs") or not mount["source"].startswith("/dev/")
+                or "rw" not in mount["options"] or "ro" in mount["options"]
+                or any("quota" in option and option != "noquota" or option.split("=", 1)[0] in
+                       {"uquota", "gquota", "pquota", "uqnoenforce", "gqnoenforce", "pqnoenforce", "qnoenforce", "jqfmt"}
+                       for option in mount["options"])):
+            raise ValueError("capacity supports only local ext4/xfs without advertised quota options")
+        current = availability(fd)
+        device = observed.st_dev
+        if device not in volumes:
+            if len(volumes) >= 64:
+                raise ValueError("capacity filesystem count exceeds its bound")
+            volumes[device] = {"device": device, "filesystem": mount["fs"], "mount_ids": set(),
+                               "required_bytes": 0, "required_inodes": 0, "initial": current, "fds": []}
+        result = volumes[device]
+        initial = result["initial"]
+        if (result["filesystem"] != mount["fs"] or any(initial[k] != current[k] for k in
+                ("allocation", "unit", "blocks", "inodes"))):
+            raise ValueError("filesystem aliases advertise inconsistent capacity geometry")
+        initial["available_bytes"] = min(initial["available_bytes"], current["available_bytes"])
+        initial["available_inodes"] = min(initial["available_inodes"], current["available_inodes"])
+        if number not in result["mount_ids"]:
+            result["mount_ids"].add(number)
+            duplicate = os.dup(fd)
+            held.append(duplicate)
+            result["fds"].append(duplicate)
+        return result
+
+    def charge(path, size, is_directory=False):
+        if forbidden(path):
+            raise ValueError("capacity destination is a runtime or special filesystem path")
+        parent = path if is_directory else str(PurePosixPath(path).parent)
+        fd, signature = resolve(parent)
+        try:
+            if parent in observations and observations[parent] != signature:
+                raise ValueError("destination layout changed between inventory entries")
+            observations[parent] = signature
+            if len(observations) > 32768:
+                raise ValueError("destination parent count exceeds its bound")
+            result = volume(fd)
+            if not is_directory and not signature[1]:
+                try:
+                    entry = os.stat(PurePosixPath(path).name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    entry = None
+                if entry is not None:
+                    trusted(entry)
+                    if stat.S_IFMT(entry.st_mode) != types[path][0]:
+                        raise ValueError("existing destination kind differs from the signed payload")
+                    descriptor = os.open(PurePosixPath(path).name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                    try:
+                        if identity(os.fstat(descriptor)) != identity(entry) or mount_id(descriptor) != mount_id(fd):
+                            raise ValueError("destination is changed or a file mount")
+                    finally:
+                        os.close(descriptor)
+            allocation = result["initial"]["allocation"]
+            # No erasure/replacement, hardlink, sparse or doc-skip credit.
+            # Two full incoming copies plus two metadata blocks per entry.
+            result["required_bytes"] += 2 * ((size + allocation - 1) // allocation + 2) * allocation
+            result["required_inodes"] += 2
+            for missing in signature[1]:
+                key = (result["device"], missing)
+                if key not in missing_dirs:
+                    missing_dirs.add(key)
+                    result["required_bytes"] += 4 * allocation
+                    result["required_inodes"] += 2
+            if len(missing_dirs) > 65536:
+                raise ValueError("new destination directory count exceeds its bound")
+        finally:
+            os.close(fd)
+
+    skipped_ghosts = 0
+    for entry in files:
+        if entry["flags"] & 64:
+            skipped_ghosts += 1
+            continue
+        charge(entry["path"], max(entry["bytes"], len(entry["link"].encode("utf-8"))),
+               stat.S_ISDIR(entry["mode"]))
+
+    def database_scan():
+        fd, signature = resolve(database)
+        rows, total = [], 0
+        result = volume(fd)
+        def walk(directory, prefix, depth):
+            nonlocal total
+            if depth > 8:
+                raise ValueError("database directory depth exceeds its bound")
+            for name in sorted(os.listdir(directory)):
+                observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                trusted(observed)
+                if observed.st_dev != result["device"]:
+                    raise ValueError("database spans unsupported filesystem boundaries")
+                path = prefix + "/" + name
+                rows.append((path, identity(observed), observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns))
+                if len(rows) > 8192:
+                    raise ValueError("database file count exceeds its bound")
+                if stat.S_ISDIR(observed.st_mode):
+                    child = dir_open(name, directory)
+                    try:
+                        if identity(os.fstat(child)) != identity(observed) or mount_id(child) != mount_id(directory):
+                            raise ValueError("database directory changed or crosses a mount")
+                        walk(child, path, depth + 1)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1:
+                    total += max(observed.st_size, observed.st_blocks * 512)
+                    if total > 2 * 1024 ** 3:
+                        raise ValueError("database allocation exceeds its inspection bound")
+                else:
+                    raise ValueError("database has an unsupported non-regular or linked object")
+        try:
+            if signature[1]:
+                raise ValueError("installed database directory is missing")
+            walk(fd, "", 0)
+            if not rows:
+                raise ValueError("installed database directory is empty")
+            return result, (signature, rows, total)
+        finally:
+            os.close(fd)
+    db_volume, db_before = database_scan()
+    db_volume["required_bytes"] += 2 * db_before[2] + 4 * header_bytes + 64 * 1024 * 1024
+    db_volume["required_inodes"] += 2 * len(db_before[1]) + 4 * len(expected) + 64
+
+    for parent, before in observations.items():
+        fd, after = resolve(parent)
+        try:
+            if after != before:
+                raise ValueError("destination ancestry changed during capacity observation")
+            volume(fd)
+        finally:
+            os.close(fd)
+    _, db_after = database_scan()
+    if db_after != db_before or Path("/proc/self/mountinfo").read_bytes() != mount_data:
+        raise ValueError("database or mount layout changed during capacity observation")
+    results = []
+    for result in volumes.values():
+        initial = result["initial"]
+        available_bytes, available_inodes = initial["available_bytes"], initial["available_inodes"]
+        for fd in result["fds"]:
+            current = availability(fd)
+            if any(current[key] != initial[key] for key in ("allocation", "unit", "blocks", "inodes")):
+                raise ValueError("filesystem geometry changed during capacity observation")
+            available_bytes = min(available_bytes, current["available_bytes"])
+            available_inodes = min(available_inodes, current["available_inodes"])
+        reserve_bytes = max(64 * 1024 * 1024, (initial["blocks"] * initial["unit"] + 19) // 20)
+        reserve_inodes = max(256, (initial["inodes"] + 19) // 20)
+        if (available_bytes < result["required_bytes"] + reserve_bytes
+                or available_inodes < result["required_inodes"] + reserve_inodes):
+            raise ValueError("advertised free blocks/inodes do not meet payload budget plus headroom")
+        results.append({key: result[key] for key in ("device", "filesystem", "required_bytes", "required_inodes")}
+                       | {"mount_ids": sorted(result["mount_ids"]), "available_bytes": available_bytes,
+                          "available_inodes": available_inodes, "headroom_bytes": reserve_bytes,
+                          "headroom_inodes": reserve_inodes})
+    proof["payload_capacity_checked"] = True
+    proof["capacity_observation"] = {"filesystems": sorted(results, key=lambda item: item["device"]),
+        "inventory_sha256": receipt["sha256"], "skipped_ghost_entries": skipped_ghosts,
+        "policy": "two gross incoming copies plus per-entry metadata; no removal/hardlink credit; database reserve; five-percent or fixed headroom",
+        "space_reserved": False, "scripts_capacity_checked": False, "rollback_capacity_checked": False,
+        "quota_enforcement_queried": False, "atomic_filesystem_snapshot": False,
+        "observer_limits": {"address_space_bytes": 768 * 1024 * 1024,
+                            "cpu_soft_seconds": 240, "descriptor_soft_limit": descriptor_limit}}
+    print(json.dumps(proof, sort_keys=True))
+except (ValueError, KeyError, TypeError, OSError, UnicodeError, IndexError, MemoryError) as error:
+    print("azurelinux3s4: update payload capacity deferred: " + str(error), file=sys.stderr)
+    sys.exit(75)
+finally:
+    for fd in held:
+        os.close(fd)
 PY
 }
 
@@ -1237,7 +1736,7 @@ PY
         chmod 0400 -- "$directory/packages/"*.rpm || return 75
     fi
     s4_rpm_test_program >"$directory/test.py" || return 75
-    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" <<'PY'
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -1246,6 +1745,10 @@ import subprocess
 import sys
 try:
     root = Path(sys.argv[1])
+    capacity = sys.argv[4] == "yes"
+    if sys.argv[4] not in ("", "yes"):
+        raise ValueError("unsupported internal capacity mode")
+    output_limit = 32 * 1024 * 1024 if capacity else 1048576
     unit = "azurelinux3s4-check-" + root.name.removeprefix("update-check.") + ".service"
     if any(character not in "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in str(root) + sys.argv[2]):
         raise ValueError("test workspace or database path is unsupported")
@@ -1258,12 +1761,13 @@ try:
         "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectKernelLogs=yes",
         "--property=ProtectControlGroups=yes", "--property=RestrictNamespaces=yes", "--property=RestrictRealtime=yes",
         "--property=LockPersonality=yes", "--property=UMask=0077", "--property=MemoryMax=768M",
-        "--property=LimitFSIZE=1048576", "--property=InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket",
+        "--property=LimitFSIZE=" + str(output_limit), "--property=InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket",
         "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH",
         "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
-        "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root), *sys.argv[2:]]
+        "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root),
+        *sys.argv[2:4], *(["capacity"] if capacity else [])]
     def limits():
-        resource.setrlimit(resource.RLIMIT_FSIZE, (1048576, 1048576))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     with (root / "native.log").open("xb") as output:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=output, preexec_fn=limits)
         completed = False
@@ -1292,14 +1796,28 @@ except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.Subpr
     sys.exit(75)
 PY
     then
-        evidence=$(cat -- "$directory/result.json") || return 75
+        if [[ $S4_CAPACITY_MODE == yes ]]; then
+            s4_update_capacity_program >"$directory/capacity.py" || return 75
+            evidence=$(timeout --kill-after=5s 5m python3 -I "$directory/capacity.py" "$directory" "$database") || return 75
+        else
+            evidence=$(cat -- "$directory/result.json") || return 75
+        fi
     else
         return 75
     fi
     rm -rf -- "$directory" || return 75
     trap - EXIT
-    s4_log 'Retained signed RPM batch passed its read-only transaction test; installation is unfinished.'
+    if [[ $S4_CAPACITY_MODE == yes ]]; then
+        s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
+    else
+        s4_log 'Retained signed RPM batch passed its read-only transaction test; installation is unfinished.'
+    fi
     printf '%s\n' "$evidence"
+)
+
+s4_check_update_capacity() (
+    local S4_CAPACITY_MODE=yes
+    s4_check_updates
 )
 
 s4_verify_component() {
@@ -1309,6 +1827,7 @@ s4_verify_component() {
         repository-trust) s4_verify_repository_trust ;;
         update-preparation) s4_update_store verify && s4_timer_state enabled active "$S4_UPDATE_TIMER" ;;
         update-compatibility) s4_check_updates ;;
+        update-capacity) s4_check_update_capacity ;;
         *) return 78 ;;
     esac
 }
@@ -1558,8 +2077,8 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility ]] || return 78
-    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility ]]; then
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity ]]; then
         # Always obtain fresh online/preparation/transaction-test evidence.
         # Honor backoff before work and do not repeat a failed operation in a child.
         attempts=$(s4_state_value "$component" attempts)
@@ -1582,6 +2101,7 @@ s4_reconcile_component() {
                     result=$?
                 fi ;;
             update-compatibility) s4_check_updates || result=$? ;;
+            update-capacity) s4_check_update_capacity || result=$? ;;
         esac
         if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0
@@ -1644,14 +2164,16 @@ s4_repair_timeout_seconds() {
     # Up to two recovery transactions (install + reinstall), one signed refresh,
     # one download, and begin/list/commit store operations, followed by admission.
     local compatibility=$((2 * control + key + store + 65 + admission + 930))
-    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility))
+    # Capacity repeats same-byte admission/native TEST, then a 5min+5s observer.
+    local capacity=$((compatibility + 305))
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
     # Another ten minutes cover trusted local tools, file fsync, cleanup and
     # scheduling outside leaf wrappers. Excessive IO still fails finitely and
     # retains retry ownership; this is not a promise for arbitrary slow storage.
-    # Compatibility adds component state writes; four more reserved controls.
-    local housekeeping=$((44 * control + 600))
+    # Compatibility and capacity add component state writes: four reserves each.
+    local housekeeping=$((48 * control + 600))
     printf '%s\n' "$((trust + health + stages + housekeeping))"
 }
 
@@ -1924,9 +2446,9 @@ s4_main() {
         --help)
             printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: signed-update preparation and read-only RPM transaction tests; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair|--prepare-updates|--check-updates) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -1951,6 +2473,11 @@ s4_main() {
         s4_check_updates
         return $?
     fi
+    if [[ $action == --check-update-capacity ]]; then
+        s4_verify_trust_anchor || return 75
+        s4_check_update_capacity
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
@@ -1958,6 +2485,7 @@ s4_main() {
             repository-trust) s4_verify_repository_trust ;;
             update-preparation) s4_prepare_updates ;;
             update-compatibility) s4_check_updates ;;
+            update-capacity) s4_check_update_capacity ;;
         esac
         return $?
     fi
