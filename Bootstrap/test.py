@@ -23,6 +23,7 @@ MODULES = (
     "test_web_relay",
     "test_web_admission",
     "test_web_filesystem",
+    "test_web_operations",
 )
 
 

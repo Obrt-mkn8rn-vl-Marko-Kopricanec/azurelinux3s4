@@ -28,6 +28,24 @@ JOURNAL = "/run/systemd/journal/stdout"
 BUFFER = 65536
 IDLE_SECONDS = 30
 TOTAL_SECONDS = 300
+METADATA_DENIED = (
+    # Landlock filesystem rights do not cover these metadata mutations.
+    "chmod", "fchmod", "fchmodat", "fchmodat2",
+    "chown", "fchown", "lchown", "fchownat",
+    "utime", "utimes", "futimesat", "utimensat",
+    "setxattr", "lsetxattr", "fsetxattr",
+    "removexattr", "lremovexattr", "fremovexattr",
+)
+IPC_DENIED = (
+    # No signal delivery, SysV/POSIX named IPC or kernel key operations are
+    # needed for read/write forwarding. Incoming supervisor signals still work.
+    "kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal",
+    "semget", "semop", "semtimedop", "semctl",
+    "msgget", "msgsnd", "msgrcv", "msgctl",
+    "shmget", "shmat", "shmdt", "shmctl",
+    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr",
+    "add_key", "request_key", "keyctl",
+)
 DENIED = (
     "socket", "socketpair", "connect", "accept", "accept4",
     # Fast Open through sendto/sendmsg is also a connection initiation route.
@@ -36,7 +54,7 @@ DENIED = (
     "pidfd_getfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "bpf",
     "execve", "execveat", "clone", "clone3", "fork", "vfork", "unshare", "setns",
     "ptrace", "process_vm_readv", "process_vm_writev",
-)
+) + METADATA_DENIED + IPC_DENIED
 
 
 class Comparison(ctypes.Structure):
@@ -276,6 +294,33 @@ def verify_seal(connection):
     connection.getpeername()  # The challenge must leave the accepted connection intact.
 
 
+def verify_operations():
+    # These calls cannot modify files, deliver a signal or create an IPC/key
+    # object even if a rule is missing. Require the filter's EPERM rather than
+    # the ordinary invalid-FD/argument error or successful signal-zero query.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.argtypes = [ctypes.c_long]
+    libc.syscall.restype = ctypes.c_long
+    lib = ctypes.CDLL("libseccomp.so.2")
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    challenges = (
+        ("fchmod", (-1, 0)),
+        ("kill", (os.getpid(), 0)),
+        ("shmget", (0, 0, 0)),
+        ("mq_getsetattr", (-1, 0, 0)),
+        ("keyctl", (-1, 0, 0, 0, 0)),
+    )
+    for name, arguments in challenges:
+        number = lib.seccomp_syscall_resolve_name(name.encode("ascii"))
+        if number < 0:
+            raise ValueError("operation challenge syscall unavailable: " + name)
+        ctypes.set_errno(0)
+        result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(value) for value in arguments))
+        if result != -1 or ctypes.get_errno() != errno.EPERM:
+            raise RuntimeError("operation denial challenge failed: " + name)
+
+
 def confine_filesystem():
     # No allow rules: deny every known handled filesystem right. ABI3 adds
     # truncate, ABI5 device ioctl. Later network/scope fields stay zero. This
@@ -464,6 +509,7 @@ def main():
                 close_runtime_extras(backend)
                 restrict(True)
                 verify_seal(client)
+                verify_operations()
                 confine_filesystem()
                 forward(client, backend)
     except (OSError, ValueError, RuntimeError, MemoryError, KeyError) as error:

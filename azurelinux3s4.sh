@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.14.0
+S4_VERSION=0.15.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -2543,6 +2543,24 @@ JOURNAL = "/run/systemd/journal/stdout"
 BUFFER = 65536
 IDLE_SECONDS = 30
 TOTAL_SECONDS = 300
+METADATA_DENIED = (
+    # Landlock filesystem rights do not cover these metadata mutations.
+    "chmod", "fchmod", "fchmodat", "fchmodat2",
+    "chown", "fchown", "lchown", "fchownat",
+    "utime", "utimes", "futimesat", "utimensat",
+    "setxattr", "lsetxattr", "fsetxattr",
+    "removexattr", "lremovexattr", "fremovexattr",
+)
+IPC_DENIED = (
+    # No signal delivery, SysV/POSIX named IPC or kernel key operations are
+    # needed for read/write forwarding. Incoming supervisor signals still work.
+    "kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal",
+    "semget", "semop", "semtimedop", "semctl",
+    "msgget", "msgsnd", "msgrcv", "msgctl",
+    "shmget", "shmat", "shmdt", "shmctl",
+    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr",
+    "add_key", "request_key", "keyctl",
+)
 DENIED = (
     "socket", "socketpair", "connect", "accept", "accept4",
     # Fast Open through sendto/sendmsg is also a connection initiation route.
@@ -2551,7 +2569,7 @@ DENIED = (
     "pidfd_getfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "bpf",
     "execve", "execveat", "clone", "clone3", "fork", "vfork", "unshare", "setns",
     "ptrace", "process_vm_readv", "process_vm_writev",
-)
+) + METADATA_DENIED + IPC_DENIED
 
 
 class Comparison(ctypes.Structure):
@@ -2791,6 +2809,33 @@ def verify_seal(connection):
     connection.getpeername()  # The challenge must leave the accepted connection intact.
 
 
+def verify_operations():
+    # These calls cannot modify files, deliver a signal or create an IPC/key
+    # object even if a rule is missing. Require the filter's EPERM rather than
+    # the ordinary invalid-FD/argument error or successful signal-zero query.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.argtypes = [ctypes.c_long]
+    libc.syscall.restype = ctypes.c_long
+    lib = ctypes.CDLL("libseccomp.so.2")
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    challenges = (
+        ("fchmod", (-1, 0)),
+        ("kill", (os.getpid(), 0)),
+        ("shmget", (0, 0, 0)),
+        ("mq_getsetattr", (-1, 0, 0)),
+        ("keyctl", (-1, 0, 0, 0, 0)),
+    )
+    for name, arguments in challenges:
+        number = lib.seccomp_syscall_resolve_name(name.encode("ascii"))
+        if number < 0:
+            raise ValueError("operation challenge syscall unavailable: " + name)
+        ctypes.set_errno(0)
+        result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(value) for value in arguments))
+        if result != -1 or ctypes.get_errno() != errno.EPERM:
+            raise RuntimeError("operation denial challenge failed: " + name)
+
+
 def confine_filesystem():
     # No allow rules: deny every known handled filesystem right. ABI3 adds
     # truncate, ABI5 device ioctl. Later network/scope fields stay zero. This
@@ -2979,6 +3024,7 @@ def main():
                 close_runtime_extras(backend)
                 restrict(True)
                 verify_seal(client)
+                verify_operations()
                 confine_filesystem()
                 forward(client, backend)
     except (OSError, ValueError, RuntimeError, MemoryError, KeyError) as error:
@@ -3192,6 +3238,7 @@ def bundle():
             "Only the accepted stdin TCP socket and connected root journal logging descriptors may be inherited; verify aggregate slice/MaxConnections and per-worker limits.",
             "Native SAME-byte worker credential, protected backend ancestry/held socket and peer-credential admission, with conflict-safe caller/manager authorization independent of names or PIDs; trusted NSS and the single dynamic identity lookup socket must be available.",
             "Enabled native Landlock ABI3+; final TSYNC process-creation denial and one live task before an empty filesystem ruleset, successful native installation and namespace/fd-link read-denial challenges BEFORE forwarding.",
+            "Native libseccomp must resolve every denied metadata/signal/SysV/POSIX-mqueue/key syscall, including fchmodat2; checked EPERM challenges for each family must precede filesystem confinement and forwarding.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
@@ -3200,6 +3247,7 @@ def bundle():
             "The worker retains an inherited IP connection; socket creation restrictions alone do not stop reconnects. No activation or native Azure worker/unit enforcement is certified by emission.",
             "The worker checks dedicated process IDs/groups/NNP/zero capabilities, journal descriptors, protected fixed backend ancestry and a held socket inode plus connect/listen-time Unix peer IDs, scrubs lookup/extra descriptors, then seals before forwarding. The read-only dynamic identity socket bind does not make its IPC protocol read-only. These observations do not authenticate native runtime or current peer executable, authorize the caller, certify manager launch, prevent UID reuse or establish atomic/ABA/concurrent-root protection.",
             "The relay additionally denies all known Landlock filesystem rights after startup; ABI3 handles file read/write/execute, directory reads, namespace creation/removal/reparenting and truncation, with device ioctl on ABI5+. Missing support or a failed challenge refuses. Existing descriptor rights, metadata/O_PATH, shared mappings, other processes and backend nginx filesystem access are separate; kernel/base/runtime/procfs are trusted. This is a calling-thread layer after final TSYNC and a bounded single-task check, not whole-host or full MAC enforcement.",
+            "The final native filter also refuses chmod/chown/timestamp/xattr mutations, outgoing signals, SysV IPC, POSIX mqueues and kernel keys through the explicitly named syscalls. Safe challenge arguments do not mutate files, deliver signals or allocate objects. Metadata observation/O_PATH, anonymous memory/IPC, futexes, existing mappings, allowed descriptor IO and future unnamed syscalls remain outside this bounded layer; incoming supervisor signals remain available. This is not complete IPC or host isolation.",
             "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",
