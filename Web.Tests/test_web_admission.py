@@ -463,7 +463,33 @@ class NativeWorkerAdmissionTests(unittest.TestCase):
             self.assertEqual(bytes(actual), b"")
             self.assertTrue(all(not value for value in observations))
             self.assertIn(b"Web relay refused", logs)
-        if mode != "replace-leaf": self.assertEqual(fingerprint(self.directory), before)
+        replacement = None
+        if mode in ("replace-leaf", "replace-leaf-without-recheck"):
+            replacement = json.loads((self.directory / "replacement-proof.json").read_text())
+            self.assertTrue(replacement["inherited_cleanup_completed"])
+            self.assertEqual(replacement["backend_path_call"], 2)
+            self.assertTrue(replacement["replacement_listener"])
+            self.assertNotEqual(replacement["original_identity"], replacement["replacement_identity"])
+            self.assertEqual(replacement["original_identity"], replacement["preserved_identity"])
+            self.assertTrue(stat.S_ISSOCK(replacement["replacement_mode"]))
+            self.assertEqual(stat.S_IMODE(replacement["replacement_mode"]), 0o666)
+            self.assertEqual((replacement["replacement_uid"], replacement["replacement_gid"]),
+                             (os.getuid(), os.getgid()))
+            for path, identity in ((self.leaf, replacement["replacement_identity"]),
+                                   (self.runtime / "retained-original.sock", replacement["original_identity"])):
+                value = path.lstat()
+                self.assertTrue(stat.S_ISSOCK(value.st_mode))
+                self.assertEqual([value.st_dev, value.st_ino], identity)
+            self.assertEqual(replacement["production_recheck_omitted"], mode.endswith("without-recheck"))
+            if mode == "replace-leaf":
+                self.assertEqual(expected, 75)
+                self.assertEqual(logs, b"Web relay refused: backend ancestry/socket changed during admission\n")
+                self.assertEqual(observations, [b""])
+            else:
+                self.assertEqual(expected, 0)
+                self.assertIn("backend ancestry/socket changed during admission", replacement["removed_recheck_ast"])
+        else:
+            self.assertEqual(fingerprint(self.directory), before)
         # Optional evidence hook is AFTER every ordinary assertion.
         self.record = {"actual_child_wait_exit": actual_exit, "expected_exit": expected,
                        "mode": mode, "family": int(family), "backend_received_bytes": sum(map(len, observations)),
@@ -471,7 +497,8 @@ class NativeWorkerAdmissionTests(unittest.TestCase):
                        "response_sha256": hashlib.sha256(actual).hexdigest(), "stderr": logs.decode(),
                        "root_fd_uid_gid_journal_path_and_caller_delivery_substituted": True,
                        "native_accounts_or_manager_authorized": False, "systemd_nginx_executed": False,
-                       "installation_authorized": False, "server_ready": False}
+                       "installation_authorized": False, "server_ready": False,
+                       "replacement_proof": replacement}
 
     def test_native_checked_admission_ipv4_seals_and_forwards_same_bytes(self):
         self.integrated()
@@ -487,6 +514,9 @@ class NativeWorkerAdmissionTests(unittest.TestCase):
 
     def test_native_leaf_replacement_refuses_before_forwarding(self):
         self.integrated(mode="replace-leaf", expected=75)
+
+    def test_omitted_recheck_model_demonstrates_replacement_detection_sensitivity(self):
+        self.integrated(mode="replace-leaf-without-recheck")
 
     def test_native_pipe_logging_refuses_before_connecting_backend(self):
         self.integrated(expected=75, bad_logging=True)
