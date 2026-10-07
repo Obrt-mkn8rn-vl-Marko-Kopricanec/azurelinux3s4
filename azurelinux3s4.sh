@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.5.0
+S4_VERSION=0.5.1
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -1228,7 +1228,34 @@ s4_install_runner() {
     s4_atomic_write "$S4_INSTALL_DIR/azurelinux3s4.sh" 0755 <"$source"
 }
 
+s4_repair_timeout_seconds() {
+    # Sum the complete current repair path, not just the download. Include each
+    # leaf timeout's kill grace; nested work is already covered by its outer cap.
+    local key=$((15 + 5)) control=$((30 + 5))
+    local integrity=$((180 + 5)) participation=$((90 + 5))
+    local recovery=$((900 + 30)) refresh=$((300 + 30)) download=$((900 + 30))
+    local store=$((300 + 5)) admission=$((900 + 5))
+    # Trust can fail verification, apply, then pass both child and parent checks:
+    # three complete admissions, plus apply's queries/import/key publication.
+    local trust=$((3 * (2 * key + 5 * control) + 5 * control + key))
+    # Bootstrap: initial, child final, parent final; repository and download:
+    # two further full health checks. Bootstrap also inspects damage separately.
+    local health=$((5 * (integrity + participation) + integrity))
+    # Up to two recovery transactions (install + reinstall), one signed refresh,
+    # one download, and begin/list/commit store operations, followed by admission.
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission))
+    # At most 34 state/repository/plugin/timer persistence/control calls on the
+    # successful repair branch; reserve 40 to include restoration after failure.
+    # Another ten minutes cover trusted local tools, file fsync, cleanup and
+    # scheduling outside leaf wrappers. Excessive IO still fails finitely and
+    # retains retry ownership; this is not a promise for arbitrary slow storage.
+    local housekeeping=$((40 * control + 600))
+    printf '%s\n' "$((trust + health + stages + housekeeping))"
+}
+
 s4_install_units() {
+    local deadline
+    deadline=$(s4_repair_timeout_seconds) || return $?
     s4_safe_path "$S4_SYSTEMD_DIR" || return $?
     s4_atomic_write "$S4_SYSTEMD_DIR/azurelinux3s4-repair.service" 0644 <<EOF || return $?
 [Unit]
@@ -1238,7 +1265,7 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/bin/bash $S4_INSTALL_DIR/azurelinux3s4.sh --repair
-TimeoutStartSec=45min
+TimeoutStartSec=${deadline}s
 TimeoutStopSec=30s
 KillMode=control-group
 UMask=0077

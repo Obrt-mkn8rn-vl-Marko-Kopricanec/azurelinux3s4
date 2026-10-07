@@ -3,8 +3,10 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import socket
 import subprocess
+import time
 import unittest
 
 import test_package_admission as admission_fixture
@@ -119,8 +121,8 @@ for name in sys.argv[1:]:
     finally: os.close(descriptor)
 ''')
 
-    def shell(self, body='s4_prepare_updates', expected=0, timeout=45):
-        header = f'''source {shlex.quote(str(admission_fixture.SCRIPT))}
+    def header(self):
+        return f'''source {shlex.quote(str(admission_fixture.SCRIPT))}
 S4_STATE={shlex.quote(str(self.root / 'state'))}
 S4_RUN={shlex.quote(str(self.root / 'run'))}
 S4_GPG_KEY={shlex.quote(str(self.root / 'vendor.asc'))}
@@ -130,13 +132,178 @@ export PATH={shlex.quote(str(self.root / 'bin'))}:$PATH
 S4_NOW=1000000
 s4_verify_metadata() {{ return 0; }}
 '''
-        result = subprocess.run(['bash', '-c', header + body], text=True,
+
+    def shell(self, body='s4_prepare_updates', expected=0, timeout=45):
+        result = subprocess.run(['bash', '-c', self.header() + body], text=True,
                                 capture_output=True, timeout=timeout)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.assertEqual(list((self.root / 'run').iterdir()), [], 'volatile workspace leaked')
         if expected:
             self.assertEqual(result.stdout, '', 'failed preparation published success')
         return result
+
+    def test_service_budget_covers_repeated_checks_recovery_and_publication(self):
+        # Independent upper-envelope inventory: leaf caps include their kill
+        # grace, and the repair path can enter the damaged-bootstrap branch.
+        source = admission_fixture.SCRIPT.read_text()
+        for setting in ('--kill-after=5s 3m python3', '--kill-after=5s 90s python3',
+                        '--signal=TERM --kill-after=30s 15m', 'local limit=15m',
+                        '|| limit=5m', '--kill-after=5s 5m python3',
+                        '--signal=TERM --kill-after=5s 15m python3',
+                        '--kill-after=5s 30s systemctl', '--kill-after=5s 15s sha256sum'):
+            self.assertIn(setting, source)
+        trust = 3 * (2 * 20 + 5 * 35) + 5 * 35 + 20
+        healthy = 5 * (185 + 95) + 185
+        stages = 2 * 930 + 330 + 930 + 3 * 305 + 905
+        persistence_and_cleanup = 40 * 35 + 600
+        deadline = int(self.shell('s4_repair_timeout_seconds').stdout)
+        self.assertGreaterEqual(deadline, trust + healthy + stages + persistence_and_cleanup)
+        self.assertLessEqual(deadline, 4 * 60 * 60)
+
+    def test_successful_slow_attempt_publishes_under_generated_service_deadline(self):
+        # Scale stage durations and the GENERATED service cap equally. Actual
+        # slot revalidation, copying/admission fixtures, persistence and repair
+        # dispatch still run. This is a disposable process/control-flow model,
+        # not a live PID1, installed-disk or physical-duration assertion.
+        self.shell()
+        original = (self.root / 'state/updates/current.json').read_bytes()
+        self.command('systemctl', r'''
+from pathlib import Path
+import sys
+root = Path(__file__).resolve().parent.parent
+args = sys.argv[1:]
+if args[0] == 'daemon-reload': sys.exit(0)
+unit = args[-1]
+link = root / 'units/timers.target.wants' / unit
+active = root / ('active-' + unit)
+if args[0] == 'enable': active.touch()
+elif args[0] == 'disable':
+    active.unlink(missing_ok=True); link.unlink(missing_ok=True)
+elif args[0] == 'show':
+    print('LoadState=loaded')
+    print('UnitFileState=' + ('enabled' if link.is_symlink() else 'disabled'))
+    print('ActiveState=' + ('active' if active.exists() else 'inactive'))
+else: sys.exit(99)
+''')
+        self.shell('s4_install_runner; s4_install_units')
+        service = (self.root / 'units/azurelinux3s4-repair.service').read_text()
+        self.assertIn('Type=oneshot', service)
+        self.assertIn('KillMode=control-group', service)
+        policy = dict(line.split('=', 1) for line in service.splitlines() if '=' in line)
+        deadline = int(policy['TimeoutStartSec'].removesuffix('s'))
+        stop_grace = int(policy['TimeoutStopSec'].removesuffix('s'))
+        # Four-minute successful checks/current revalidation, twelve-minute
+        # download and fourteen-minute admission reproduce Review's46min path.
+        # Commit gets another four minutes. Each stage stays within its own cap.
+        scale = 120
+        self.command('slow-stage', f'''
+import json
+from pathlib import Path
+import sys
+import time
+root = Path(__file__).resolve().parent.parent
+name, seconds, cap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+assert 0 < seconds < cap
+with (root / 'slow-stages').open('a') as log:
+    log.write(json.dumps({{'stage': name, 'event': 'begin', 'seconds': seconds, 'cap': cap}}) + '\\n')
+time.sleep(seconds / {scale})
+with (root / 'slow-stages').open('a') as log:
+    log.write(json.dumps({{'stage': name, 'event': 'end'}}) + '\\n')
+''')
+        body = r'''
+s4_verify_trust_anchor() { return 0; }
+s4_repositories() { return 0; }
+s4_verify_bootstrap() { slow-stage bootstrap-health 240 280; }
+s4_verify_repository_trust() { slow-stage repository-health 240 280; slow-stage signed-refresh 240 330; }
+s4_verify_metadata() { slow-stage update-health 240 280; }
+saved=$(declare -f s4_update_store); eval "${saved/s4_update_store/original_update_store}"
+s4_update_store() {
+    case $1 in
+        begin) slow-stage current-revalidation 240 305 >&2 ;;
+        commit) slow-stage commit 240 305 >&2 ;;
+    esac
+    original_update_store "$@"
+}
+s4_repair no
+'''
+        downloader = self.root / 'bin/tdnf'
+        downloader.write_text(downloader.read_text().replace(
+            'args = sys.argv[1:]',
+            "subprocess.run([str(root / 'bin/slow-stage'), 'download', '720', '930'], check=True)\nargs = sys.argv[1:]"
+        ).replace('import sys\n', 'import sys\nimport subprocess\n'))
+        verifier = self.root / 'bin/rpmkeys'
+        verifier.write_text(verifier.read_text().replace(
+            'args = sys.argv[1:]',
+            "subprocess.run([str(root / 'bin/slow-stage'), 'admission', '840', '905'], check=True)\nargs = sys.argv[1:]"
+        ).replace('import sys\n', 'import sys\nimport subprocess\n'))
+
+        def attempt(seconds):
+            start = time.monotonic()
+            process = subprocess.Popen(['bash', '-c', self.header() + body], text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+            expired = False
+            def signal_session(kind):
+                # GNU timeout creates child process groups. A single killpg
+                # misses those descendants; the model must stop the whole test
+                # session. pidfds prevent signaling a recycled, unrelated PID.
+                for entry in Path('/proc').iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    descriptor = None
+                    try:
+                        pid = int(entry.name)
+                        descriptor = os.pidfd_open(pid)
+                        if os.getsid(pid) == process.pid:
+                            signal.pidfd_send_signal(descriptor, kind)
+                    except ProcessLookupError:
+                        pass
+                    finally:
+                        if descriptor is not None:
+                            os.close(descriptor)
+            try:
+                output, errors = process.communicate(timeout=seconds / scale)
+            except subprocess.TimeoutExpired:
+                expired = True
+                signal_session(signal.SIGTERM)
+                try:
+                    output, errors = process.communicate(timeout=stop_grace / scale)
+                except subprocess.TimeoutExpired:
+                    signal_session(signal.SIGKILL)
+                    output, errors = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    signal_session(signal.SIGKILL)
+                    process.wait(timeout=5)
+            return expired, process.returncode, output, errors, time.monotonic() - start
+
+        old = attempt(45 * 60)
+        self.assertTrue(old[0], old)
+        self.assertNotEqual(old[1], 0, old)
+        self.assertEqual((self.root / 'state/updates/current.json').read_bytes(), original)
+        boundary = len((self.root / 'slow-stages').read_text().splitlines())
+        new = attempt(deadline)
+        self.assertFalse(new[0], new)
+        self.assertEqual(new[1], 0, new)
+        self.assertGreater(new[4], 45 * 60 / scale)
+        self.assertNotEqual((self.root / 'state/updates/current.json').read_bytes(), original)
+        stages = [json.loads(line) for line in (self.root / 'slow-stages').read_text().splitlines()[boundary:]]
+        self.assertEqual([value['stage'] for value in stages if value['event'] == 'end'],
+                         ['bootstrap-health', 'repository-health', 'signed-refresh',
+                          'current-revalidation', 'update-health', 'download', 'admission', 'commit'])
+        self.assertEqual((self.root / 'state/finalization').read_text(), 'status=complete\n')
+        self.assertEqual(self.current()[0]['slot'], '1')
+        self.assertFalse(self.current()[2]['installs_performed'])
+        self.slow_attempt_evidence = {
+            'source_sha256': hashlib.sha256(admission_fixture.SCRIPT.read_bytes()).hexdigest(),
+            'scale': scale, 'generated_start_seconds': deadline, 'stop_seconds': stop_grace,
+            'old_start_seconds': 45 * 60,
+            'old_attempt': {'expired': old[0], 'exit': old[1], 'seconds': old[4], 'stderr': old[3]},
+            'corrected_attempt': {'expired': new[0], 'exit': new[1], 'seconds': new[4], 'stderr': new[3]},
+            'completed_stages': stages, 'final_pointer': self.current()[0],
+            'final_manifest': self.current()[2], 'finalization': 'status=complete',
+            'limits': 'Scaled unprivileged process/control-flow model with native command fixtures; not live PID1 or physical/persistent-disk/production-duration proof.',
+        }
 
     def current(self):
         pointer = json.loads((self.root / 'state/updates/current.json').read_text())
