@@ -81,7 +81,7 @@ args = sys.argv[1:]
 with (root / "events").open("a") as log:
     log.write(" ".join(args) + "\n")
 unit = args[-1]
-kind = "recovery" if unit == "azurelinux3s4-finalization-recovery.timer" else "timer"
+kind = "recovery" if unit == "azurelinux3s4-finalization-recovery.timer" else "update" if unit == "azurelinux3s4-update-preparation.timer" else "timer"
 enabled, active = root / ("run/" + kind + "-enabled"), root / ("run/" + kind + "-active")
 link = root / "units/timers.target.wants" / unit
 prefix = "S4_RECOVERY_" if kind == "recovery" else "S4_PRIMARY_"
@@ -331,7 +331,9 @@ for path in operands:
     durable[scope] = snapshot
 database.write_text(json.dumps(durable))
 ''')
-        self.shell("s4_install_runner; s4_install_units; s4_write_state bootstrap complete 0 0 0")
+        # This retained model covers the accepted two-activator finalization
+        # transaction. The new periodic preparation timer is tested separately.
+        self.shell('s4_install_runner; s4_install_units; systemctl disable --now "$S4_UPDATE_TIMER"; sync -f -- "$S4_SYSTEMD_DIR"; s4_write_state bootstrap complete 0 0 0')
 
     def adverse_reboot(self, persist_visible_unit_deletions=False):
         durable = json.loads((self.root / "durable.json").read_text())
@@ -393,7 +395,7 @@ database.write_text(json.dumps(durable))
     def test_help_is_available_without_privilege(self):
         result = subprocess.run([str(SCRIPT), "--help"], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0)
-        self.assertIn("hardening is incomplete", result.stdout)
+        self.assertIn("hardening and update installation are incomplete", result.stdout)
 
     def test_unknown_action_is_rejected(self):
         result = subprocess.run([str(SCRIPT), "--unknown"], text=True, capture_output=True, timeout=10)
@@ -741,7 +743,7 @@ sys.exit(result.returncode)
         self.resume_boot_worker()
 
     def test_stopping_last_timer_accepts_removed_empty_wants_directory(self):
-        self.shell("s4_install_units; export S4_REMOVE_EMPTY_WANTS=1; s4_finish_repair")
+        self.shell('s4_install_units; systemctl disable --now "$S4_UPDATE_TIMER"; export S4_REMOVE_EMPTY_WANTS=1; s4_finish_repair')
         self.assertFalse((self.root / "units/timers.target.wants").exists())
         self.assertEqual((self.root / "state/finalization").read_text(), "status=complete\n")
 
@@ -1222,7 +1224,7 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
         timer = (self.root / "units/azurelinux3s4-repair.timer").read_text()
         recovery = (self.root / "units/azurelinux3s4-finalization-recovery.timer").read_text()
         self.assertIn("KillMode=control-group", service)
-        self.assertIn("TimeoutStartSec=20min", service)
+        self.assertIn("TimeoutStartSec=45min", service)
         self.assertNotIn("network-online.target", service)
         self.assertIn("OnBootSec=2min", timer)
         self.assertIn("OnUnitInactiveSec=1min", timer)
@@ -1231,6 +1233,24 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
                         "Unit=azurelinux3s4-repair.service", "WantedBy=timers.target"):
             self.assertIn(setting, recovery)
         self.assertNotIn("network-online.target", recovery)
+
+    def test_periodic_update_preparation_survives_primary_finalization(self):
+        self.shell("s4_install_units; s4_finish_repair")
+        unit = self.root / "units/azurelinux3s4-update-preparation.timer"
+        policy = unit.read_text()
+        for setting in ("OnBootSec=3min", "OnCalendar=hourly", "Persistent=yes",
+                        "RandomizedDelaySec=15min", "WantedBy=timers.target",
+                        "Unit=azurelinux3s4-repair.service"):
+            self.assertIn(setting, policy)
+        self.shell('s4_timer_state enabled active "$S4_UPDATE_TIMER"')
+        self.shell('s4_timer_state disabled inactive "$S4_REPAIR_TIMER"')
+        self.shell('s4_timer_state disabled inactive "$S4_RECOVERY_TIMER"')
+        link = self.root / "units/timers.target.wants" / unit.name
+        self.assertEqual(link.resolve(), unit)
+
+    def test_periodic_preparation_enablement_rejects_failed_observation(self):
+        self.shell('s4_install_units; export S4_QUERY_FAILURE=42; s4_start_timer "$S4_UPDATE_TIMER"', expected=1)
+        self.assertTrue((self.root / "units/timers.target.wants/azurelinux3s4-update-preparation.timer").is_symlink())
 
     def test_status_never_claims_full_hardening(self):
         self.shell("s4_verify_bootstrap() { return 0; }; s4_reconcile_component bootstrap yes")

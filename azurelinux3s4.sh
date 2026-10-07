@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.4.0
+S4_VERSION=0.5.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,7 +21,11 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation)
+S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
+# Internal dynamic-scope options; never accept inherited environment values.
+S4_ADMISSION_DESTINATION=
+S4_DOWNLOAD_DIRECTORY=
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -326,6 +330,9 @@ s4_verify_rpm_artifacts() (
     command -v python3 >/dev/null && command -v rpmkeys >/dev/null || return 75
     s4_safe_path "$S4_RUN" && s4_safe_path "$S4_GPG_KEY" || return 75
     local path directory result=0 evidence
+    if [[ -n $S4_ADMISSION_DESTINATION ]]; then
+        s4_safe_path "$S4_ADMISSION_DESTINATION" || return 75
+    fi
     for path in "$@"; do
         s4_safe_path "$path" || return 75
     done
@@ -333,7 +340,7 @@ s4_verify_rpm_artifacts() (
     trap 'rm -rf -- "$directory"' EXIT
     if timeout --signal=TERM --kill-after=5s 15m python3 -I - \
         "$directory" "$S4_GPG_KEY" "$S4_VENDOR_KEY_SHA256" \
-        "$S4_VENDOR_FINGERPRINT" "$@" >"$directory/result.json" <<'PY'
+        "$S4_VENDOR_FINGERPRINT" "$S4_ADMISSION_DESTINATION" "$@" >"$directory/result.json" <<'PY'
 import base64
 import hashlib
 import json
@@ -424,8 +431,14 @@ try:
     strong_payload = re.compile(r"Payload SHA(?:256|384|512) digest: OK")
     additional = {"Header SHA1 digest: OK", "MD5 digest: OK"}
     admitted, total = [], 0
-    for index, name in enumerate(sys.argv[5:]):
-        artifact = root / (str(index) + ".rpm")
+    destination = Path(sys.argv[5]) if sys.argv[5] else root
+    if destination != root:
+        observed = destination.lstat()
+        if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid not in (0, os.geteuid())
+                or observed.st_mode & 0o077 or any(destination.iterdir())):
+            raise ValueError("retained snapshot directory is not private and empty")
+    for index, name in enumerate(sys.argv[6:]):
+        artifact = destination / (str(index) + ".rpm")
         digest, size = snapshot(name, artifact, 512 * 1024 * 1024)
         total += size
         if total > 1024 * 1024 * 1024:
@@ -442,7 +455,7 @@ try:
             raise ValueError("native evidence lacks a pinned signature and strong header/payload digests")
         admitted.append({"path": name, "sha256": digest, "bytes": size})
     print(json.dumps({"schema": 1, "vendor_fingerprint": sys.argv[4], "artifacts": admitted,
-                      "installs_performed": False, "snapshots_retained": False,
+                      "installs_performed": False, "snapshots_retained": destination != root,
                       "freshness_proven": False}, sort_keys=True))
 except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
     print("azurelinux3s4: package admission deferred: " + str(error), file=sys.stderr)
@@ -465,10 +478,16 @@ PY
 )
 
 s4_tdnf() {
-    [[ $# == 1 && $1 == makecache ]] || {
+    if [[ -n $S4_DOWNLOAD_DIRECTORY ]]; then
+        [[ $# == 3 && $1 == upgrade && $2 == --downloadonly && $3 == "--downloaddir=$S4_DOWNLOAD_DIRECTORY" ]] || return 78
+        s4_safe_path "$S4_DOWNLOAD_DIRECTORY" || return 75
+        [[ -d $S4_DOWNLOAD_DIRECTORY && ! -L $S4_DOWNLOAD_DIRECTORY ]] || return 75
+    else
+        [[ $# == 1 && $1 == makecache ]] || {
         s4_log 'The signed update executor is unfinished; package-changing operations are deferred.'
-        return 78
-    }
+            return 78
+        }
+    fi
     s4_verify_metadata || return 75
     s4_safe_path "$S4_GPG_KEY" || return 75
     [[ -f $S4_GPG_KEY && ! -L $S4_GPG_KEY ]] || return 75
@@ -479,13 +498,16 @@ s4_tdnf() {
     # trust database, home configuration, agent, or network key retrieval.
     timeout --signal=TERM --kill-after=30s "$limit" \
         python3 -I - "$S4_RUN" "$S4_GPG_KEY" "$S4_VENDOR_KEY_SHA256" \
-        "$S4_VENDOR_FINGERPRINT" "$S4_STATE/tdnf.conf" "$limit" "$@" <<'PY'
+        "$S4_VENDOR_FINGERPRINT" "$S4_STATE/tdnf.conf" "$limit" "$S4_DOWNLOAD_DIRECTORY" "$@" <<'PY'
 import hashlib
 import os
 from pathlib import Path
+import selectors
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 try:
     # Read a bounded snapshot; GnuPG imports that snapshot, not a second read of
@@ -523,8 +545,97 @@ try:
         # Verbose loader evidence is mandatory for this actual operation as well
         # as the separate integrity/invalid-signature challenge before it.
         command = ["tdnf", "-v", "-c", sys.argv[5], "--releasever=3.0", "--refresh", "-y",
-                   "--disableplugin=*", "--enableplugin=tdnfrepogpgcheck", *sys.argv[7:]]
-        transaction = run(*command, timeout=240 if sys.argv[6] == "5m" else 800)
+                   "--disableplugin=*", "--enableplugin=tdnfrepogpgcheck", *sys.argv[8:]]
+        if sys.argv[7]:
+            incoming = Path(sys.argv[7])
+            observed = incoming.lstat()
+            if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid()
+                    or observed.st_mode & 0o077 or any(incoming.iterdir())
+                    or any(character not in "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                           for character in str(incoming) + str(root))):
+                raise ValueError("download workspace is not an empty private directory")
+            cache = root / "cache"
+            cache.mkdir(mode=0o700)
+            configuration = Path(sys.argv[5]).read_text()
+            lines = configuration.splitlines()
+            if sum(line.startswith("cachedir=") for line in lines) != 1:
+                raise ValueError("download cache policy is ambiguous")
+            (root / "download.conf").write_text("\n".join(
+                "cachedir=" + str(cache) if line.startswith("cachedir=") else line
+                for line in lines) + "\n")
+            command[3] = str(root / "download.conf")
+            unit = "azurelinux3s4-download-" + root.name.removeprefix("transaction.") + ".service"
+            probe = """import os, sys
+status = dict(line.split(':', 1) for line in open('/proc/self/status') if ':' in line)
+if any(int(status[name].strip(), 16) for name in ('CapEff', 'CapPrm', 'CapBnd', 'CapAmb')) or status['NoNewPrivs'].strip() != '1':
+    raise SystemExit('download sandbox lacks its privilege restriction')
+for path in ('/', '/etc', '/usr', '/var/lib', '/var/lib/rpm'):
+    if not os.statvfs(path).f_flag & os.ST_RDONLY:
+        raise SystemExit('download sandbox lacks read-only system protection: ' + path)
+for path in ('/run/systemd/private', '/run/dbus/system_bus_socket'):
+    if os.access(path, os.R_OK | os.W_OK):
+        raise SystemExit('download sandbox exposes a privileged manager socket')
+print('S4_DOWNLOAD_SANDBOX_VERIFIED', flush=True)
+os.execvp(sys.argv[1], sys.argv[1:])
+"""
+            sandbox = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
+                       "--unit=" + unit, "--property=RuntimeMaxSec=14min", "--property=TimeoutStopSec=15s",
+                       "--property=KillMode=control-group", "--property=ProtectSystem=strict",
+                       "--property=ReadWritePaths=" + str(root) + " " + str(incoming),
+                       "--property=ProtectHome=yes", "--property=PrivateTmp=yes", "--property=PrivateDevices=yes",
+                       "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",
+                       "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes",
+                       "--property=ProtectKernelLogs=yes", "--property=ProtectControlGroups=yes",
+                       "--property=RestrictNamespaces=yes", "--property=RestrictRealtime=yes",
+                       "--property=LockPersonality=yes", "--property=UMask=0077",
+                       "--property=InaccessiblePaths=/run/systemd/private /run/dbus/system_bus_socket",
+                       "--property=LimitFSIZE=536870912", "--property=MemoryMax=768M",
+                       "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH GPG_AGENT_INFO LD_PRELOAD LD_LIBRARY_PATH",
+                       "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
+                       "--setenv=HOME=" + str(home), "--setenv=GNUPGHOME=" + str(home), "--",
+                       "python3", "-I", "-c", probe, *command]
+            # Stream diagnostics into a bounded buffer. Watch the flat incoming
+            # directory while tdnf runs, rather than admitting a huge completed download.
+            process = subprocess.Popen(sandbox, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, env=environment)
+            completed = False
+            try:
+                output = bytearray()
+                deadline = time.monotonic() + 800
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while selector.get_map():
+                        if time.monotonic() >= deadline:
+                            raise ValueError("download deadline expired")
+                        entries = list(incoming.iterdir())
+                        sizes = [entry.lstat() for entry in entries]
+                        if (len(entries) > 128 or any(not stat.S_ISREG(value.st_mode)
+                                or value.st_size > 512 * 1024 * 1024 for value in sizes)
+                                or sum(value.st_size for value in sizes) > 1024 * 1024 * 1024):
+                            raise ValueError("download exceeded its regular-file/count/size bounds")
+                        for event, _ in selector.select(0.2):
+                            data = os.read(event.fd, 65536)
+                            if not data:
+                                selector.unregister(event.fileobj)
+                            else:
+                                output.extend(data)
+                                if len(output) > 1024 * 1024:
+                                    raise ValueError("download diagnostics exceeded their bound")
+                code = process.wait(timeout=max(1, deadline - time.monotonic()))
+                completed = True
+                transaction = subprocess.CompletedProcess(sandbox, code, output.decode("utf-8", "strict"), "")
+                if "S4_DOWNLOAD_SANDBOX_VERIFIED\n" not in transaction.stdout:
+                    raise ValueError("download sandbox enforcement was not positively observed")
+            finally:
+                if not completed:
+                    stopped = subprocess.run(["systemctl", "stop", unit], stdin=subprocess.DEVNULL,
+                                             capture_output=True, timeout=30)
+                    process.kill()
+                    process.wait(timeout=15)
+                    if stopped.returncode:
+                        raise ValueError("download service shutdown could not be confirmed")
+        else:
+            transaction = run(*command, timeout=240)
         print(transaction.stdout, end="")
         print(transaction.stderr, end="", file=sys.stderr)
         output = transaction.stdout + transaction.stderr
@@ -532,7 +643,7 @@ try:
             sys.exit(transaction.returncode if 0 < transaction.returncode < 126 else 75)
         if "Loaded plugin: tdnfrepogpgcheck" not in output or "Error loading plugin" in output:
             raise ValueError("native metadata verifier participation was not observed")
-except (ValueError, OSError, subprocess.SubprocessError) as error:
+except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
     print("azurelinux3s4: trusted metadata transaction deferred: " + str(error), file=sys.stderr)
     sys.exit(75)
 PY
@@ -544,11 +655,261 @@ s4_verify_repository_trust() {
     s4_tdnf makecache
 }
 
+s4_update_store() {
+    # Two bounded slots preserve the last durable batch while preparing its
+    # replacement. A visible pointer is re-flushed before the other slot is reused.
+    local action=$1 directory=${2:-} receipt=${3:-}
+    s4_safe_path "$S4_STATE/updates" || return 75
+    timeout --kill-after=5s 5m python3 -I - "$action" "$S4_STATE/updates" \
+        "$S4_VENDOR_FINGERPRINT" "$directory" "$receipt" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+try:
+    action, root, fingerprint = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+    marker = b"azurelinux3s4-update-slot-v1\n"
+
+    def inspect(path, directory=False, private=True):
+        value = path.lstat()
+        if (not (stat.S_ISDIR(value.st_mode) if directory else stat.S_ISREG(value.st_mode))
+                or value.st_uid != os.geteuid() or value.st_mode & (0o077 if private else 0o022)
+                or (not directory and value.st_nlink != 1)):
+            raise ValueError("update store contains an unsafe object: " + str(path))
+        return value
+
+    def read(path, maximum=1048576):
+        inspect(path)
+        with path.open("rb") as stream:
+            data = stream.read(maximum + 1)
+        if len(data) > maximum:
+            raise ValueError("update record exceeds its bound")
+        return data
+
+    def flush(path):
+        inspect(path, path.is_dir())
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def barrier(*paths):
+        subprocess.run(["sync", "-f", "--", *map(str, paths)], stdin=subprocess.DEVNULL,
+                       check=True, timeout=30)
+
+    def write(path, data, mode):
+        if path.exists() or path.is_symlink():
+            inspect(path)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+
+    def inventory(slot):
+        inspect(slot, True)
+        names = {entry.name for entry in slot.iterdir()}
+        if not names <= {"owner", "manifest.json", "packages"}:
+            raise ValueError("refusing foreign slot contents")
+        if "owner" not in names:
+            if names:
+                raise ValueError("nonempty slot has no ownership record")
+            return []
+        identity = read(slot / "owner", 128)
+        if identity != marker:
+            # Initial creation can be interrupted before the complete marker is
+            # written. Only its bounded prefix in an otherwise empty slot is
+            # recognized; foreign data and every wrong-kind object remain refused.
+            if names == {"owner"} and marker.startswith(identity):
+                return []
+            raise ValueError("slot ownership record is foreign")
+        if "manifest.json" in names:
+            inspect(slot / "manifest.json")
+        files = []
+        if "packages" in names:
+            inspect(slot / "packages", True)
+            files = list((slot / "packages").iterdir())
+            if len(files) > 128:
+                raise ValueError("slot contains too many package objects")
+            for path in files:
+                if not re.fullmatch(r"(?:0|[1-9][0-9]{0,2})\.rpm", path.name) or int(path.stem) > 127:
+                    raise ValueError("refusing foreign package name")
+                inspect(path)
+        return files
+
+    def validate(pointer, persist):
+        if (not isinstance(pointer, dict) or set(pointer) != {"schema", "slot", "manifest_sha256"}
+                or pointer["schema"] != 1 or pointer["slot"] not in ("0", "1")
+                or not re.fullmatch(r"[0-9a-f]{64}", str(pointer["manifest_sha256"]))):
+            raise ValueError("current update pointer is malformed")
+        slot = root / ("slot" + pointer["slot"])
+        files = inventory(slot)
+        material = read(slot / "manifest.json")
+        if hashlib.sha256(material).hexdigest() != pointer["manifest_sha256"]:
+            raise ValueError("current update manifest does not match its pointer")
+        proof = json.loads(material)
+        if (set(proof) != {"schema", "vendor_fingerprint", "packages", "installs_performed", "freshness_proven"}
+                or proof["schema"] != 1 or proof["vendor_fingerprint"] != fingerprint
+                or proof["installs_performed"] is not False or proof["freshness_proven"] is not False
+                or not isinstance(proof["packages"], list) or len(proof["packages"]) > 128):
+            raise ValueError("current update manifest policy is unsupported")
+        expected, total = [], 0
+        for index, record in enumerate(proof["packages"]):
+            path = slot / "packages" / (str(index) + ".rpm")
+            if (not isinstance(record, dict) or set(record) != {"file", "bytes", "sha256"}
+                    or record["file"] != "packages/" + path.name or type(record["bytes"]) is not int
+                    or not 0 < record["bytes"] <= 512 * 1024 * 1024
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"]))):
+                raise ValueError("current update package record is malformed")
+            value = inspect(path)
+            if value.st_mode & 0o777 != 0o400 or value.st_size != record["bytes"]:
+                raise ValueError("retained update package mode/size changed")
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    digest.update(block)
+            if digest.hexdigest() != record["sha256"]:
+                raise ValueError("retained update package bytes changed")
+            total += record["bytes"]
+            expected.append(path)
+            if persist:
+                flush(path)
+        if total > 1024 * 1024 * 1024 or set(files) != set(expected):
+            raise ValueError("retained batch size/contents differ from its manifest")
+        if persist:
+            for path in (slot / "owner", slot / "manifest.json", slot / "packages", slot, root / "current.json", root):
+                flush(path)
+            barrier(slot, root, root.parent)
+            if json.loads(read(root / "current.json")) != pointer:
+                raise ValueError("current pointer changed after its persistence barrier")
+        return slot
+
+    inspect(root, True)
+    current = root / "current.json"
+    pointer = json.loads(read(current)) if current.exists() or current.is_symlink() else None
+    if action == "begin":
+        if pointer is not None:
+            validate(pointer, True)
+        name = "slot1" if pointer and pointer["slot"] == "0" else "slot0"
+        slot = root / name
+        if slot.exists() or slot.is_symlink():
+            files = inventory(slot)
+            # Only the recognized private slot and its bounded regular files
+            # are reusable; ordinary foreign/wrong-kind objects are preserved.
+            for path in files:
+                path.unlink()
+            if (slot / "manifest.json").exists():
+                (slot / "manifest.json").unlink()
+            # Keep the ownership record and empty package directory throughout
+            # recycling. An interruption must not create an unrecognized slot.
+        else:
+            slot.mkdir(mode=0o700)
+        if not (slot / "owner").exists() or read(slot / "owner", 128) != marker:
+            write(slot / "owner", marker, 0o600)
+        (slot / "packages").mkdir(mode=0o700, exist_ok=True)
+        flush(slot)
+        barrier(slot, root, root.parent)
+        print(slot)
+    elif action == "list":
+        incoming = Path(sys.argv[4])
+        inspect(incoming, True)
+        files = sorted(incoming.iterdir())
+        sizes = [inspect(path, private=False) for path in files]
+        if (len(files) > 128 or any(not path.name.endswith(".rpm") for path in files)
+                or any(not 0 < value.st_size <= 512 * 1024 * 1024 for value in sizes)
+                or sum(value.st_size for value in sizes) > 1024 * 1024 * 1024):
+            raise ValueError("download batch is not bounded regular RPM files")
+        for path in files:
+            sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+    elif action == "commit":
+        slot = Path(sys.argv[4])
+        if slot not in (root / "slot0", root / "slot1") or (pointer and slot.name == "slot" + pointer["slot"]):
+            raise ValueError("candidate slot is not independent of the current slot")
+        inventory(slot)
+        receipt = json.loads(read(Path(sys.argv[5])))
+        if (receipt.get("schema") != 1 or receipt.get("vendor_fingerprint") != fingerprint
+                or receipt.get("snapshots_retained") is not True or receipt.get("installs_performed") is not False
+                or receipt.get("freshness_proven") is not False or not isinstance(receipt.get("artifacts"), list)):
+            raise ValueError("retained admission evidence is malformed")
+        records = [{"file": "packages/" + str(index) + ".rpm", "bytes": value["bytes"], "sha256": value["sha256"]}
+                   for index, value in enumerate(receipt["artifacts"])]
+        for path in inventory(slot):
+            path.chmod(0o400)
+        manifest = json.dumps({"schema": 1, "vendor_fingerprint": fingerprint, "packages": records,
+                               "installs_performed": False, "freshness_proven": False}, sort_keys=True).encode() + b"\n"
+        write(slot / "manifest.json", manifest, 0o400)
+        new = {"schema": 1, "slot": slot.name[-1], "manifest_sha256": hashlib.sha256(manifest).hexdigest()}
+        # Validate bytes against the same admission receipt BEFORE publication.
+        validate(new, False)
+        for path in [*inventory(slot), slot / "owner", slot / "manifest.json", slot / "packages", slot]:
+            flush(path)
+        barrier(slot, root, root.parent)
+        temporary = root / "current.next"
+        write(temporary, json.dumps(new, sort_keys=True).encode() + b"\n", 0o600)
+        temporary.replace(current)
+        flush(root)
+        barrier(root, root.parent)
+        validate(new, True)
+        print(json.dumps(new, sort_keys=True))
+    elif action == "verify":
+        if pointer is None:
+            raise ValueError("no signed update batch is prepared")
+        validate(pointer, True)
+    else:
+        raise ValueError("unknown update-store operation")
+except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
+    print("azurelinux3s4: update preparation deferred: " + str(error), file=sys.stderr)
+    sys.exit(75)
+PY
+}
+
+s4_prepare_updates() (
+    command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
+    s4_directory "$S4_STATE/updates" 0700 || return 75
+    local directory slot evidence
+    slot=$(s4_update_store begin) || return 75
+    directory=$(mktemp -d "$S4_RUN/updates.XXXXXX") || return 75
+    trap 'rm -rf -- "$directory"' EXIT
+    mkdir -m 0700 -- "$directory/incoming" || return 75
+    local S4_DOWNLOAD_DIRECTORY=$directory/incoming
+    if ! s4_tdnf upgrade --downloadonly "--downloaddir=$S4_DOWNLOAD_DIRECTORY" >"$directory/download.log"; then
+        cat -- "$directory/download.log" >&2
+        return 75
+    fi
+    cat -- "$directory/download.log" >&2
+    s4_update_store list "$directory/incoming" >"$directory/files" || return 75
+    local -a packages=()
+    mapfile -d '' -t packages <"$directory/files"
+    if (( ${#packages[@]} )); then
+        local S4_ADMISSION_DESTINATION=$slot/packages
+        s4_verify_rpm_artifacts "${packages[@]}" >"$directory/receipt.json" || return 75
+    else
+        # Empty output is not proof that the solver found no work. Require its
+        # explicit native no-action observation after the signed refresh.
+        awk '$0 == "Nothing to do." { found=1 } END { exit !found }' "$directory/download.log" || return 75
+        printf '{"schema":1,"vendor_fingerprint":"%s","artifacts":[],"installs_performed":false,"snapshots_retained":true,"freshness_proven":false}\n' \
+            "$S4_VENDOR_FINGERPRINT" >"$directory/receipt.json"
+    fi
+    evidence=$(s4_update_store commit "$slot" "$directory/receipt.json") || return 75
+    rm -rf -- "$directory" || return 75
+    trap - EXIT
+    s4_log 'Signed update batch prepared; no packages were installed.'
+    printf '%s\n' "$evidence"
+)
+
 s4_verify_component() {
     case $1 in
         trust-anchor) s4_verify_trust_anchor ;;
         bootstrap) s4_verify_bootstrap ;;
         repository-trust) s4_verify_repository_trust ;;
+        update-preparation) s4_update_store verify && s4_timer_state enabled active "$S4_UPDATE_TIMER" ;;
         *) return 78 ;;
     esac
 }
@@ -798,8 +1159,8 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust ]] || return 78
-    if [[ $component == repository-trust ]]; then
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation ]]; then
         # Its health check IS an online signed refresh. Honor backoff before
         # network work and do not repeat the same failed refresh in a child.
         attempts=$(s4_state_value "$component" attempts)
@@ -812,11 +1173,19 @@ s4_reconcile_component() {
         (( attempts < 10 )) || attempts=10
         attempts=$((attempts + 1))
         s4_write_state "$component" running "$attempts" 0 0 || return $?
-        if s4_verify_repository_trust; then
+        result=0
+        case $component in
+            repository-trust) s4_verify_repository_trust || result=$? ;;
+            update-preparation)
+                if s4_start_timer "$S4_UPDATE_TIMER"; then
+                    s4_prepare_updates || result=$?
+                else
+                    result=$?
+                fi ;;
+        esac
+        if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0
             return $?
-        else
-            result=$?
         fi
         s4_defer_component "$component" "$result" "$attempts"
         return $?
@@ -869,7 +1238,7 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/bin/bash $S4_INSTALL_DIR/azurelinux3s4.sh --repair
-TimeoutStartSec=20min
+TimeoutStartSec=45min
 TimeoutStopSec=30s
 KillMode=control-group
 UMask=0077
@@ -912,10 +1281,26 @@ Unit=azurelinux3s4-repair.service
 [Install]
 WantedBy=timers.target
 EOF
+    s4_atomic_write "$S4_SYSTEMD_DIR/$S4_UPDATE_TIMER" 0644 <<'EOF' || return $?
+[Unit]
+Description=Periodically prepare vendor-signed Azure Linux 3 updates
+
+[Timer]
+OnBootSec=3min
+OnCalendar=hourly
+Persistent=yes
+RandomizedDelaySec=15min
+AccuracySec=1min
+Unit=azurelinux3s4-repair.service
+
+[Install]
+WantedBy=timers.target
+EOF
     # OnBootSec makes an offline reboot resume work; no network-online gate stalls
     # timer installation. Failed one-shots remain eligible for the next attempt.
     timeout --kill-after=5s 30s systemctl daemon-reload || return $?
-    s4_start_repair_timer
+    s4_start_repair_timer || return $?
+    s4_start_timer "$S4_UPDATE_TIMER"
 }
 
 s4_timer_state() {
@@ -935,7 +1320,7 @@ s4_timer_state() {
 
 s4_preserve_retry_link() {
     local unit=${1:-$S4_REPAIR_TIMER} directory=$S4_SYSTEMD_DIR/timers.target.wants link target
-    [[ $unit == "$S4_REPAIR_TIMER" || $unit == "$S4_RECOVERY_TIMER" ]] || return 78
+    [[ $unit == "$S4_REPAIR_TIMER" || $unit == "$S4_RECOVERY_TIMER" || $unit == "$S4_UPDATE_TIMER" ]] || return 78
     target=$S4_SYSTEMD_DIR/$unit
     link=$directory/$unit
     s4_safe_path "$target" || return $?
@@ -1108,11 +1493,11 @@ s4_main() {
     local action=${1:-install}
     case $action in
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: trust anchor, bootstrap and repository trust only; server hardening is incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: trust, bootstrap and signed-update preparation; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -1127,11 +1512,17 @@ s4_main() {
         s4_verify_rpm_artifacts "$@"
         return $?
     fi
+    if [[ $action == --prepare-updates ]]; then
+        s4_verify_trust_anchor && s4_repositories && s4_verify_bootstrap || return 75
+        s4_prepare_updates
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
             bootstrap) s4_apply_bootstrap ;;
             repository-trust) s4_verify_repository_trust ;;
+            update-preparation) s4_prepare_updates ;;
         esac
         return $?
     fi
@@ -1139,7 +1530,7 @@ s4_main() {
         s4_install_runner || return $?
         s4_install_units || return $?
         s4_repair yes || return $?
-        s4_log 'INCOMPLETE: trust anchor, bootstrap and repository trust only. This checkpoint has not hardened the server.'
+        s4_log 'INCOMPLETE: trust, bootstrap and update preparation only. Host hardening and automatic package installation remain unfinished.'
         return 78
     fi
     s4_repair no
