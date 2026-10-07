@@ -7,6 +7,7 @@ s4_verify_component() {
         update-compatibility) s4_check_updates ;;
         update-capacity) s4_check_update_capacity ;;
         update-effects) s4_check_update_effects ;;
+        update-interpreters) s4_check_update_interpreters ;;
         *) return 78 ;;
     esac
 }

@@ -17,6 +17,7 @@ MODULES = (
     "test_update_compatibility",
     "test_update_capacity",
     "test_update_effects",
+    "test_update_interpreters",
 )
 
 

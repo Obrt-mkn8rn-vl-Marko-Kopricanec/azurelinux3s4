@@ -321,6 +321,7 @@ s4_repositories() {{ return 0; }}
 s4_verify_repository_trust() {{ return 0; }}
 s4_prepare_updates() {{ return 0; }}
 s4_check_update_capacity() {{ return 0; }}
+s4_check_update_interpreters() {{ return 0; }}
 s4_start_timer() {{ return 0; }}
 s4_start_repair_timer() {{ touch {shlex.quote(str(self.root / 'retry'))}; }}
 s4_finish_repair() {{ touch {shlex.quote(str(self.root / 'finished'))}; }}
@@ -334,11 +335,11 @@ s4_repair yes >/dev/null
         self.assertIn('status=complete', (self.root / 'state/components/update-effects').read_text())
 
     def test_generated_policy_includes_another_complete_admission_test_and_controls(self):
-        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 14540 + 2295 + 4 * 35)
+        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 14540 + 2295 + 4 * 35 + 2600 + 4 * 35)
         # Unit generation is real; activation has separate accepted coverage.
         self.shell('s4_start_repair_timer() { return 0; }; s4_start_timer() { return 0; }; s4_install_units')
         policy = (self.root / 'units/azurelinux3s4-repair.service').read_text()
-        self.assertIn('TimeoutStartSec=16975s', policy)
+        self.assertIn('TimeoutStartSec=19715s', policy)
         self.assertIn('TimeoutStopSec=30s', policy)
         self.assertIn('KillMode=control-group', policy)
 

@@ -157,10 +157,11 @@ s4_verify_metadata() {{ return 0; }}
         stages = 2 * 930 + 330 + 930 + 3 * 305 + 905
         diagnostic = 2 * 35 + 20 + 305 + 65 + 905 + 930
         stages += diagnostic + diagnostic + 305
-        persistence_and_cleanup = 48 * 35 + 600
+        stages += diagnostic + diagnostic + 305  # Effects, then interpreter-file observation.
+        persistence_and_cleanup = 56 * 35 + 600
         deadline = int(self.shell('s4_repair_timeout_seconds').stdout)
         self.assertGreaterEqual(deadline, trust + healthy + stages + persistence_and_cleanup)
-        self.assertLessEqual(deadline, 5 * 60 * 60)
+        self.assertLessEqual(deadline, 6 * 60 * 60)
 
     def test_successful_slow_attempt_publishes_under_generated_service_deadline(self):
         # Scale stage durations and the GENERATED service cap equally. Actual
