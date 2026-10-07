@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests")
+TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests", "Web.Tests")
 MODULES = (
     "test_bundle",
     "test_bootstrap",
@@ -19,6 +19,7 @@ MODULES = (
     "test_update_effects",
     "test_update_interpreters",
     "test_update_removals",
+    "test_web_isolation",
 )
 
 
@@ -31,7 +32,7 @@ def main():
                             check=False)
     if result.returncode:
         return result.returncode
-    # Legacy fixture imports stay local to the three test components. The
+    # Fixture imports stay local to the explicit test components. The
     # delivered installer never imports or depends on this development runner.
     sys.path[:0] = [str(ROOT / directory) for directory in TEST_DIRECTORIES]
     loader = unittest.TestLoader()

@@ -1,0 +1,7 @@
+s4_web_isolation_policy() {
+    # Candidate bytes only. No package/account/unit/file installation or host
+    # observation is performed, and this is not a setup-completion dependency.
+    timeout --kill-after=5s 30s python3 -I - <<'PY'
+# @s4-include Web/policy.py
+PY
+}
