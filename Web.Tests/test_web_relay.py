@@ -40,7 +40,7 @@ class RelayPolicyTests(unittest.TestCase):
         self.assertEqual(unit["Unit"]["CollectMode"], ["inactive-or-failed"])
         self.assertEqual(proxy["StandardInput"], ["socket"])
         self.assertEqual(proxy["Restart"][-1], "no")
-        self.assertEqual(proxy["RuntimeMaxSec"], ["300s"])
+        self.assertEqual(proxy["RuntimeMaxSec"], ["390s"])
         self.assertEqual(proxy["ExecStart"], ["/usr/bin/python3 -I /usr/local/lib/azurelinux3s4/web-relay.py"])
         listener = sections(entries["systemd/azurelinux3s4-web.socket"]["content"])["Socket"]
         self.assertEqual(listener["Accept"], ["yes"])
@@ -60,9 +60,9 @@ class RelayPolicyTests(unittest.TestCase):
                 target = checkout / name
                 target.parent.mkdir(exist_ok=True)
                 shutil.copyfile(ROOT / name, target)
-            path = checkout / "Web/relay.py"
+            path = checkout / pack.WORKER_TEMPLATE
             # This is valid Python but would close its enclosing raw literal.
-            path.write_bytes(b'# unsafe literal separator: ' + bytes([39]) * 3 + b'\n')
+            path.write_bytes(path.read_bytes() + b'# unsafe literal separator: ' + bytes([39]) * 3 + b'\n')
             with self.assertRaisesRegex(ValueError, "assembly boundary"):
                 pack.assemble(checkout)
 

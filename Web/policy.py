@@ -94,7 +94,8 @@ Type=exec
 Slice=azurelinux3s4-web.slice
 User=azurelinux3s4-web-proxy
 {COMMON}Restart=no
-RuntimeMaxSec=300s
+# 60s worker startup + 300s forwarding + 30s loader/local cleanup reserve.
+RuntimeMaxSec=390s
 StandardInput=socket
 ExecStart=/usr/bin/python3 -I {RELAY}
 # Hide host runtime sockets; expose the backend and dynamic identity lookup only.
@@ -201,6 +202,7 @@ def bundle():
             "Native SAME-byte worker credential, protected backend ancestry/held socket and peer-credential admission, with conflict-safe caller/manager authorization independent of names or PIDs; trusted NSS and the single dynamic identity lookup socket must be available.",
             "Enabled native Landlock ABI3+; final TSYNC process-creation denial and one live task before an empty filesystem ruleset, successful native installation and namespace/fd-link read-denial challenges BEFORE forwarding.",
             "Native libseccomp must resolve every denied metadata/signal/SysV/POSIX-mqueue/key syscall, including fchmodat2; checked EPERM challenges for each family must precede filesystem confinement and forwarding.",
+            "Fresh mapped-runtime/interpreter inode/path/ELF/hash observations before final descriptor scrubbing; clean unblocked SIGALRM/default-handler/no-existing-timer context and checked 60s startup timer retired before forwarding.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
@@ -210,6 +212,7 @@ def bundle():
             "The worker checks dedicated process IDs/groups/NNP/zero capabilities, journal descriptors, protected fixed backend ancestry and a held socket inode plus connect/listen-time Unix peer IDs, scrubs lookup/extra descriptors, then seals before forwarding. The read-only dynamic identity socket bind does not make its IPC protocol read-only. These observations do not authenticate native runtime or current peer executable, authorize the caller, certify manager launch, prevent UID reuse or establish atomic/ABA/concurrent-root protection.",
             "The relay additionally denies all known Landlock filesystem rights after startup; ABI3 handles file read/write/execute, directory reads, namespace creation/removal/reparenting and truncation, with device ioctl on ABI5+. Missing support or a failed challenge refuses. Existing descriptor rights, metadata/O_PATH, shared mappings, other processes and backend nginx filesystem access are separate; kernel/base/runtime/procfs are trusted. This is a calling-thread layer after final TSYNC and a bounded single-task check, not whole-host or full MAC enforcement.",
             "The final native filter also refuses chmod/chown/timestamp/xattr mutations, outgoing signals, SysV IPC, POSIX mqueues and kernel keys through the explicitly named syscalls. Safe challenge arguments do not mutate files, deliver signals or allocate objects. Metadata observation/O_PATH, anonymous memory/IPC, futexes, existing mappings, allowed descriptor IO and future unnamed syscalls remain outside this bounded layer; incoming supervisor signals remain available. This is not complete IPC or host isolation.",
+            "The worker observes already-loaded executable ELF files and its interpreter via trusted procfs, protected root-owned alias-free paths and same-inode hash descriptors. This is post-load file observation, not signed-package/native-runtime/memory attestation or complete Python/NSS/dependency/environment authentication. Deleted/ambiguous/unsupported maps or executable anonymous/writable mappings refuse; permitted heap/data mappings and future mappings remain separate. The 30s observer and 60s startup guards assume finite honest IO/scheduling; generated 390s runtime allowance includes 300s forwarding and a 30s loader/local reserve, with separate 30s stop grace. No universal stalled-kernel or native manager liveness is certified.",
             "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",

@@ -22,10 +22,12 @@ class BundleTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "checkout"
         self.root.mkdir()
-        for name in (*PACK.INPUTS, "Bootstrap/pack.py", "Bootstrap/test.py"):
+        for name in (*PACK.INPUTS, *PACK.OUTPUTS, "Bootstrap/pack.py", "Bootstrap/test.py"):
             target = self.root / name
             target.parent.mkdir(exist_ok=True)
             shutil.copyfile(ROOT / name, target)
+            if name in PACK.OUTPUTS:
+                target.chmod(PACK.OUTPUTS[name])
         self.script = self.root / PACK.TARGET
         self.script.write_bytes((ROOT / PACK.TARGET).read_bytes())
         self.script.chmod(0o755)
@@ -189,6 +191,70 @@ class BundleTests(unittest.TestCase):
         self.assertIn("differs from its sources", result.stderr)
         self.assertNotIn("ModuleNotFoundError", result.stderr)
         self.assertNotIn("Ran ", result.stderr)
+
+    def test_generated_worker_drift_and_mode_refuse_before_test_imports(self):
+        worker = self.root / PACK.WORKER_TARGET
+        expected = worker.read_bytes()
+        worker.write_bytes(expected + b"# stale output\n")
+        result = subprocess.run([sys.executable, "-B", str(self.root / "Bootstrap/test.py"), "test_web_runtime"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Web/relay.py differs", result.stderr)
+        self.assertNotIn("Ran ", result.stderr)
+        self.command()
+        self.assertEqual(worker.read_bytes(), expected)
+        worker.chmod(0o660)
+        self.command("--check", expected=1)
+        self.command()
+        self.assertEqual(stat.S_IMODE(worker.stat().st_mode), 0o644)
+
+    def test_worker_operator_output_objects_refuse_before_installer_replacement(self):
+        original = self.script.read_bytes()
+        worker = self.root / PACK.WORKER_TARGET
+        worker.unlink()
+        operator = self.root.parent / "operator-worker.py"
+        operator.write_bytes(b"operator data\n")
+        for kind in ("symlink", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "symlink": worker.symlink_to(operator)
+                elif kind == "fifo": os.mkfifo(worker)
+                else: worker.mkdir()
+                identity = worker.lstat()
+                self.command(expected=1)
+                self.command("--check", expected=1)
+                self.assertEqual(worker.lstat(), identity)
+                self.assertEqual(operator.read_bytes(), b"operator data\n")
+                self.assertEqual(self.script.read_bytes(), original)
+                if kind == "directory": worker.rmdir()
+                else: worker.unlink()
+
+    def test_runtime_include_is_unique_declared_and_cannot_close_outer_boundary(self):
+        original = self.script.read_bytes()
+        template = self.root / PACK.WORKER_TEMPLATE
+        source = template.read_bytes()
+        marker = b"# @s4-include Web/runtime.py\n"
+        for replacement in (marker + marker, b"# @s4-include .env\n", b"# omitted runtime\n"):
+            with self.subTest(replacement=replacement):
+                template.write_bytes(source.replace(marker, replacement))
+                self.command(expected=1)
+                self.assertEqual(self.script.read_bytes(), original)
+        template.write_bytes(source)
+        helper = self.root / PACK.WORKER_HELPER
+        for data in (b"PY\n", b"# @s4-include .env\n"):
+            with self.subTest(data=data):
+                helper.write_bytes(data)
+                self.command(expected=1)
+                self.assertEqual(self.script.read_bytes(), original)
+
+    def test_worker_pair_rebuild_is_repeatable_and_repairs_both_artifacts(self):
+        worker = self.root / PACK.WORKER_TARGET
+        expected = worker.read_bytes(), self.script.read_bytes()
+        worker.write_bytes(b"damaged worker\n")
+        self.script.write_bytes(b"damaged installer\n")
+        self.command()
+        self.assertEqual((worker.read_bytes(), self.script.read_bytes()), expected)
+        self.command("--check")
+        self.assertFalse(list(self.root.rglob(".azurelinux3s4-*.tmp")))
 
 
 if __name__ == "__main__":
