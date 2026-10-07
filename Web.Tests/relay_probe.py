@@ -1,8 +1,9 @@
 """Local projection of the maintained relay; no unit or server activation.
 
-The forwarding route changes only the Unix backend PATH delivery, optionally
-scales the two clocks or injects an explicit failure. Socket/filter/copy/close
-work remains the actual production implementation.
+The historical forwarding projection delivers a private PATH and substitutes
+credential/journal/backend admission, optionally scales clocks or injects a
+failure. It proves the accepted sealing/copy leaves, not the new admission.
+New admission controls are maintained separately in test_web_admission.py.
 """
 
 import ctypes
@@ -93,7 +94,23 @@ def main():
             raise AssertionError("extra inherited FD remains open")
         print(json.dumps({"extra_fd_closed": True}))
         return 0
-    RELAY.BACKEND = argument
+    # Disclosed historical seccomp/forwarding projection: no production
+    # credential, journal or backend ancestry acceptance follows from it.
+    RELAY.process_identity = lambda: (os.getuid(), os.getuid(), os.getgid())
+    RELAY.admit_logging = lambda: None
+
+    def private_backend(uid, gid):
+        connection = socket.socket(socket.AF_UNIX)
+        try:
+            connection.settimeout(5)
+            connection.connect(argument)
+            connection.setblocking(False)
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    RELAY.connect_backend = private_backend
     if mode == "idle":
         RELAY.IDLE_SECONDS = 0.2
         RELAY.TOTAL_SECONDS = 2

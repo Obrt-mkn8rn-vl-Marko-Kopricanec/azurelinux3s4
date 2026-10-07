@@ -97,9 +97,10 @@ User=azurelinux3s4-web-proxy
 RuntimeMaxSec=300s
 StandardInput=socket
 ExecStart=/usr/bin/python3 -I {RELAY}
-# Hide host runtime sockets; the checked backend directory is the only run bind.
+# Hide host runtime sockets; expose the backend and dynamic identity lookup only.
 TemporaryFileSystem=/run:ro /var:ro
 BindReadOnlyPaths={RUNTIME}
+BindReadOnlyPaths=/run/systemd/userdb/io.systemd.DynamicUser
 InaccessiblePaths=/etc/azurelinux3s4
 # Startup permits the one Unix connect. The worker must seal connect, flagged
 # sends, socket/FD acquisition and process creation BEFORE forwarding any bytes.
@@ -191,19 +192,20 @@ def bundle():
             "inherited_inet_sockets_restricted", "lan_containment_verified", "tls_ready", "server_ready")},
         "prerequisites": [
             "Fresh authenticated nginx/systemd runtime and supported native x86_64/aarch64 ABI.",
-            "Root-owned protected configuration/content and a checked dedicated shared group.",
+            "Root-owned protected configuration/content and conflict-admitted dedicated UID/GID/shared-group allocation; name-service observations alone do not authorize identities.",
             "Conflict-safe durable installation, actual parser tests and boot/repair ownership.",
             "Positive network namespace/seccomp/filesystem/capability enforcement challenges.",
             "Independent proxy egress protection covering inherited TCP sockets, with positive refusal challenges.",
             "Trusted Python/libseccomp/close_range and per-connection worker sealing BEFORE forwarding, including connect/Fast Open/FD-acquisition refusals and same-connection byte/half-close proof.",
-            "Only the accepted stdin TCP socket and checked Unix/non-IP logging descriptors may be inherited; verify aggregate slice/MaxConnections and per-worker limits.",
+            "Only the accepted stdin TCP socket and connected root journal logging descriptors may be inherited; verify aggregate slice/MaxConnections and per-worker limits.",
+            "Native SAME-byte worker credential, protected backend ancestry/held socket and peer-credential admission, with conflict-safe caller/manager authorization independent of names or PIDs; trusted NSS and the single dynamic identity lookup socket must be available.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
         "limits": [
             "Candidate HTTP files only; generation does not install, activate or inspect the host.",
             "The worker retains an inherited IP connection; socket creation restrictions alone do not stop reconnects. No activation or native Azure worker/unit enforcement is certified by emission.",
-            "The worker connects to its fixed Unix backend once, then denies connection setup/flagged sends and forwards through bounded read/write queues. Trusted startup/import/native libraries and the checked backend peer remain assumptions.",
+            "The worker checks dedicated process IDs/groups/NNP/zero capabilities, journal descriptors, protected fixed backend ancestry and a held socket inode plus connect/listen-time Unix peer IDs, scrubs lookup/extra descriptors, then seals before forwarding. The read-only dynamic identity socket bind does not make its IPC protocol read-only. These observations do not authenticate native runtime or current peer executable, authorize the caller, certify manager launch, prevent UID reuse or establish atomic/ABA/concurrent-root protection.",
             "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",

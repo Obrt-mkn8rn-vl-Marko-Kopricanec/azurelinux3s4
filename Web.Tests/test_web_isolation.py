@@ -120,7 +120,8 @@ class WebPolicyTests(unittest.TestCase):
         self.assertEqual(backend["Group"], proxy["Group"])
         self.assertEqual(POLICY.files()["sysusers/azurelinux3s4-web.conf"], "g azurelinux3s4-web -\n")
         self.assertEqual(proxy["TemporaryFileSystem"], ["/run:ro /var:ro"])
-        self.assertEqual(proxy["BindReadOnlyPaths"], ["/run/azurelinux3s4-web"])
+        self.assertEqual(proxy["BindReadOnlyPaths"], ["/run/azurelinux3s4-web",
+                                                    "/run/systemd/userdb/io.systemd.DynamicUser"])
 
     def test_resource_limits_are_finite_and_independent_of_repair_budget(self):
         for name, content in POLICY.files().items():

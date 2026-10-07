@@ -221,7 +221,10 @@ exec(compile(sys.stdin.read(), '<stdin>', 'exec'), {'__name__': '__main__'})
         path.unlink()
         os.mkfifo(path, 0o600)
         inode = path.stat().st_ino
-        self.shell(expected=75, timeout=3)
+        # This wall budget also covers interpreter/private-keyring startup and
+        # four RPM fixture commands. The audit below independently forbids any
+        # wrong-kind open, so extra scheduling margin cannot hide FIFO IO.
+        self.shell(expected=75, timeout=15)
         self.assertEqual(path.stat().st_ino, inode)
         path.unlink()
         path.mkdir()

@@ -1,22 +1,30 @@
 """One accepted TCP connection to one Unix backend; no reconnect after sealing.
 
-Candidate worker only. Installation, systemd confinement, protected backend
-identity/ancestry and native Azure runtime admission are separate prerequisites.
+Candidate worker only. Credential/path observations do not authenticate the
+runtime, authorize a caller or establish systemd/LSM confinement.
 """
 
 import ctypes
 import errno
+import grp
 import os
 import platform
+import pwd
 import resource
 import selectors
 import socket
 import stat
+import struct
 import sys
 import time
 
 
-BACKEND = "/run/azurelinux3s4-web/http.sock"
+BACKEND_USER = "azurelinux3s4-web-backend"
+PROXY_USER = "azurelinux3s4-web-proxy"
+SHARED_GROUP = "azurelinux3s4-web"
+ROOT_UID = 0
+ROOT_GID = 0
+JOURNAL = "/run/systemd/journal/stdout"
 BUFFER = 65536
 IDLE_SECONDS = 30
 TOTAL_SECONDS = 300
@@ -34,6 +42,171 @@ DENIED = (
 class Comparison(ctypes.Structure):
     _fields_ = [("arg", ctypes.c_uint), ("op", ctypes.c_int),
                 ("a", ctypes.c_uint64), ("b", ctypes.c_uint64)]
+
+
+def peer_credentials(stream):
+    # SO_PEERCRED is a connect/listen-time observation, not executable identity
+    # or evidence that the currently executing process still has these IDs.
+    data = stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    if len(data) != 12:
+        raise ValueError("Unix peer credentials are incomplete")
+    pid, uid, gid = struct.unpack("=iII", data)
+    if pid <= 0 or uid == 0xffffffff or gid == 0xffffffff:
+        raise ValueError("Unix peer credentials are unavailable")
+    return pid, uid, gid
+
+
+def process_identity():
+    proxy = pwd.getpwnam(PROXY_USER)
+    backend = pwd.getpwnam(BACKEND_USER)
+    group = grp.getgrnam(SHARED_GROUP)
+    if (proxy.pw_name != PROXY_USER or backend.pw_name != BACKEND_USER
+            or group.gr_name != SHARED_GROUP
+            or not 0 < proxy.pw_uid < 0xffffffff
+            or not 0 < backend.pw_uid < 0xffffffff
+            or proxy.pw_uid == backend.pw_uid
+            or not 0 < group.gr_gid < 0xffffffff
+            or pwd.getpwuid(proxy.pw_uid).pw_name != PROXY_USER
+            or pwd.getpwuid(backend.pw_uid).pw_name != BACKEND_USER
+            or grp.getgrgid(group.gr_gid).gr_name != SHARED_GROUP):
+        raise ValueError("dedicated web account observations are inconsistent")
+    if (os.getresuid() != (proxy.pw_uid,) * 3
+            or os.getresgid() != (group.gr_gid,) * 3
+            or not set(os.getgroups()) <= {group.gr_gid}):
+        raise ValueError("web worker credentials differ from the dedicated identity")
+    # Root, borrowed supplementary groups and retained capabilities are refused.
+    # NSS/base/procfs are trusted inputs; this is not account creation/admission.
+    with open("/proc/self/status", "rb") as stream:
+        data = stream.read(16385)
+    if len(data) > 16384:
+        raise ValueError("process status exceeds the observation bound")
+    records = {}
+    for line in data.splitlines():
+        key, separator, value = line.partition(b":")
+        if separator and key in (b"Uid", b"Gid", b"CapInh", b"CapPrm", b"CapEff", b"CapBnd", b"CapAmb", b"NoNewPrivs"):
+            if key in records:
+                raise ValueError("duplicate process status observation")
+            records[key] = value.split()
+    if (records.get(b"Uid") != [str(proxy.pw_uid).encode()] * 4
+            or records.get(b"Gid") != [str(group.gr_gid).encode()] * 4
+            or records.get(b"NoNewPrivs") != [b"1"]):
+        raise ValueError("process filesystem IDs or NNP observation refused")
+    for key in (b"CapInh", b"CapPrm", b"CapEff", b"CapBnd", b"CapAmb"):
+        values = records.get(key, [])
+        if len(values) != 1 or len(values[0]) != 16 or values[0] != b"0" * 16:
+            raise ValueError("process capability observation refused")
+    return proxy.pw_uid, backend.pw_uid, group.gr_gid
+
+
+def admit_logging():
+    observations = []
+    for descriptor in (1, 2):
+        if not stat.S_ISSOCK(os.fstat(descriptor).st_mode):
+            raise ValueError("only connected Unix journal logging descriptors are accepted")
+        stream = socket.socket(fileno=descriptor)
+        try:
+            if (stream.family != socket.AF_UNIX or stream.type != socket.SOCK_STREAM
+                    or stream.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+                    or stream.getpeername() != JOURNAL):
+                raise ValueError("unexpected journal descriptor")
+            peer = peer_credentials(stream)
+            if peer[1:] != (ROOT_UID, ROOT_GID):
+                raise ValueError("journal peer is not the expected root identity")
+            observations.append(peer)
+        finally:
+            stream.detach()
+    if observations[0] != observations[1]:
+        raise ValueError("journal descriptors have different peers")
+
+
+def inode_identity(value):
+    return value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid
+
+
+def mount_identity(descriptor):
+    with open(f"/proc/self/fdinfo/{descriptor}", "rb") as stream:
+        data = stream.read(8193)
+    if len(data) > 8192:
+        raise ValueError("descriptor mount observation exceeds the bound")
+    values = [line.split(b":", 1)[1].strip() for line in data.splitlines()
+              if line.startswith(b"mnt_id:")]
+    if len(values) != 1 or not values[0].isdigit():
+        raise ValueError("descriptor mount identity is unavailable")
+    return int(values[0])
+
+
+def backend_root():
+    return os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def backend_path(backend_uid, group_gid):
+    # Fixed, alias-free path. O_PATH never opens a FIFO/device/socket for IO;
+    # NOFOLLOW leaves symlinks as links so they cannot redirect this walk.
+    descriptors = []
+    try:
+        root = backend_root()
+        descriptors.append(root)
+        trace = []
+        for index, name in enumerate((None, "run", "azurelinux3s4-web", "http.sock")):
+            if name is not None:
+                descriptors.append(os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                           dir_fd=descriptors[-1]))
+            descriptor = descriptors[-1]
+            value = os.fstat(descriptor)
+            if index < 2:
+                if not stat.S_ISDIR(value.st_mode) or value.st_uid != ROOT_UID or value.st_mode & 0o022:
+                    raise ValueError("unprotected backend root or run ancestry")
+            elif index == 2:
+                if (not stat.S_ISDIR(value.st_mode) or value.st_uid != backend_uid
+                        or value.st_gid != group_gid or stat.S_IMODE(value.st_mode) != 0o750):
+                    raise ValueError("backend runtime directory identity or permissions refused")
+            elif (not stat.S_ISSOCK(value.st_mode) or value.st_uid != backend_uid
+                  or value.st_gid != group_gid or stat.S_IMODE(value.st_mode) != 0o666):
+                raise ValueError("backend socket identity, kind or permissions refused")
+            trace.append((inode_identity(value), mount_identity(descriptor)))
+        # RuntimeDirectory may be a checked read-only bind in the worker. The
+        # socket must be on that same mount; parent transitions are rechecked.
+        if trace[-1][1] != trace[-2][1]:
+            raise ValueError("backend socket has a separate mount")
+        return descriptors, trace
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def connect_backend(backend_uid, group_gid):
+    descriptors, before = backend_path(backend_uid, group_gid)
+    connection = None
+    try:
+        connection = socket.socket(socket.AF_UNIX)
+        connection.settimeout(5)
+        # Resolve the held socket inode through the trusted kernel fd link,
+        # rather than reopening its original pathname for connection setup.
+        connection.connect(f"/proc/self/fd/{descriptors[-1]}")
+        peer = peer_credentials(connection)
+        if peer[1:] != (backend_uid, group_gid):
+            raise ValueError("backend listener credentials do not match the socket owner")
+        after_descriptors, after = backend_path(backend_uid, group_gid)
+        try:
+            if before != after or any(inode_identity(os.fstat(fd)) != item[0]
+                                      or mount_identity(fd) != item[1]
+                                      for fd, item in zip(descriptors, before)):
+                raise ValueError("backend ancestry/socket changed during admission")
+        finally:
+            for descriptor in reversed(after_descriptors):
+                os.close(descriptor)
+        if peer_credentials(connection) != peer:
+            raise ValueError("backend peer credentials changed during admission")
+        connection.setblocking(False)
+        return connection
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        raise
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def checked(result):
@@ -199,6 +372,22 @@ def close_inherited():
         raise OSError(ctypes.get_errno(), "cannot close extra inherited descriptors")
 
 
+def close_runtime_extras(backend):
+    # NSS/native libraries may retain descriptors during startup. Keep only
+    # stdio and the checked backend, even after the final account lookup.
+    descriptor = backend.fileno()
+    if descriptor < 3:
+        raise ValueError("backend descriptor overlaps standard IO")
+    before = inode_identity(os.fstat(descriptor))
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.close_range.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+    for first, last in ((3, descriptor - 1), (descriptor + 1, 0xffffffff)):
+        if first <= last and libc.close_range(first, last, 0):
+            raise OSError(ctypes.get_errno(), "cannot close startup lookup/extra descriptors")
+    if inode_identity(os.fstat(descriptor)) != before:
+        raise ValueError("backend descriptor changed during extra descriptor closure")
+
+
 def main():
     try:
         if len(sys.argv) != 1:
@@ -206,17 +395,19 @@ def main():
         resource.setrlimit(resource.RLIMIT_CPU, (60, 70))
         resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024,) * 2)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        credentials = process_identity()
+        admit_logging()
         close_inherited()
         with prepare_client(0) as client:
             restrict(False)
-            with socket.socket(socket.AF_UNIX) as backend:
-                backend.settimeout(5)
-                backend.connect(BACKEND)
-                backend.setblocking(False)
+            with connect_backend(credentials[1], credentials[2]) as backend:
+                if process_identity() != credentials:
+                    raise ValueError("web account observations changed during startup")
+                close_runtime_extras(backend)
                 restrict(True)
                 verify_seal(client)
                 forward(client, backend)
-    except (OSError, ValueError, RuntimeError, MemoryError) as error:
+    except (OSError, ValueError, RuntimeError, MemoryError, KeyError) as error:
         print("Web relay refused: " + str(error), file=sys.stderr)
         return 75
     return 0
