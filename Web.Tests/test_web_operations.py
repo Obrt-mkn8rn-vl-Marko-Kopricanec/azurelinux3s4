@@ -80,6 +80,7 @@ class OperationsContractTests(unittest.TestCase):
         self.closed, self.loaded = [], []
         numbers = {name: index + 100 for index, name in enumerate(self.worker.DENIED)}
         numbers["fcntl"] = 500
+        numbers["prlimit64"] = 501
 
         def prctl(number, *args):
             return 1 if number == 39 else 2 if number == 21 else 0
