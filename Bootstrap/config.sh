@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.9.0
+S4_VERSION=0.10.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,7 +21,7 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity update-effects update-interpreters)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity update-effects update-interpreters update-removals)
 S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
 # Internal dynamic-scope options; never accept inherited environment values.
 S4_ADMISSION_DESTINATION=
@@ -29,6 +29,7 @@ S4_DOWNLOAD_DIRECTORY=
 S4_CAPACITY_MODE=
 S4_EFFECTS_MODE=
 S4_INTERPRETERS_MODE=
+S4_REMOVALS_MODE=
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=

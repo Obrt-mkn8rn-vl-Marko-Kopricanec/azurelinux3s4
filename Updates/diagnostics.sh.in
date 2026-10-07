@@ -29,11 +29,21 @@ s4_update_interpreters_program() {
 PY
 }
 
+s4_update_removals_program() {
+    # A conservative replacement prerequisite, not full removal/installation policy.
+    cat <<'PY'
+# @s4-include Updates/removals.py
+PY
+}
+
 s4_check_updates() (
     command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
     local directory database evidence
     if [[ -n $S4_INTERPRETERS_MODE ]]; then
-        [[ $S4_INTERPRETERS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE ]] || return 75
+        [[ $S4_INTERPRETERS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE && -z $S4_REMOVALS_MODE ]] || return 75
+    fi
+    if [[ -n $S4_REMOVALS_MODE ]]; then
+        [[ $S4_REMOVALS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE && -z $S4_INTERPRETERS_MODE ]] || return 75
     fi
     database=$(s4_rpm_database_path) || return 75
     directory=$(mktemp -d "$S4_RUN/update-check.XXXXXX") || return 75
@@ -69,7 +79,10 @@ PY
 # @s4-include Updates/sandbox.py
 PY
     then
-        if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+        if [[ $S4_REMOVALS_MODE == yes ]]; then
+            s4_update_removals_program >"$directory/removals.py" || return 75
+            evidence=$(timeout --kill-after=5s 90s python3 -I "$directory/removals.py" "$directory") || return 75
+        elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
             s4_update_interpreters_program >"$directory/interpreters.py" || return 75
             evidence=$(timeout --kill-after=5s 5m python3 -I "$directory/interpreters.py" "$directory") || return 75
         elif [[ $S4_CAPACITY_MODE == yes ]]; then
@@ -83,7 +96,9 @@ PY
     fi
     rm -rf -- "$directory" || return 75
     trap - EXIT
-    if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+    if [[ $S4_REMOVALS_MODE == yes ]]; then
+        s4_log 'Current TEST removals have unique same-name/architecture replacements; complete removal, rollback and installation policy remain unproved.'
+    elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
         s4_log 'Declared script metadata and installed removal identities observed; execution policy remains unfinished.'
@@ -107,5 +122,10 @@ s4_check_update_effects() (
 
 s4_check_update_interpreters() (
     local S4_EFFECTS_MODE=yes S4_INTERPRETERS_MODE=yes
+    s4_check_updates
+)
+
+s4_check_update_removals() (
+    local S4_EFFECTS_MODE=yes S4_REMOVALS_MODE=yes
     s4_check_updates
 )

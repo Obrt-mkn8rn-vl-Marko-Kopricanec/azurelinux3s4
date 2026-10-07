@@ -27,14 +27,16 @@ s4_repair_timeout_seconds() {
     local effects=$compatibility
     # Interpreter files repeat the fresh effects TEST and add a 5min+5s observer.
     local interpreters=$((effects + 305))
-    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects + interpreters))
+    # Removal replacement prerequisites repeat fresh effects TEST, then 90s+5s.
+    local removals=$((effects + 95))
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects + interpreters + removals))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
     # Another ten minutes cover trusted local tools, file fsync, cleanup and
     # scheduling outside leaf wrappers. Excessive IO still fails finitely and
     # retains retry ownership; this is not a promise for arbitrary slow storage.
-    # Each of compatibility, capacity, effects and interpreters adds four reserves.
-    local housekeeping=$((56 * control + 600))
+    # Each of compatibility, capacity, effects, interpreters and removals adds four reserves.
+    local housekeeping=$((60 * control + 600))
     printf '%s\n' "$((trust + health + stages + housekeeping))"
 }
 

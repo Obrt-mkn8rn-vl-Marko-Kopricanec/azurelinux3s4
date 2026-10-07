@@ -517,6 +517,7 @@ s4_verify_repository_trust() {{ return 0; }}
 s4_prepare_updates() {{ return 0; }}
 s4_check_update_effects() {{ return 0; }}
 s4_check_update_interpreters() {{ return 0; }}
+s4_check_update_removals() {{ return 0; }}
 s4_start_timer() {{ return 0; }}
 s4_start_repair_timer() {{ touch {shlex.quote(str(self.root/'retry'))}; }}
 s4_finish_repair() {{ touch {shlex.quote(str(self.root/'finished'))}; }}
@@ -538,8 +539,8 @@ s4_repair yes >/dev/null
 
     def test_whole_attempt_budget_includes_repeated_admission_test_capacity_and_controls(self):
         deadline=int(self.shell('s4_repair_timeout_seconds').stdout)
-        self.assertEqual(deadline,11800+2295+305+4*35+2295+4*35+2295+305+4*35)
-        self.assertLess(deadline,6*60*60)
+        self.assertEqual(deadline,11800+2295+305+4*35+2295+4*35+2295+305+4*35+2295+95+4*35)
+        self.assertLess(deadline,7*60*60)
 
     def test_existing_matching_fixture_link_passes_fresh_native_inventory_check(self):
         self.prepare()

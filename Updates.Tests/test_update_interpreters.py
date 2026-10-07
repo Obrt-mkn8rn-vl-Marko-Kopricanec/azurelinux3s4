@@ -406,6 +406,7 @@ s4_repositories() { return 0; }
 s4_verify_repository_trust() { return 0; }
 s4_prepare_updates() { return 0; }
 s4_check_update_capacity() { return 0; }
+s4_check_update_removals() { return 0; }
 s4_start_timer() { return 0; }
 s4_start_repair_timer() { touch "$S4_STATE/retry"; }
 s4_finish_repair() { touch "$S4_STATE/finished"; }
@@ -423,6 +424,7 @@ s4_verify_bootstrap() { return 0; }
 s4_repositories() { return 0; }
 s4_verify_repository_trust() { return 0; }
 s4_check_update_capacity() { return 0; }
+s4_check_update_removals() { return 0; }
 s4_start_timer() { return 0; }
 s4_start_repair_timer() { return 0; }
 s4_finish_repair() { return 0; }
@@ -431,6 +433,6 @@ s4_install_units
 ''', timeout=180)
         self.assertIn('status=complete', (self.root / 'state/components/update-interpreters').read_text())
         policy = (self.root / 'units/azurelinux3s4-repair.service').read_text()
-        self.assertIn('TimeoutStartSec=19715s', policy)
+        self.assertIn('TimeoutStartSec=22245s', policy)
         self.assertIn('TimeoutStopSec=30s', policy)
         self.assertIn('KillMode=control-group', policy)

@@ -15,8 +15,8 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters ]] || return 78
-    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters ]]; then
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters || $component == update-removals ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters || $component == update-removals ]]; then
         # Always obtain fresh online/preparation/transaction-test evidence.
         # Honor backoff before work and do not repeat a failed operation in a child.
         attempts=$(s4_state_value "$component" attempts)
@@ -42,6 +42,7 @@ s4_reconcile_component() {
             update-capacity) s4_check_update_capacity || result=$? ;;
             update-effects) s4_check_update_effects || result=$? ;;
             update-interpreters) s4_check_update_interpreters || result=$? ;;
+            update-removals) s4_check_update_removals || result=$? ;;
         esac
         if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0

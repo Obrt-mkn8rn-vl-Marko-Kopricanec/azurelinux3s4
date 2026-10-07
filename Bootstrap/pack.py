@@ -35,6 +35,7 @@ PAYLOADS = {
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",
     "Updates/interpreters.py": "PY",
+    "Updates/removals.py": "PY",
     "Updates/plan.py": "PY",
     "Updates/sandbox.py": "PY",
     "Bootstrap/integrity.py": "PY",

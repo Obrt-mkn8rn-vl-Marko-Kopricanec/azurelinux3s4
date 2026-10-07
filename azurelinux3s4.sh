@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.9.0
+S4_VERSION=0.10.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -21,7 +21,7 @@ S4_PLUGIN_CONFIG=/etc/tdnf/pluginconf.d/tdnfrepogpgcheck.conf
 S4_PLUGIN_LIBRARY=/usr/lib64/tdnf-plugins/libtdnfrepogpgcheck.so
 S4_REPAIR_TIMER=azurelinux3s4-repair.timer
 S4_RECOVERY_TIMER=azurelinux3s4-finalization-recovery.timer
-S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity update-effects update-interpreters)
+S4_COMPONENTS=(trust-anchor bootstrap repository-trust update-preparation update-compatibility update-capacity update-effects update-interpreters update-removals)
 S4_UPDATE_TIMER=azurelinux3s4-update-preparation.timer
 # Internal dynamic-scope options; never accept inherited environment values.
 S4_ADMISSION_DESTINATION=
@@ -29,6 +29,7 @@ S4_DOWNLOAD_DIRECTORY=
 S4_CAPACITY_MODE=
 S4_EFFECTS_MODE=
 S4_INTERPRETERS_MODE=
+S4_REMOVALS_MODE=
 S4_BOOTSTRAP_PACKAGES=(ca-certificates curl openssl python3 gnupg2 tdnf-plugin-repogpgcheck)
 S4_ARCH=
 S4_NOW=
@@ -2153,11 +2154,200 @@ if __name__ == "__main__":
 PY
 }
 
+s4_update_removals_program() {
+    # A conservative replacement prerequisite, not full removal/installation policy.
+    cat <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import stat
+import sys
+
+
+KERNELS = frozenset(("kernel", "kernel-mshv", "kernel-uvm", "kernel-uki", "kernel-64k", "kernel-hwe"))
+LIMIT = 32 * 1024 * 1024
+
+
+def number(value, lower, upper):
+    if type(value) is not int or not lower <= value <= upper:
+        raise ValueError("removal evidence integer is missing or excessive")
+    return value
+
+
+def digest(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("removal evidence digest is invalid")
+    return value
+
+
+def package(value):
+    name, nevra = value["name"], value["nevra"]
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+._-]{0,255}", name)
+            or not isinstance(nevra, str) or len(nevra) > 1024 or not nevra.startswith(name + "-")):
+        raise ValueError("package name and native identity are inconsistent")
+    # Parse only the bounded canonical binary NEVRA subset emitted by RPM.
+    # No RPM version comparison, dependency or renamed-provider equivalence is
+    # inferred from these strings. Unsupported identities remain pending.
+    match = re.fullmatch(r"(?:[0-9]+:)?[A-Za-z0-9._+~^]+-[A-Za-z0-9._+~^]+\.(x86_64|aarch64|noarch)",
+                         nevra[len(name) + 1:])
+    if not match:
+        raise ValueError("package identity is outside the supported binary NEVRA subset")
+    number(value["header_bytes"], 8, 8 * 1024 * 1024)
+    digest(value["header_sha256"])
+    return name, match[1]
+
+
+def artifact(value):
+    path = value["file"]
+    if not isinstance(path, str) or not re.fullmatch(r"packages/(?:0|[1-9][0-9]{0,2})\.rpm", path):
+        raise ValueError("incoming artifact does not identify a private snapshot")
+    number(int(path[9:-4]), 0, 127)
+    number(value["bytes"], 1, 512 * 1024 * 1024)
+    digest(value["sha256"])
+    if not isinstance(value["nevra"], str) or len(value["nevra"]) > 1024:
+        raise ValueError("incoming native identity is invalid")
+    return path, value["sha256"], value["bytes"], value["nevra"]
+
+
+def observe(proof):
+    if not isinstance(proof, dict):
+        raise ValueError("removal evidence is not an object")
+    if type(proof.get("schema")) is not int or proof["schema"] != 1 or proof.get("test_passed") is not True:
+        raise ValueError("removal evidence lacks the current native TEST result")
+    for flag in ("installs_performed", "scripts_executed", "installation_authorized",
+                 "storage_capacity_checked", "freshness_proven"):
+        if proof.get(flag) is not False:
+            raise ValueError("removal evidence exceeds its diagnostic authority")
+    digest(proof["manifest_sha256"])
+    baseline = proof["baseline"]
+    if not isinstance(baseline, dict):
+        raise ValueError("installed observation is missing")
+    headers = number(baseline["headers"], 1, 32768)
+    digest(baseline["sha256"])
+    audit = proof["effects"]
+    if (not isinstance(audit, dict) or type(audit.get("schema")) is not int or audit["schema"] != 1
+            or audit.get("script_metadata_observed") is not True
+            or audit.get("removals_bound_to_installed_instances") is not True
+            or type(audit.get("installed_headers_observed")) is not int
+            or audit["installed_headers_observed"] != headers):
+        raise ValueError("removal evidence lacks bound installed-instance observations")
+    for flag in ("installed_headers_authenticated", "trigger_selection_complete", "script_execution_plan_complete",
+                 "script_policy_satisfied", "removal_policy_satisfied", "rollback_policy_satisfied"):
+        if audit.get(flag) is not False:
+            raise ValueError("removal evidence claims an unestablished policy")
+    incoming, additions, removals, identities = audit["incoming"], proof["additions"], audit["removals"], proof["removals"]
+    if (any(not isinstance(value, list) for value in (incoming, additions, removals, identities))
+            or len(incoming) != len(additions) or len(incoming) > 128
+            or len(removals) != len(identities) or len(removals) > headers):
+        raise ValueError("removal evidence inventories are inconsistent or excessive")
+    if proof.get("rpm_test_performed") is not bool(additions) or (removals and not additions):
+        raise ValueError("a removal must come from a nonempty current package TEST")
+    if any(not isinstance(value, dict) for value in incoming + additions + removals):
+        raise ValueError("removal evidence record is not an object")
+    if sorted(map(artifact, incoming)) != sorted(map(artifact, additions)):
+        raise ValueError("incoming observations differ from the SAME tested snapshots")
+    if [value["nevra"] for value in removals] != identities:
+        raise ValueError("removal inventory differs from the native TEST elements")
+    snapshots, replacements = {}, {}
+    for value in incoming:
+        binding, key = artifact(value), package(value)
+        if binding[0] in snapshots or key in replacements:
+            raise ValueError("incoming replacement is duplicated or ambiguous")
+        snapshots[binding[0]] = value
+        replacements[key] = value
+    for value in additions:
+        if type(value.get("install_only")) is not bool or type(value.get("pretrans_present")) is not bool:
+            raise ValueError("incoming native element flags are missing")
+        source = snapshots[value["file"]]
+        if value["install_only"] != (source["name"] in KERNELS):
+            raise ValueError("incoming kernel retention mode is inconsistent")
+    instances, used, matches = set(), set(), []
+    for removed in removals:
+        key = package(removed)
+        instance = number(removed["instance"], 1, 2 ** 32 - 1)
+        if instance in instances or key in used:
+            raise ValueError("removed installed instance or replacement is repeated")
+        instances.add(instance)
+        if key[0] in KERNELS:
+            raise ValueError("installed kernel removal is outside the update safeguard")
+        replacement = replacements.get(key)
+        if replacement is None or removed.get("classification") != "same-name-replacement":
+            raise ValueError("installed removal lacks a unique SAME-name-and-architecture replacement")
+        if removed["nevra"] == replacement["nevra"]:
+            raise ValueError("same-identity erase/reinstall is outside the update safeguard")
+        used.add(key)
+        matches.append({"instance": instance, "name": key[0], "architecture": key[1],
+                        "removed_nevra": removed["nevra"], "removed_header_sha256": removed["header_sha256"],
+                        "replacement_nevra": replacement["nevra"], "file": replacement["file"],
+                        "sha256": replacement["sha256"], "bytes": replacement["bytes"],
+                        "replacement_header_sha256": replacement["header_sha256"]})
+    proof["removal_guard"] = {"schema": 1, "matches": matches,
+        "same_name_architecture_replacements_only": True, "kernel_removals_refused": True,
+        "scope": "current TEST elements; one removed instance per unique same-name/architecture incoming snapshot",
+        "versions_compared_by_guard": False, "package_continuity_proven": False,
+        "critical_package_closure_complete": False, "removal_policy_satisfied": False,
+        "rollback_policy_satisfied": False, "installation_authorized": False}
+    return proof
+
+
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("removal evidence has a duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def main():
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_CPU, (60, 65))
+        path = Path(sys.argv[1]) / "result.json"
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600 or not 0 < before.st_size <= LIMIT):
+            raise ValueError("removal proof is not a bounded private regular file")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            if identity(os.fstat(stream.fileno())) != identity(before):
+                raise ValueError("removal proof changed before opening")
+            data = stream.read(LIMIT + 1)
+            if identity(os.fstat(stream.fileno())) != identity(before) or len(data) != before.st_size:
+                raise ValueError("removal proof changed while reading")
+        proof = observe(json.loads(data, object_pairs_hook=unique_object))
+        proof["removal_guard"]["input_sha256"] = hashlib.sha256(data).hexdigest()
+        encoded = json.dumps(proof, sort_keys=True)
+        if len(encoded.encode("utf-8")) > 64 * 1024 * 1024:
+            raise ValueError("removal observations exceed their output bound")
+        print(encoded)
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError, OverflowError, IndexError, StopIteration) as error:
+        print("Update removal safeguard deferred: " + str(error), file=sys.stderr)
+        return 75
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+}
+
 s4_check_updates() (
     command -v systemd-run >/dev/null && command -v rpmkeys >/dev/null || return 75
     local directory database evidence
     if [[ -n $S4_INTERPRETERS_MODE ]]; then
-        [[ $S4_INTERPRETERS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE ]] || return 75
+        [[ $S4_INTERPRETERS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE && -z $S4_REMOVALS_MODE ]] || return 75
+    fi
+    if [[ -n $S4_REMOVALS_MODE ]]; then
+        [[ $S4_REMOVALS_MODE == yes && $S4_EFFECTS_MODE == yes && -z $S4_CAPACITY_MODE && -z $S4_INTERPRETERS_MODE ]] || return 75
     fi
     database=$(s4_rpm_database_path) || return 75
     directory=$(mktemp -d "$S4_RUN/update-check.XXXXXX") || return 75
@@ -2267,7 +2457,10 @@ except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.Subpr
     sys.exit(75)
 PY
     then
-        if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+        if [[ $S4_REMOVALS_MODE == yes ]]; then
+            s4_update_removals_program >"$directory/removals.py" || return 75
+            evidence=$(timeout --kill-after=5s 90s python3 -I "$directory/removals.py" "$directory") || return 75
+        elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
             s4_update_interpreters_program >"$directory/interpreters.py" || return 75
             evidence=$(timeout --kill-after=5s 5m python3 -I "$directory/interpreters.py" "$directory") || return 75
         elif [[ $S4_CAPACITY_MODE == yes ]]; then
@@ -2281,7 +2474,9 @@ PY
     fi
     rm -rf -- "$directory" || return 75
     trap - EXIT
-    if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+    if [[ $S4_REMOVALS_MODE == yes ]]; then
+        s4_log 'Current TEST removals have unique same-name/architecture replacements; complete removal, rollback and installation policy remain unproved.'
+    elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
         s4_log 'Declared script metadata and installed removal identities observed; execution policy remains unfinished.'
@@ -2308,6 +2503,11 @@ s4_check_update_interpreters() (
     s4_check_updates
 )
 
+s4_check_update_removals() (
+    local S4_EFFECTS_MODE=yes S4_REMOVALS_MODE=yes
+    s4_check_updates
+)
+
 s4_verify_component() {
     case $1 in
         trust-anchor) s4_verify_trust_anchor ;;
@@ -2318,6 +2518,7 @@ s4_verify_component() {
         update-capacity) s4_check_update_capacity ;;
         update-effects) s4_check_update_effects ;;
         update-interpreters) s4_check_update_interpreters ;;
+        update-removals) s4_check_update_removals ;;
         *) return 78 ;;
     esac
 }
@@ -2567,8 +2768,8 @@ s4_defer_component() {
 
 s4_reconcile_component() {
     local component=$1 force=$2 attempts next result
-    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters ]] || return 78
-    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters ]]; then
+    [[ $component == trust-anchor || $component == bootstrap || $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters || $component == update-removals ]] || return 78
+    if [[ $component == repository-trust || $component == update-preparation || $component == update-compatibility || $component == update-capacity || $component == update-effects || $component == update-interpreters || $component == update-removals ]]; then
         # Always obtain fresh online/preparation/transaction-test evidence.
         # Honor backoff before work and do not repeat a failed operation in a child.
         attempts=$(s4_state_value "$component" attempts)
@@ -2594,6 +2795,7 @@ s4_reconcile_component() {
             update-capacity) s4_check_update_capacity || result=$? ;;
             update-effects) s4_check_update_effects || result=$? ;;
             update-interpreters) s4_check_update_interpreters || result=$? ;;
+            update-removals) s4_check_update_removals || result=$? ;;
         esac
         if (( result == 0 )); then
             s4_write_state "$component" complete 0 0 0
@@ -2663,14 +2865,16 @@ s4_repair_timeout_seconds() {
     local effects=$compatibility
     # Interpreter files repeat the fresh effects TEST and add a 5min+5s observer.
     local interpreters=$((effects + 305))
-    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects + interpreters))
+    # Removal replacement prerequisites repeat fresh effects TEST, then 90s+5s.
+    local removals=$((effects + 95))
+    local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects + interpreters + removals))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
     # Another ten minutes cover trusted local tools, file fsync, cleanup and
     # scheduling outside leaf wrappers. Excessive IO still fails finitely and
     # retains retry ownership; this is not a promise for arbitrary slow storage.
-    # Each of compatibility, capacity, effects and interpreters adds four reserves.
-    local housekeeping=$((56 * control + 600))
+    # Each of compatibility, capacity, effects, interpreters and removals adds four reserves.
+    local housekeeping=$((60 * control + 600))
     printf '%s\n' "$((trust + health + stages + housekeeping))"
 }
 
@@ -2943,9 +3147,9 @@ s4_main() {
         --help)
             printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: signed-update preparation and read-only RPM transaction tests; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects|--check-update-interpreters) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects|--check-update-interpreters|--check-update-removals) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity || $2 == update-effects || $2 == update-interpreters ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity || $2 == update-effects || $2 == update-interpreters || $2 == update-removals ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -2985,6 +3189,11 @@ s4_main() {
         s4_check_update_interpreters
         return $?
     fi
+    if [[ $action == --check-update-removals ]]; then
+        s4_verify_trust_anchor || return 75
+        s4_check_update_removals
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
@@ -2995,6 +3204,7 @@ s4_main() {
             update-capacity) s4_check_update_capacity ;;
             update-effects) s4_check_update_effects ;;
             update-interpreters) s4_check_update_interpreters ;;
+            update-removals) s4_check_update_removals ;;
         esac
         return $?
     fi

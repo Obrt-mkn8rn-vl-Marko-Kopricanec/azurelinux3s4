@@ -8,9 +8,9 @@ s4_main() {
         --help)
             printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\nDevelopment checkpoint: signed-update preparation and read-only RPM transaction tests; server hardening and update installation are incomplete.\n'
             return 0 ;;
-        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects|--check-update-interpreters) [[ $# -le 1 ]] || return 64 ;;
+        install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects|--check-update-interpreters|--check-update-removals) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;
-        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity || $2 == update-effects || $2 == update-interpreters ) ]] || return 64 ;;
+        --component) [[ $# == 2 && ( $2 == trust-anchor || $2 == bootstrap || $2 == repository-trust || $2 == update-preparation || $2 == update-compatibility || $2 == update-capacity || $2 == update-effects || $2 == update-interpreters || $2 == update-removals ) ]] || return 64 ;;
         *) s4_log 'Unknown argument. Use --help.'; return 64 ;;
     esac
     s4_preflight || return $?
@@ -50,6 +50,11 @@ s4_main() {
         s4_check_update_interpreters
         return $?
     fi
+    if [[ $action == --check-update-removals ]]; then
+        s4_verify_trust_anchor || return 75
+        s4_check_update_removals
+        return $?
+    fi
     if [[ $action == --component ]]; then
         case $2 in
             trust-anchor) s4_apply_trust_anchor ;;
@@ -60,6 +65,7 @@ s4_main() {
             update-capacity) s4_check_update_capacity ;;
             update-effects) s4_check_update_effects ;;
             update-interpreters) s4_check_update_interpreters ;;
+            update-removals) s4_check_update_removals ;;
         esac
         return $?
     fi

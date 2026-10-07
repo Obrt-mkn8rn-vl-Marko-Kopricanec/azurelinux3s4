@@ -8,6 +8,7 @@ s4_verify_component() {
         update-capacity) s4_check_update_capacity ;;
         update-effects) s4_check_update_effects ;;
         update-interpreters) s4_check_update_interpreters ;;
+        update-removals) s4_check_update_removals ;;
         *) return 78 ;;
     esac
 }
