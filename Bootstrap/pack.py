@@ -38,6 +38,7 @@ PAYLOADS = {
     "Updates/interpreters.py": "PY",
     "Updates/removals.py": "PY",
     "Web/policy.py": "PY",
+    "Web/relay.py": "'''",
     "Updates/plan.py": "PY",
     "Updates/sandbox.py": "PY",
     "Bootstrap/integrity.py": "PY",
@@ -75,7 +76,8 @@ def assemble(root=ROOT):
                 raise ValueError("unknown or repeated assembly payload: " + payload)
             data = read_source(root, payload)
             if (PAYLOADS[payload].encode() in data.splitlines()
-                    or b"@s4-include" in data):
+                    or b"@s4-include" in data
+                    or (PAYLOADS[payload] == "'''" and b"'''" in data)):
                 raise ValueError("payload collides with its assembly boundary: " + payload)
             if payload.endswith(".py"):
                 ast.parse(data, filename=payload)

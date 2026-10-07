@@ -20,6 +20,7 @@ MODULES = (
     "test_update_interpreters",
     "test_update_removals",
     "test_web_isolation",
+    "test_web_relay",
 )
 
 

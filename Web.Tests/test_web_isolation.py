@@ -19,6 +19,7 @@ SCRIPT = ROOT / "azurelinux3s4.sh"
 SPEC = importlib.util.spec_from_file_location("web_policy", ROOT / "Web/policy.py")
 POLICY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(POLICY)
+POLICY.RELAY_SOURCE = (ROOT / "Web/relay.py").read_text()
 PROBE = ROOT / "Web.Tests/socket_probe.py"
 
 
@@ -91,7 +92,7 @@ class WebPolicyTests(unittest.TestCase):
             self.assertNotIn("PermissionsStartOnly", values)
 
     def test_backend_denies_connect_and_io_uring_socket_bypasses(self):
-        for name in ("systemd/azurelinux3s4-web-backend.service", "systemd/azurelinux3s4-web.service"):
+        for name in ("systemd/azurelinux3s4-web-backend.service", "systemd/azurelinux3s4-web@.service"):
             filters = " ".join(sections(POLICY.files()[name])["Service"]["SystemCallFilter"])
             for call in ("io_uring_setup", "io_uring_enter", "io_uring_register", "bpf"):
                 self.assertIn(call, filters.split())
@@ -102,17 +103,17 @@ class WebPolicyTests(unittest.TestCase):
         listener = sections(POLICY.files()["systemd/azurelinux3s4-web.socket"])["Socket"]
         self.assertEqual(listener["ListenStream"], ["0.0.0.0:80", "[::]:80"])
         self.assertEqual(listener["BindIPv6Only"], ["ipv6-only"])
-        self.assertEqual(listener["Accept"], ["no"])
+        self.assertEqual(listener["Accept"], ["yes"])
         self.assertNotIn("PrivateNetwork", listener)
-        proxy = sections(POLICY.files()["systemd/azurelinux3s4-web.service"])
+        proxy = sections(POLICY.files()["systemd/azurelinux3s4-web@.service"])
         self.assertIn("azurelinux3s4-web-backend.service", proxy["Unit"]["BindsTo"])
         self.assertIn("azurelinux3s4-web-backend.service", " ".join(proxy["Unit"]["After"]))
         self.assertEqual(proxy["Service"]["Type"], ["exec"])
-        self.assertIn("/run/azurelinux3s4-web/http.sock", proxy["Service"]["ExecStart"][0])
+        self.assertIn("/usr/local/lib/azurelinux3s4/web-relay.py", proxy["Service"]["ExecStart"][0])
 
     def test_shared_socket_parent_is_not_world_traversable_or_proxy_owned(self):
         backend = sections(POLICY.files()["systemd/azurelinux3s4-web-backend.service"])["Service"]
-        proxy = sections(POLICY.files()["systemd/azurelinux3s4-web.service"])["Service"]
+        proxy = sections(POLICY.files()["systemd/azurelinux3s4-web@.service"])["Service"]
         self.assertEqual(backend["RuntimeDirectoryMode"], ["0750"])
         self.assertNotIn("RuntimeDirectory", proxy)
         self.assertNotEqual(backend["User"], proxy["User"])
@@ -206,7 +207,7 @@ class NativeSocketProjectionTests(unittest.TestCase):
             self.errors.append(error)
 
     def run_probe(self, mode, descriptor=-1, reconnect_port=0, forwarding=False):
-        unit = "systemd/azurelinux3s4-web" + ("-backend" if mode == "backend" else "") + ".service"
+        unit = "systemd/azurelinux3s4-web" + ("-backend" if mode == "backend" else "@") + ".service"
         filters = sections(POLICY.files()[unit])["Service"]["SystemCallFilter"]
         # Explicit leaf rules come from the emitted policy. Systemd groups,
         # namespaces, mounts, users and capability handling are NOT exercised.

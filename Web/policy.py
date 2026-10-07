@@ -12,6 +12,7 @@ GROUP = "azurelinux3s4-web"
 RUNTIME = "/run/azurelinux3s4-web"
 CONFIG = "/etc/azurelinux3s4/web/nginx.conf"
 CONTENT = "/srv/azurelinux3s4/www"
+RELAY = "/usr/local/lib/azurelinux3s4/web-relay.py"
 
 COMMON = """DynamicUser=yes
 Group=azurelinux3s4-web
@@ -57,6 +58,8 @@ StandardError=journal
 
 
 def files():
+    if not isinstance(globals().get("RELAY_SOURCE"), str) or not RELAY_SOURCE:
+        raise ValueError("the assembled relay payload is required")
     # These are separate units: vendor nginx.service and its configuration are
     # never rewritten. A future applier must refuse conflicting existing units.
     backend = f"""[Unit]
@@ -66,6 +69,7 @@ StartLimitBurst=5
 
 [Service]
 Type=forking
+Slice=azurelinux3s4-web.slice
 User={BACKEND}
 {COMMON}RuntimeDirectory=azurelinux3s4-web
 RuntimeDirectoryMode=0750
@@ -77,7 +81,8 @@ KillSignal=SIGQUIT
 SystemCallFilter=~connect
 """
     proxy = f"""[Unit]
-Description=Socket-activated Azure Linux 3 HTTP ingress candidate
+Description=One accepted Azure Linux 3 HTTP connection candidate
+CollectMode=inactive-or-failed
 Requires={PROXY}.socket
 BindsTo={BACKEND}.service
 After={PROXY}.socket {BACKEND}.service
@@ -86,14 +91,18 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
+Slice=azurelinux3s4-web.slice
 User=azurelinux3s4-web-proxy
-{COMMON}ExecStart=/usr/lib/systemd/systemd-socket-proxyd --connections-max=256 {RUNTIME}/http.sock
+{COMMON}Restart=no
+RuntimeMaxSec=300s
+StandardInput=socket
+ExecStart=/usr/bin/python3 -I {RELAY}
 # Hide host runtime sockets; the checked backend directory is the only run bind.
 TemporaryFileSystem=/run:ro /var:ro
 BindReadOnlyPaths={RUNTIME}
 InaccessiblePaths=/etc/azurelinux3s4
-# The proxy uses splice, not ancillary FD delivery. Inherited TCP sockets still
-# require an independent egress rule before this candidate may be activated.
+# Startup permits the one Unix connect. The worker must seal connect, flagged
+# sends, socket/FD acquisition and process creation BEFORE forwarding any bytes.
 SystemCallFilter=~recvmsg recvmmsg pidfd_getfd
 """
     listener = f"""[Unit]
@@ -103,8 +112,8 @@ Description=Azure Linux 3 HTTP ingress candidate
 ListenStream=0.0.0.0:80
 ListenStream=[::]:80
 BindIPv6Only=ipv6-only
-Accept=no
-Service={PROXY}.service
+Accept=yes
+MaxConnections=32
 Backlog=256
 
 [Install]
@@ -147,10 +156,22 @@ http {{
 """
     return {
         "systemd/" + BACKEND + ".service": backend,
-        "systemd/" + PROXY + ".service": proxy,
+        "systemd/" + PROXY + "@.service": proxy,
         "systemd/" + PROXY + ".socket": listener,
         "nginx/nginx.conf": nginx,
         "sysusers/azurelinux3s4-web.conf": "g " + GROUP + " -\n",
+        "systemd/azurelinux3s4-web.slice": """[Unit]
+Description=Azure Linux 3 web aggregate resource candidate
+
+[Slice]
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=128
+CPUQuota=100%
+""",
+        # RELAY_SOURCE is supplied by the explicit assembly before this payload.
+        # Source-level tests supply the same maintained bytes, never an env value.
+        "lib/web-relay.py": RELAY_SOURCE,
     }
 
 
@@ -174,12 +195,16 @@ def bundle():
             "Conflict-safe durable installation, actual parser tests and boot/repair ownership.",
             "Positive network namespace/seccomp/filesystem/capability enforcement challenges.",
             "Independent proxy egress protection covering inherited TCP sockets, with positive refusal challenges.",
+            "Trusted Python/libseccomp/close_range and per-connection worker sealing BEFORE forwarding, including connect/Fast Open/FD-acquisition refusals and same-connection byte/half-close proof.",
+            "Only the accepted stdin TCP socket and checked Unix/non-IP logging descriptors may be inherited; verify aggregate slice/MaxConnections and per-worker limits.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
         "limits": [
             "Candidate HTTP files only; generation does not install, activate or inspect the host.",
-            "The proxy retains inherited IP listeners/connections; socket creation restrictions alone do not stop reconnects.",
+            "The worker retains an inherited IP connection; socket creation restrictions alone do not stop reconnects. No activation or native Azure worker/unit enforcement is certified by emission.",
+            "The worker connects to its fixed Unix backend once, then denies connection setup/flagged sends and forwards through bounded read/write queues. Trusted startup/import/native libraries and the checked backend peer remain assumptions.",
+            "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",
             "The byte-forwarding proxy does not preserve a trusted original client address at nginx.",
