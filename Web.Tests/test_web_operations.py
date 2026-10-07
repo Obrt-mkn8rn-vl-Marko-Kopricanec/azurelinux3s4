@@ -79,6 +79,7 @@ class OperationsContractTests(unittest.TestCase):
     def filter(self, unknown=None, rule_failure=None):
         self.closed, self.loaded = [], []
         numbers = {name: index + 100 for index, name in enumerate(self.worker.DENIED)}
+        numbers["fcntl"] = 500
 
         def prctl(number, *args):
             return 1 if number == 39 else 2 if number == 21 else 0

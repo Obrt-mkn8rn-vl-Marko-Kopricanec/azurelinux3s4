@@ -21,6 +21,7 @@ import time
 
 # @s4-include Web/runtime.py
 # @s4-include Web/memory.py
+# @s4-include Web/descriptors.py
 
 
 BACKEND_USER = "azurelinux3s4-web-backend"
@@ -58,7 +59,7 @@ DENIED = (
     "pidfd_getfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "bpf",
     "execve", "execveat", "clone", "clone3", "fork", "vfork", "unshare", "setns",
     "ptrace", "process_vm_readv", "process_vm_writev",
-) + METADATA_DENIED + IPC_DENIED
+) + METADATA_DENIED + IPC_DENIED + DESCRIPTOR_DENIED
 
 
 class Comparison(ctypes.Structure):
@@ -266,6 +267,7 @@ def restrict(final):
                 if number == -1:  # __NR_SCMP_ERROR; other negative values are pseudo IDs.
                     raise ValueError("unknown syscall: " + name)
                 checked(lib.seccomp_rule_add_array(context, 0x50000 | errno.EPERM, number, 0, None))
+            add_descriptor_rules(lib, context)
         else:
             number = lib.seccomp_syscall_resolve_name(b"socket")
             if number == -1:
@@ -517,6 +519,7 @@ def main():
                     restrict(True)
                     verify_seal(client)
                     verify_operations()
+                    verify_descriptors((client.fileno(), backend.fileno()))
                     confine_filesystem()
                     startup.disarm()
                     forward(client, backend)

@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.17.0
+S4_VERSION=0.18.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -2863,6 +2863,61 @@ def protect_memory():
         if libc.munmap(writable, size) != 0:
             raise OSError(ctypes.get_errno(), "MDWE challenge cleanup refused")
     return 1
+"""Final descriptor duplication/mutation refusal and nonmutating witnesses."""
+
+import ctypes
+import errno
+import os
+
+
+DESCRIPTOR_DENIED = ("dup", "dup2", "dup3")
+
+
+def add_descriptor_rules(lib, context):
+    if ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_long) != 8:
+        raise ValueError("unsupported descriptor native ABI")
+    number = lib.seccomp_syscall_resolve_name(b"fcntl")
+    if number == -1:
+        raise ValueError("unknown syscall: fcntl")
+    # Allow only exact F_GETFD=1/F_GETFL=3. Separate single-argument rules
+    # avoid unsupported repeated comparisons on one argument. Full-width
+    # comparisons also refuse high-bit aliases of kernel-truncated commands.
+    for operation, value in ((2, 1), (4, 2), (6, 3)):  # LT1, EQ2, GT3.
+        comparison = Comparison(1, operation, value, 0)
+        checked(lib.seccomp_rule_add_array(context, 0x50000 | errno.EPERM,
+                                           number, 1, ctypes.byref(comparison)))
+
+
+def verify_descriptors(descriptors):
+    if (len(descriptors) != 2
+            or any(type(fd) is not int or not 0 <= fd <= 0x7fffffff for fd in descriptors)
+            or len(set(descriptors)) != 2):
+        raise ValueError("two distinct descriptor observations are required")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.dup.argtypes, libc.dup.restype = [ctypes.c_int], ctypes.c_int
+    libc.dup2.argtypes, libc.dup2.restype = [ctypes.c_int, ctypes.c_int], ctypes.c_int
+    libc.dup3.argtypes, libc.dup3.restype = [ctypes.c_int] * 3, ctypes.c_int
+    libc.fcntl.argtypes, libc.fcntl.restype = [ctypes.c_int, ctypes.c_int, ctypes.c_long], ctypes.c_int
+    # Invalid source FDs make all probes noncreating/nonmutating even when
+    # a rule is absent. EBADF/EINVAL cannot certify the filter's EPERM.
+    challenges = (
+        ("dup", libc.dup, (-1,)),
+        ("dup2", libc.dup2, (-1, -1)),
+        ("dup3", libc.dup3, (-1, -1, 0)),
+        ("fcntl-dupfd", libc.fcntl, (-1, 0, 0)),
+        ("fcntl-setfd", libc.fcntl, (-1, 2, 0)),
+        ("fcntl-setfl", libc.fcntl, (-1, 4, 0)),
+        ("fcntl-dupfd-cloexec", libc.fcntl, (-1, 1030, 0)),
+    )
+    for name, operation, arguments in challenges:
+        ctypes.set_errno(0)
+        if operation(*arguments) != -1 or ctypes.get_errno() != errno.EPERM:
+            raise RuntimeError("descriptor denial challenge failed: " + name)
+    for descriptor in descriptors:
+        flags = libc.fcntl(descriptor, 1, 0)
+        status = libc.fcntl(descriptor, 3, 0)
+        if flags not in (0, 1) or status < 0 or not status & os.O_NONBLOCK:
+            raise RuntimeError("descriptor query/nonblocking state refused")
 
 
 BACKEND_USER = "azurelinux3s4-web-backend"
@@ -2900,7 +2955,7 @@ DENIED = (
     "pidfd_getfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "bpf",
     "execve", "execveat", "clone", "clone3", "fork", "vfork", "unshare", "setns",
     "ptrace", "process_vm_readv", "process_vm_writev",
-) + METADATA_DENIED + IPC_DENIED
+) + METADATA_DENIED + IPC_DENIED + DESCRIPTOR_DENIED
 
 
 class Comparison(ctypes.Structure):
@@ -3108,6 +3163,7 @@ def restrict(final):
                 if number == -1:  # __NR_SCMP_ERROR; other negative values are pseudo IDs.
                     raise ValueError("unknown syscall: " + name)
                 checked(lib.seccomp_rule_add_array(context, 0x50000 | errno.EPERM, number, 0, None))
+            add_descriptor_rules(lib, context)
         else:
             number = lib.seccomp_syscall_resolve_name(b"socket")
             if number == -1:
@@ -3359,6 +3415,7 @@ def main():
                     restrict(True)
                     verify_seal(client)
                     verify_operations()
+                    verify_descriptors((client.fileno(), backend.fileno()))
                     confine_filesystem()
                     startup.disarm()
                     forward(client, backend)
@@ -3577,6 +3634,7 @@ def bundle():
             "Native libseccomp must resolve every denied metadata/signal/SysV/POSIX-mqueue/key syscall, including fchmodat2; checked EPERM challenges for each family must precede filesystem confinement and forwarding.",
             "Fresh mapped-runtime/interpreter inode/path/ELF/hash observations before final descriptor scrubbing; clean unblocked SIGALRM/default-handler/no-existing-timer context and checked 60s startup timer retired before forwarding.",
             "Native PR_SET_MDWE/PR_GET_MDWE with exact inheritable REFUSE_EXEC_GAIN mask1, actual writable-executable mmap and execute-gain mprotect EACCES challenges, preserved data-page operations and successful challenge cleanup before forwarding.",
+            "Final native dup/dup2/dup3 denial and fcntl restricted to exact F_GETFD/F_GETFL queries; noncreating invalid-FD EPERM witnesses and both checked channel nonblocking/query observations before forwarding.",
             "Current MAC, content/runtime access and capacity policy; native nginx/proxy lifecycle proof.",
             "HTTPS certificate provisioning/renewal, listener/firewall policy and client identity/rate controls.",
         ],
@@ -3588,6 +3646,7 @@ def bundle():
             "The final native filter also refuses chmod/chown/timestamp/xattr mutations, outgoing signals, SysV IPC, POSIX mqueues and kernel keys through the explicitly named syscalls. Safe challenge arguments do not mutate files, deliver signals or allocate objects. Metadata observation/O_PATH, anonymous memory/IPC, futexes, existing mappings, allowed descriptor IO and future unnamed syscalls remain outside this bounded layer; incoming supervisor signals remain available. This is not complete IPC or host isolation.",
             "The worker observes already-loaded executable ELF files and its interpreter via trusted procfs, protected root-owned alias-free paths and same-inode hash descriptors. This is post-load file observation, not signed-package/native-runtime/memory attestation or complete Python/NSS/dependency/environment authentication. Deleted/ambiguous/unsupported maps or executable anonymous/writable mappings refuse; permitted heap/data mappings and future mappings remain separate. The 30s observer and 60s startup guards assume finite honest IO/scheduling; generated 390s runtime allowance includes 300s forwarding and a 30s loader/local reserve, with separate 30s stop grace. No universal stalled-kernel or native manager liveness is certified.",
             "The worker additionally sets and challenges native memory-deny-write-execute after runtime observation and before final descriptor scrubbing. Unsupported, non-inheriting/unknown masks, failed installation/read-back or any challenge/cleanup failure refuse. It denies new writable-executable mappings and execute gain from non-executable mappings, while fresh read-execute mappings and previously executable code remain possible. It does not revoke preexisting mappings, authenticate memory, prevent code reuse/all aliases or prove whole-process/host isolation. Kernel/native runtime and finite IO/scheduling remain trusted; emitted systemd MemoryDenyWriteExecute alone is not enforcement evidence.",
+            "After final sealing, named descriptor duplication/replacement syscalls and every fcntl operation except exact descriptor/status flag queries are refused, including flag changes and duplication. Invalid-source witnesses cannot create or replace descriptors; actual channel queries must still report nonblocking IO. This does not prohibit all descriptor creation, close/reuse through every kernel interface, existing channel/logging IO, metadata/O_PATH access, aliases in other processes or resource exhaustion. Trusted kernel/runtime and separate complete descriptor/resource/outer policy remain prerequisites.",
             "No nft_socket feature is assumed: Azure Linux3 x86 source config disables it. Host-wide firewall and non-web egress policy remain separate unfinished components.",
             "Pathname Unix sockets remain reachable across private network namespaces; privileged IPC policy needs verification.",
             "Static content only; no upstream, DNS, reverse proxy, .NET application or certificate lifecycle is configured.",

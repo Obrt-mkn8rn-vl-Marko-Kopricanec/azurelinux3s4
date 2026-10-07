@@ -47,7 +47,7 @@ PAYLOADS = {
 WORKER_TARGET = "Web/relay.py"
 WORKER_TEMPLATE = "Web/relay.py.in"
 WORKER_HELPER = "Web/runtime.py"  # Retained name for the runtime fixture boundary.
-WORKER_HELPERS = (WORKER_HELPER, "Web/memory.py")
+WORKER_HELPERS = (WORKER_HELPER, "Web/memory.py", "Web/descriptors.py")
 INPUTS = (*PARTS, *(name for name in PAYLOADS if name != WORKER_TARGET), WORKER_TEMPLATE, *WORKER_HELPERS)
 INCLUDE = re.compile(rb"# @s4-include ([A-Za-z0-9_./-]+)\n")
 TARGET = "azurelinux3s4.sh"
