@@ -26,6 +26,7 @@ MODULES = (
     "test_update_provides",
     "test_update_provider_matches",
     "test_update_trigger_sources",
+    "test_update_header_inputs",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",

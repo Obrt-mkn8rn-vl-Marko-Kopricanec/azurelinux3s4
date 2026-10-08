@@ -181,6 +181,8 @@ try:
             value["trigger_condition_bytes"] = trigger_condition_export(exported, value)
         if provides_projection:
             value["provides"] = provides_export(exported, value)
+        if header_exports_projection:
+            value["header_export_hex"] = exported.hex()
         effects_bytes += len(json.dumps(value, sort_keys=True).encode("utf-8"))
         # Retain at most 16MiB of metadata before plan/removal duplication;
         # the final 32MiB output cap is separate and positively checked.
@@ -507,6 +509,10 @@ try:
         if provides_projection:
             proof["effects"]["installed_provides"] = [
                 {field: value[field] for field in (*INSTALLED_VERSION_FIELDS, "provides")}
+                for _, value in sorted(installed_effects.items())]
+        if header_exports_projection:
+            proof["effects"]["installed_header_exports"] = [
+                {field: value[field] for field in (*INSTALLED_VERSION_FIELDS, "header_export_hex")}
                 for _, value in sorted(installed_effects.items())]
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,

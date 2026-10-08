@@ -293,7 +293,7 @@ class ProviderPrivateTests(unittest.TestCase):
     def test_actual_file_only_snapshot_binds_six_receipts_and_preserves_input(self):
         material = self.path.read_bytes(); proof = json.loads(self.run_guard().stdout)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation'):
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation'):
             self.assertEqual(proof[name]['input_sha256'], hashlib.sha256(material).hexdigest())
         self.assertEqual(self.path.read_bytes(), material)
         self.assertFalse(proof['provider_match_observation']['native_participation_checked'])
@@ -330,6 +330,8 @@ class ProviderPipelineTests(unittest.TestCase):
             'incoming(h)?(setting("provider_positive")?"9:7-3":"1-1"):"9:7-3"')
         source = source.replace('void *headerExport(', 'void *fixtureProvidesOriginalExport(') + model
         source += ranges.VERSION_MODEL.read_text() + ranges.MODEL.read_text() + MODEL.read_text()
+        from test_update_header_inputs import header_model_source
+        source = header_model_source(source)
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(cls.library)],
                        input=source, text=True, capture_output=True, check=True)
 
@@ -342,7 +344,7 @@ class ProviderPipelineTests(unittest.TestCase):
         self.assertEqual(compared[0]['source']['owner']['sha256'], proof['additions'][0]['sha256'])
         original = copy.deepcopy(proof)
         names = ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                 'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation')
+                 'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation')
         for name in names: original.pop(name)
         digest = hashlib.sha256((json.dumps(original, sort_keys=True) + '\n').encode()).hexdigest()
         for name in names: self.assertEqual(proof[name]['input_sha256'], digest)
