@@ -308,6 +308,28 @@ void *headerExport(void *h,unsigned *size) {
     uint32_t bodytag=incoming(h)?1023:5076, progtag=incoming(h)?1085:5077;
     uint32_t bodykind=incoming(h)?6:8, progkind=8;
     uint32_t bodylen=strlen(body)+1, proglen=strlen(program)+1;
+    if(!incoming(h)) {
+        /* Complete declared family for the normal effects prerequisite;
+           preserve the same body/interpreter delivery for file observations. */
+        uint32_t tags[]={5076,5077,5078,5079,5081,5082,5080,5085};
+        uint32_t kinds[]={8,8,4,8,8,4,4,4};
+        const char *strings[]={body,program,NULL,"/usr/lib","",NULL,NULL,NULL};
+        uint32_t values[]={0,0,0,0,0,65536,0,1000000};
+        unsigned offsets[8],lengths[8],data_size=0;
+        for(unsigned i=0;i<8;i++) {
+            if(kinds[i]==4)data_size=(data_size+3)&~3U;
+            offsets[i]=data_size;lengths[i]=kinds[i]==4?4:strlen(strings[i])+1;data_size+=lengths[i];
+        }
+        *size=8+16*8+data_size;unsigned char *result=calloc(1,*size);uint32_t v=htonl(8);memcpy(result,&v,4);
+        v=htonl(data_size);memcpy(result+4,&v,4);
+        for(unsigned i=0;i<8;i++) {
+            uint32_t row[]={tags[i],kinds[i],offsets[i],1};
+            for(unsigned j=0;j<4;j++){v=htonl(row[j]);memcpy(result+8+16*i+4*j,&v,4);}
+            if(kinds[i]==4){v=htonl(values[i]);memcpy(result+8+16*8+offsets[i],&v,4);}
+            else memcpy(result+8+16*8+offsets[i],strings[i],lengths[i]);
+        }
+        return result;
+    }
     *size=40+bodylen+proglen;
     unsigned char *result=calloc(1,*size);
     uint32_t fields[]={2,bodylen+proglen,bodytag,bodykind,0,1,progtag,progkind,bodylen,1};
@@ -439,6 +461,6 @@ s4_install_units
 ''', timeout=180)
         self.assertIn('status=complete', (self.root / 'state/components/update-interpreters').read_text())
         policy = (self.root / 'units/azurelinux3s4-repair.service').read_text()
-        self.assertIn('TimeoutStartSec=22245s', policy)
+        self.assertIn('TimeoutStartSec=22340s', policy)
         self.assertIn('TimeoutStopSec=30s', policy)
         self.assertIn('KillMode=control-group', policy)

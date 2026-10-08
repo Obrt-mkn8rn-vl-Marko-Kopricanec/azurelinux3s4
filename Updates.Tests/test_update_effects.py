@@ -195,6 +195,37 @@ void *headerExport(void *h,unsigned *size) {
 }
 '''
 
+# The declared-array guard needs a complete installed trigger family. Keep the
+# original incoming/type/aggregate/error deliveries; this remains a C ABI MODEL.
+LIBRARY = LIBRARY.replace('void *headerExport(', 'void *fixtureTriggerOriginalExport(')
+LIBRARY += r'''
+void *headerExport(void *h,unsigned *size) {
+    if(incoming(h) || setting("effects_large_metadata") || setting("effects_wrong_type"))
+        return fixtureTriggerOriginalExport(h,size);
+    uint32_t tags[]={5076,5077,5078,5079,5081,5082,5080,5085};
+    uint32_t kinds[]={8,8,4,8,8,4,4,4};
+    uint32_t count=setting("trigger_missing_priority")?7:8;
+    const char *body=ran && setting("changed_baseline")?"changed":"echo fixture-no-execution";
+    const char *strings[]={body,"/bin/sh",NULL,"/usr/lib", "",NULL,NULL,NULL};
+    uint32_t values[]={0,0,0,0,0,65536,setting("trigger_bad_index")?1:0,1000000};
+    unsigned offsets[8], lengths[8], data_size=0;
+    for(unsigned i=0;i<count;i++) {
+        if(kinds[i]==4) data_size=(data_size+3)&~3U;
+        offsets[i]=data_size;lengths[i]=kinds[i]==4?4:strlen(strings[i])+1;data_size+=lengths[i];
+    }
+    *size=8+16*count+data_size;
+    unsigned char *result=calloc(1,*size);uint32_t v=htonl(count);memcpy(result,&v,4);
+    v=htonl(data_size);memcpy(result+4,&v,4);
+    for(unsigned i=0;i<count;i++) {
+        uint32_t row[]={tags[i],kinds[i],offsets[i],1};
+        for(unsigned j=0;j<4;j++) { v=htonl(row[j]);memcpy(result+8+16*i+4*j,&v,4); }
+        if(kinds[i]==4) { v=htonl(values[i]);memcpy(result+8+16*count+offsets[i],&v,4); }
+        else memcpy(result+8+16*count+offsets[i],strings[i],lengths[i]);
+    }
+    return result;
+}
+'''
+
 
 class UpdateEffectsTests(unittest.TestCase):
     command = compatibility.UpdateCompatibilityTests.command
@@ -213,7 +244,7 @@ class UpdateEffectsTests(unittest.TestCase):
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(cls.library)],
                        input=LIBRARY, text=True, capture_output=True, check=True)
 
-    def shell(self, body='s4_check_update_effects', expected=0, timeout=45):
+    def shell(self, body='s4_check_update_effects', expected=0, timeout=180):
         return staging.UpdateStagingTests.shell(self, body, expected, timeout)
 
     def test_incoming_and_installed_trigger_owners_are_bound_to_observed_headers(self):
@@ -336,11 +367,11 @@ s4_repair yes >/dev/null
         self.assertIn('status=complete', (self.root / 'state/components/update-effects').read_text())
 
     def test_generated_policy_includes_another_complete_admission_test_and_controls(self):
-        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 14540 + 2295 + 4 * 35 + 2600 + 4 * 35 + 2295 + 95 + 4 * 35)
+        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 14540 + 2295 + 4 * 35 + 2600 + 4 * 35 + 2295 + 95 + 4 * 35 + 95)
         # Unit generation is real; activation has separate accepted coverage.
         self.shell('s4_start_repair_timer() { return 0; }; s4_start_timer() { return 0; }; s4_install_units')
         policy = (self.root / 'units/azurelinux3s4-repair.service').read_text()
-        self.assertIn('TimeoutStartSec=22245s', policy)
+        self.assertIn('TimeoutStartSec=22340s', policy)
         self.assertIn('TimeoutStopSec=30s', policy)
         self.assertIn('KillMode=control-group', policy)
 

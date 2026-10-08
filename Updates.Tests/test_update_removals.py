@@ -445,10 +445,10 @@ s4_verify_trust_anchor() { return 0; }; s4_main'''
         self.assertIn('server_ready=no', self.shell('s4_status').stdout)
 
     def test_generated_finite_budget_covers_fresh_test_observer_and_persistence(self):
-        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 19715 + 2295 + 95 + 4 * 35)
+        self.assertEqual(int(self.shell('s4_repair_timeout_seconds').stdout), 19715 + 2295 + 95 + 4 * 35 + 95)
         self.shell('s4_start_repair_timer() { return 0; }; s4_start_timer() { return 0; }; s4_install_units')
         policy = (self.root / 'units/azurelinux3s4-repair.service').read_text()
-        self.assertIn('TimeoutStartSec=22245s', policy)
+        self.assertIn('TimeoutStartSec=22340s', policy)
         self.assertIn('TimeoutStopSec=30s', policy); self.assertIn('KillMode=control-group', policy)
 
 

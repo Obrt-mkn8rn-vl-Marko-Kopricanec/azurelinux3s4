@@ -16,6 +16,14 @@ s4_rpm_test_program() {
 PY
 }
 
+s4_update_trigger_inputs_program() {
+    # Use the same bounded tag catalog/inventory definitions; no script execution.
+    s4_rpm_effects_program || return $?
+    cat <<'PY'
+# @s4-include Updates/triggers.py
+PY
+}
+
 s4_update_capacity_program() {
     # Observe advertised capacity only; scripts/rollback and reservation remain unproved.
     cat <<'PY'
@@ -108,6 +116,9 @@ PY
         elif [[ $S4_CAPACITY_MODE == yes ]]; then
             s4_update_capacity_program >"$directory/capacity.py" || return 75
             evidence=$(timeout --kill-after=5s 5m python3 -I "$directory/capacity.py" "$directory" "$database") || return 75
+        elif [[ $S4_EFFECTS_MODE == yes ]]; then
+            s4_update_trigger_inputs_program >"$directory/triggers.py" || return 75
+            evidence=$(timeout --kill-after=5s 90s python3 -I "$directory/triggers.py" "$directory") || return 75
         else
             evidence=$(cat -- "$directory/result.json") || return 75
         fi
@@ -121,7 +132,7 @@ PY
     elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
-        s4_log 'Declared script metadata and installed removal identities observed; execution policy remains unfinished.'
+        s4_log 'Declared script metadata, trigger-array correspondence and removal identities observed; selection/execution policy remains unfinished.'
     elif [[ $S4_CAPACITY_MODE == yes ]]; then
         s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
     else

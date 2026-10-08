@@ -22,13 +22,12 @@ s4_repair_timeout_seconds() {
     local compatibility=$((2 * control + key + store + 65 + admission + 930))
     # Capacity repeats same-byte admission/native TEST, then a 5min+5s observer.
     local capacity=$((compatibility + 305))
-    # Effects repeats current admission/TEST and inventories bounded exports
-    # within that same native/parent cap; no script is executed by the observer.
-    local effects=$compatibility
+    # Effects repeats current admission/TEST, then a 90s+5s declared-array guard.
+    local effects=$((compatibility + 95))
     # Interpreter files repeat the fresh effects TEST and add a 5min+5s observer.
-    local interpreters=$((effects + 305))
+    local interpreters=$((compatibility + 305))
     # Removal replacement prerequisites repeat fresh effects TEST, then 90s+5s.
-    local removals=$((effects + 95))
+    local removals=$((compatibility + 95))
     local stages=$((2 * recovery + refresh + download + 3 * store + admission + compatibility + capacity + effects + interpreters + removals))
     # At most 34 state/repository/plugin/timer persistence/control calls on the
     # successful repair branch; reserve 40 to include restoration after failure.
