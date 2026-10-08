@@ -26,13 +26,22 @@ class RemovalGuardTests(unittest.TestCase):
         cls.program = interpreters.emitted('s4_update_removals_program')
         cls.namespace = {'__name__': 'fixture'}
         exec(compile(cls.program, '<production-removal-guard>', 'exec'), cls.namespace)
+        temporary = tempfile.TemporaryDirectory(prefix='s4-removal-version-model-', dir=Path.home() / '.cache')
+        cls.addClassCleanup(temporary.cleanup)
+        cls.version_library = Path(temporary.name) / 'librpm-version-model.so'
+        model = SOURCE.parent / 'Updates.Tests/rpm_version_model.c'
+        subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', str(model), '-o', str(cls.version_library)],
+                       input=compatibility.LIBRARY, text=True, capture_output=True, check=True)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='azurelinux3s4-removals-', dir=Path.home() / '.cache')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.program_file = self.root / 'removals.py'
-        self.program_file.write_text(self.program)
+        # Actual production client with ONLY native library-path delivery to a
+        # finite ABI comparator MODEL; no genuine installed RPM is claimed.
+        self.program_file.write_text(self.program.replace('C.CDLL("librpm.so.9",',
+                                                          'C.CDLL(' + repr(str(self.version_library)) + ','))
         self.proof = self.make_proof()
 
     @staticmethod
@@ -286,10 +295,18 @@ class UpdateRemovalIntegrationTests(unittest.TestCase):
         cls.library = Path(temporary.name) / 'librpm-removals.so'
         # Public ABI/error delivery model, NOT genuine RPM semantics/signatures.
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(cls.library)],
-                       input=effects.LIBRARY, text=True, capture_output=True, check=True)
+                       input=effects.LIBRARY + (SOURCE.parent / 'Updates.Tests/rpm_version_model.c').read_text(),
+                       text=True, capture_output=True, check=True)
 
     def shell(self, body='s4_check_update_removals', expected=0, timeout=45):
-        return staging.UpdateStagingTests.shell(self, body, expected, timeout)
+        # Preserve fresh actual wrapper/store/admission/TEST and correspondence;
+        # deliver ONLY comparator library path to the finite C ABI model.
+        program = interpreters.emitted('s4_update_removals_program')
+        self.assertEqual(program.count('C.CDLL("librpm.so.9",'), 1)
+        delivered = program.replace('C.CDLL("librpm.so.9",', 'C.CDLL(' + repr(str(self.library)) + ',')
+        self.assertNotIn('\nS4_VERSION_MODEL\n', delivered)
+        prefix = "s4_update_removals_program() { cat <<'S4_VERSION_MODEL'\n" + delivered + '\nS4_VERSION_MODEL\n}\n'
+        return staging.UpdateStagingTests.shell(self, prefix + body, expected, timeout)
 
     def test_fresh_same_byte_admission_test_and_bound_removal_match_preserve_pointer(self):
         self.prepare(userland_removal=True)

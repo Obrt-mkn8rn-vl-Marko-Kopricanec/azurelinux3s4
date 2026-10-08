@@ -40,6 +40,7 @@ PAYLOADS = {
     "Updates/capacity.py": "PY",
     "Updates/interpreters.py": "PY",
     "Updates/removals.py": "PY",
+    "Updates/versions.py": "PY",
     "Web/policy.py": "PY",
     "SSH/policy.py": "PY",
     "SSH/service.py": "PY",
