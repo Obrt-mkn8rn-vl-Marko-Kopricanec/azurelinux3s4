@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -225,7 +226,7 @@ class ProvidesPrivateTests(unittest.TestCase):
     def test_owned_private_snapshot_binds_all_five_receipts_and_is_preserved(self):
         material = self.path.read_bytes(); proof = json.loads(self.run_guard().stdout)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation'):
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation'):
             self.assertEqual(proof[name]['input_sha256'], hashlib.sha256(material).hexdigest())
         self.assertEqual(self.path.read_bytes(), material)
 
@@ -281,6 +282,7 @@ class ProvidesPipelineTests(unittest.TestCase):
         source = effects.LIBRARY.replace('void *headerExport(', 'void *fixtureProvidesOriginalExport(') + PROVIDES_MODEL
         source += (effects.SOURCE.parent / 'Updates.Tests/rpm_version_model.c').read_text()
         source += (effects.SOURCE.parent / 'Updates.Tests/rpm_range_model.c').read_text()
+        source += (effects.SOURCE.parent / 'Updates.Tests/rpm_dependency_model.c').read_text()
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(cls.library)],
                        input=source, text=True, capture_output=True, check=True)
 
@@ -295,7 +297,7 @@ class ProvidesPipelineTests(unittest.TestCase):
         self.assertEqual(proof['effects']['removals'][0]['provides'], proof['effects']['installed_provides'][0]['provides'])
         original = copy.deepcopy(proof)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation'): original.pop(name)
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation'): original.pop(name)
         self.assertEqual(receipt['input_sha256'], hashlib.sha256((json.dumps(original, sort_keys=True) + '\n').encode()).hexdigest())
         self.assertFalse(receipt['package_trigger_matches_observed']); self.assertFalse(proof['installation_authorized'])
         self.assertIn('run 1', self.native_calls()); self.assertEqual((self.root / 'state/updates/current.json').read_bytes(), pointer)
@@ -340,7 +342,7 @@ class ProvidesPipelineTests(unittest.TestCase):
     def test_missing_projection_delivery_refuses_after_fresh_test_despite_stale_receipt(self):
         self.prepare(); pointer = (self.root / 'state/updates/current.json').read_bytes()
         delivered = triggers.emitted().replace('C.CDLL("librpm.so.9",', 'C.CDLL(' + repr(str(self.library)) + ',')
-        ending = "if trigger_execution:\n    raise SystemExit(trigger_main(provides_observe))\n"
+        ending = "if trigger_execution:\n    raise SystemExit(trigger_main(provider_observe))\n"
         self.assertTrue(delivered.endswith(ending))
         # Explicit private parent-delivery MODEL: the actual guard sees a
         # missing source projection after the completed unchanged native TEST.
@@ -350,7 +352,9 @@ class ProvidesPipelineTests(unittest.TestCase):
             "    proof['provides_observation'] = {'declared_provides_observed': True}\n"
             "    return provides_observe(proof)\n"
             "if trigger_execution:\n    raise SystemExit(trigger_main(missing_projection))\n")
-        override = "s4_update_trigger_inputs_program() { cat <<'S4_PROVIDES_MODEL'\n" + delivered + "\nS4_PROVIDES_MODEL\n}\n"
+        model_path = self.root / 'missing-projection-model.py'
+        model_path.write_text(delivered)
+        override = 's4_update_trigger_inputs_program() { cat ' + shlex.quote(str(model_path)) + '; }\n'
         result = self.shell(override + 's4_check_update_effects', expected=75)
         self.assertIn('installed_provides', result.stderr); self.assertIn('run 1', self.native_calls())
         self.assertEqual(result.stdout, ''); self.assertEqual((self.root / 'state/updates/current.json').read_bytes(), pointer)
