@@ -33,6 +33,7 @@ MODULES = (
     "test_ssh_crypto",
     "test_ssh_revocations",
     "test_ssh_accounts",
+    "test_ssh_home",
 )
 
 

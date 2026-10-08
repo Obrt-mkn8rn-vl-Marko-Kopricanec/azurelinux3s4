@@ -1,6 +1,21 @@
 s4_inspect_ssh_account() {
-    # Fixed public local records only; no identity creation or NSS/PAM operation.
-    timeout --kill-after=5s 30s python3 -I - <<'PY'
+    s4_inspect_ssh_administrator account
+}
+
+s4_inspect_ssh_home() {
+    s4_inspect_ssh_administrator home
+}
+
+s4_inspect_ssh_administrator() {
+    [[ $# == 1 && ( $1 == account || $1 == home ) ]] || return 64
+    local allowance=30s
+    [[ $1 != home ]] || allowance=45s
+    timeout --kill-after=5s "$allowance" python3 -I - "$1" <<'PY'
+__name__ = 's4_ssh_administrator_library'
 # @s4-include SSH/accounts.py
+# @s4-include SSH/home.py
+action = sys.argv[1]
+sys.argv = [sys.argv[0]]
+raise SystemExit(main() if action == 'account' else home_main(observe))
 PY
 }

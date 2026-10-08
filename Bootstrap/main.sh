@@ -6,7 +6,7 @@ s4_main() {
     local action=${1:-install}
     case $action in
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\n       ./azurelinux3s4.sh --inspect-ssh-home\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
             return 0 ;;
         --web-isolation-policy)
             [[ $# == 1 ]] || return 64
@@ -27,6 +27,10 @@ s4_main() {
         --inspect-ssh-account)
             [[ $# == 1 ]] || return 64
             s4_inspect_ssh_account
+            return $? ;;
+        --inspect-ssh-home)
+            [[ $# == 1 ]] || return 64
+            s4_inspect_ssh_home
             return $? ;;
         install|--status|--repair|--prepare-updates|--check-updates|--check-update-capacity|--audit-update-effects|--check-update-interpreters|--check-update-removals) [[ $# -le 1 ]] || return 64 ;;
         --verify-rpm) (( $# >= 2 && $# <= 129 )) || return 64 ;;

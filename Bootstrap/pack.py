@@ -44,6 +44,7 @@ PAYLOADS = {
     "SSH/policy.py": "PY",
     "SSH/keys.py": "PY",
     "SSH/accounts.py": "PY",
+    "SSH/home.py": "PY",
     "Web/relay.py": "'''",
     "Updates/plan.py": "PY",
     "Updates/sandbox.py": "PY",
