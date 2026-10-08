@@ -318,7 +318,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)

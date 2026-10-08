@@ -25,8 +25,9 @@ s4_update_trigger_inputs_program() {
 trigger_execution = __name__ == '__main__'
 __name__ = 's4_trigger_library'
 # @s4-include Updates/triggers.py
+# @s4-include Updates/trigger_ranges.py
 if trigger_execution:
-    raise SystemExit(trigger_main(trigger_condition_observe))
+    raise SystemExit(trigger_main(trigger_range_observe))
 PY
 }
 
@@ -141,7 +142,7 @@ PY
     elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
-        s4_log 'Declared script metadata, trigger-array correspondence, literal trigger conditions and removal identities observed; selection/execution policy remains unfinished.'
+        s4_log 'Declared script metadata, trigger-array correspondence, literal trigger conditions, bounded EVR range overlaps and removal identities observed; selection/execution policy remains unfinished.'
     elif [[ $S4_CAPACITY_MODE == yes ]]; then
         s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
     else
