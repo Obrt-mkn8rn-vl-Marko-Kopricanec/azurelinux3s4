@@ -19,6 +19,7 @@ MODULES = (
     "test_update_effects",
     "test_update_interpreters",
     "test_update_interpreter_paths",
+    "test_update_kernel_layout",
     "test_update_removals",
     "test_update_versions",
     "test_update_baselines",

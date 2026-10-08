@@ -30,8 +30,9 @@ interpreter_execution = __name__ == '__main__'
 __name__ = 's4_interpreter_library'
 # @s4-include Updates/interpreters.py
 # @s4-include Updates/interpreter_paths.py
+# @s4-include Updates/kernel_layout.py
 if interpreter_execution:
-    raise SystemExit(main(interpreter_paths))
+    raise SystemExit(main(kernel_layout))
 PY
 }
 

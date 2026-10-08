@@ -41,6 +41,7 @@ PAYLOADS = {
     "Updates/capacity.py": "PY",
     "Updates/interpreters.py": "PY",
     "Updates/interpreter_paths.py": "PY",
+    "Updates/kernel_layout.py": "PY",
     "Updates/removals.py": "PY",
     "Updates/versions.py": "PY",
     "Updates/floors.py": "PY",
