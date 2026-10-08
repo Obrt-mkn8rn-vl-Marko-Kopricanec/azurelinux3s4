@@ -297,6 +297,30 @@ try:
         charge(entry["path"], max(entry["bytes"], len(entry["link"].encode("utf-8"))),
                stat.S_ISDIR(entry["mode"]))
 
+    boot_budget = boot_work_budget(files)
+    if boot_budget["images"]:
+        boot_fd, boot_signature = resolve("/boot")
+        try:
+            if boot_signature[1]:
+                raise ValueError("boot-work destination directory is missing")
+            if "/boot" in observations and observations["/boot"] != boot_signature:
+                raise ValueError("boot-work destination layout changed")
+            observations["/boot"] = boot_signature
+            if len(observations) > 32768:
+                raise ValueError("boot-work destination parent count exceeds its bound")
+            boot_volume = volume(boot_fd)
+            allocation = boot_volume["initial"]["allocation"]
+            rounded = ((boot_budget["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
+            charged = rounded + 2 * allocation * boot_budget["minimum_work_inodes"]
+            boot_volume["required_bytes"] += charged
+            boot_volume["required_inodes"] += boot_budget["minimum_work_inodes"]
+            boot_budget.update(filesystem_device=boot_volume["device"],
+                               charged_bytes=charged, boot_directory_observed=True)
+        finally:
+            os.close(boot_fd)
+    else:
+        boot_budget.update(filesystem_device=None, charged_bytes=0, boot_directory_observed=False)
+
     def database_scan():
         fd, signature = resolve(database)
         rows, total = [], 0
@@ -373,6 +397,7 @@ try:
                           "headroom_inodes": reserve_inodes})
     proof["payload_capacity_checked"] = True
     proof["capacity_observation"] = {"filesystems": sorted(results, key=lambda item: item["device"]),
+        "boot_work_budget": boot_budget,
         "inventory_sha256": receipt["sha256"], "skipped_ghost_entries": skipped_ghosts,
         "policy": "two gross incoming copies plus per-entry metadata; no removal/hardlink credit; database reserve; five-percent or fixed headroom",
         "space_reserved": False, "scripts_capacity_checked": False, "rollback_capacity_checked": False,

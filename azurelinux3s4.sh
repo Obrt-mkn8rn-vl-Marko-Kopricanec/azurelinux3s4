@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.32.0
+S4_VERSION=0.33.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -1569,6 +1569,34 @@ PY
 s4_update_capacity_program() {
     # Observe advertised capacity only; scripts/rollback and reservation remain unproved.
     cat <<'PY'
+"""Supplemental minimum boot-work allowance, not generated-image capacity proof."""
+
+
+def boot_work_budget(files):
+    images, declarations = {}, []
+    for entry in files:
+        if not re.fullmatch(r'/boot/vmlinuz-[^/]+', entry['path']) or entry['flags'] & 64:
+            continue
+        if not stat.S_ISREG(entry['mode']) or entry['bytes'] == 0:
+            raise ValueError('boot-work image declaration is not a nonempty ordinary file')
+        images[entry['path']] = max(images.get(entry['path'], 0), entry['bytes'])
+        declarations.append(entry)
+        if len(images) > 128:
+            raise ValueError('boot-work image count exceeds its bound')
+    # This repository floor supplements existing gross payload/db/headroom
+    # accounting. It does NOT upper-bound dracut, triggers or rollback work.
+    required = sum(128 * 1024 * 1024 + 4 * size for size in images.values())
+    return {
+        'schema': 1, 'images': [{'path': path, 'declared_bytes': size} for path, size in sorted(images.items())],
+        'source_sha256': hashlib.sha256(json.dumps(declarations, sort_keys=True,
+            separators=(',', ':')).encode('utf-8')).hexdigest(),
+        'minimum_work_bytes': required, 'minimum_work_inodes': 8 * len(images),
+        'policy': 'supplemental 128MiB plus four declared image lengths and eight inodes per unique named image',
+        'scope': 'nonghost ordinary /boot/vmlinuz-* declarations ONLY; no kernel owner/trigger selection',
+        **{key: False for key in ('kernel_owner_authenticated', 'all_regeneration_triggers_accounted',
+            'generated_image_size_bounded', 'space_reserved', 'complete_boot_capacity_checked',
+            'rollback_capacity_checked', 'installation_authorized', 'reboot_authorized', 'server_ready')},
+    }
 import hashlib
 import json
 import os
@@ -1868,6 +1896,30 @@ try:
         charge(entry["path"], max(entry["bytes"], len(entry["link"].encode("utf-8"))),
                stat.S_ISDIR(entry["mode"]))
 
+    boot_budget = boot_work_budget(files)
+    if boot_budget["images"]:
+        boot_fd, boot_signature = resolve("/boot")
+        try:
+            if boot_signature[1]:
+                raise ValueError("boot-work destination directory is missing")
+            if "/boot" in observations and observations["/boot"] != boot_signature:
+                raise ValueError("boot-work destination layout changed")
+            observations["/boot"] = boot_signature
+            if len(observations) > 32768:
+                raise ValueError("boot-work destination parent count exceeds its bound")
+            boot_volume = volume(boot_fd)
+            allocation = boot_volume["initial"]["allocation"]
+            rounded = ((boot_budget["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
+            charged = rounded + 2 * allocation * boot_budget["minimum_work_inodes"]
+            boot_volume["required_bytes"] += charged
+            boot_volume["required_inodes"] += boot_budget["minimum_work_inodes"]
+            boot_budget.update(filesystem_device=boot_volume["device"],
+                               charged_bytes=charged, boot_directory_observed=True)
+        finally:
+            os.close(boot_fd)
+    else:
+        boot_budget.update(filesystem_device=None, charged_bytes=0, boot_directory_observed=False)
+
     def database_scan():
         fd, signature = resolve(database)
         rows, total = [], 0
@@ -1944,6 +1996,7 @@ try:
                           "headroom_inodes": reserve_inodes})
     proof["payload_capacity_checked"] = True
     proof["capacity_observation"] = {"filesystems": sorted(results, key=lambda item: item["device"]),
+        "boot_work_budget": boot_budget,
         "inventory_sha256": receipt["sha256"], "skipped_ghost_entries": skipped_ghosts,
         "policy": "two gross incoming copies plus per-entry metadata; no removal/hardlink credit; database reserve; five-percent or fixed headroom",
         "space_reserved": False, "scripts_capacity_checked": False, "rollback_capacity_checked": False,

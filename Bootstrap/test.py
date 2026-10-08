@@ -16,6 +16,7 @@ MODULES = (
     "test_update_staging",
     "test_update_compatibility",
     "test_update_capacity",
+    "test_update_boot_budget",
     "test_update_effects",
     "test_update_interpreters",
     "test_update_interpreter_paths",
