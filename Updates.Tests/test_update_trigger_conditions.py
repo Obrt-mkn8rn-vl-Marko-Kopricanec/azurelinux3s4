@@ -304,7 +304,7 @@ class ConditionPipelineTests(unittest.TestCase):
         self.assertEqual((record['name'], record['evr'], record['declared_operator']), ('userland', '2:1.0~rc1-3.azl3', '>='))
         self.assertEqual(receipt['owners'][0]['header_sha256'], proof['effects']['installed_script_owners'][0]['header_sha256'])
         source = copy.deepcopy(proof)
-        for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation', 'trigger_range_observation'): source.pop(name)
+        for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation', 'trigger_range_observation', 'provides_observation'): source.pop(name)
         self.assertEqual(receipt['input_sha256'], hashlib.sha256((json.dumps(source, sort_keys=True) + '\n').encode()).hexdigest())
         self.assertFalse(receipt['conditions_evaluated']); self.assertFalse(proof['installation_authorized'])
         self.assertIn('run 1', self.native_calls()); self.assertEqual((self.root / 'state/updates/current.json').read_bytes(), pointer)

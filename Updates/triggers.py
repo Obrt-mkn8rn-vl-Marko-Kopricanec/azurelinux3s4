@@ -229,6 +229,8 @@ def trigger_main(after=None):
                 proof['trigger_condition_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
             if 'trigger_range_observation' in proof:
                 proof['trigger_range_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
+            if 'provides_observation' in proof:
+                proof['provides_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         proof['trigger_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         output = json.dumps(proof, sort_keys=True)
         if len(output.encode('utf-8')) > TRIGGER_LIMIT:

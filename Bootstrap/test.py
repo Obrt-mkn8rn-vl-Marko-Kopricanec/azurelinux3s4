@@ -23,6 +23,7 @@ MODULES = (
     "test_update_trigger_prefixes",
     "test_update_trigger_conditions",
     "test_update_trigger_ranges",
+    "test_update_provides",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",

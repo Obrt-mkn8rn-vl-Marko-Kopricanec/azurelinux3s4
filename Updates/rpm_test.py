@@ -179,6 +179,8 @@ try:
         if file_trigger_prefix_projection:
             value["file_trigger_prefix_bytes"] = file_trigger_export(exported, value)
             value["trigger_condition_bytes"] = trigger_condition_export(exported, value)
+        if provides_projection:
+            value["provides"] = provides_export(exported, value)
         effects_bytes += len(json.dumps(value, sort_keys=True).encode("utf-8"))
         # Retain at most 16MiB of metadata before plan/removal duplication;
         # the final 32MiB output cap is separate and positively checked.
@@ -502,6 +504,10 @@ try:
             "trigger_selection_complete": False, "script_execution_plan_complete": False,
             "script_policy_satisfied": False, "removal_policy_satisfied": False,
             "rollback_policy_satisfied": False}
+        if provides_projection:
+            proof["effects"]["installed_provides"] = [
+                {field: value[field] for field in (*INSTALLED_VERSION_FIELDS, "provides")}
+                for _, value in sorted(installed_effects.items())]
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",

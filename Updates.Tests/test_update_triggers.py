@@ -152,16 +152,19 @@ class TriggerProofTests(unittest.TestCase):
         audited = self.namespace['audit_header'](material)
         owner = {'instance':1,'name':'fixture','nevra':'fixture-0-1.x86_64', **audited,
             'file_trigger_prefix_bytes':self.namespace['file_trigger_export'](material,audited),
-            'trigger_condition_bytes':self.namespace['trigger_condition_export'](material,audited)}
+            'trigger_condition_bytes':self.namespace['trigger_condition_export'](material,audited),
+            'provides':self.namespace['provides_export'](material,audited)}
         baseline = {'headers':1,'sha256':hashlib.sha256(json.dumps([(1,owner['header_sha256'])],separators=(',',':')).encode()).hexdigest()}
         additions = [{'file':'packages/0.rpm','sha256':'a'*64,'bytes':15,'nevra':'future-1-1.x86_64'}] if incoming else []
         incoming_owners = [{'name':'future',**additions[0],**self.namespace['audit_header'](effects.exported([(1023,6,[b'body'])])),
-                            'file_trigger_prefix_bytes':[], 'trigger_condition_bytes':[]}] if incoming else []
+                            'file_trigger_prefix_bytes':[], 'trigger_condition_bytes':[],
+                            'provides':{'schema':1,'tags':[]}}] if incoming else []
         return {'schema':1,'test_passed':True,'rpm_test_performed':incoming,
             **{flag:False for flag in ('installs_performed','scripts_executed','installation_authorized','storage_capacity_checked','freshness_proven')},
             'baseline':baseline,'additions':additions,'removals':[],
             'effects':{'schema':1,'incoming':incoming_owners,'removals':[],'installed_script_owners':[owner] if trigger else [],
                 'installed_versions':self.namespace['installed_version_inventory']({1:owner},baseline),
+                'installed_provides':[{field:owner[field] for field in (*self.namespace['INSTALLED_VERSION_FIELDS'],'provides')}],
                 'installed_headers_observed':1,'script_metadata_observed':True,'removals_bound_to_installed_instances':True,
                 **{flag:False for flag in ('installed_headers_authenticated','trigger_selection_complete','script_execution_plan_complete',
                     'script_policy_satisfied','removal_policy_satisfied','rollback_policy_satisfied')}}}
@@ -318,7 +321,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)
