@@ -10,7 +10,7 @@ FILE_TRIGGER_PREFIX_LIMIT = 8 * 1024 * 1024
 file_trigger_prefix_projection = False
 
 
-def file_trigger_export(material, audited):
+def file_trigger_export(material, audited, selected_tags=FILE_TRIGGER_PREFIX_TAGS):
     # Called with the very same headerExport bytes already admitted by audit_header.
     if (audited['header_bytes'] != len(material)
             or audited['header_sha256'] != hashlib.sha256(material).hexdigest()):
@@ -23,7 +23,7 @@ def file_trigger_export(material, audited):
     result, seen = [], set()
     for index in range(entries):
         tag, kind, offset, count = struct.unpack_from('>IIII', material, 8 + 16 * index)
-        if tag not in FILE_TRIGGER_PREFIX_TAGS:
+        if tag not in selected_tags:
             continue
         source = tags.get(tag)
         if (tag in seen or kind != 8 or not 1 <= count <= 4096 or offset >= size
@@ -44,7 +44,7 @@ def file_trigger_export(material, audited):
         if source['bytes'] != len(encoded) or source['sha256'] != hashlib.sha256(encoded).hexdigest():
             raise ValueError('file-trigger prefix array differs from its audited tag')
         result.append({'tag': tag, 'hex_values': values})
-    if seen != set(tags).intersection(FILE_TRIGGER_PREFIX_TAGS):
+    if seen != set(tags).intersection(selected_tags):
         raise ValueError('file-trigger prefix export is incomplete')
     return sorted(result, key=lambda row: row['tag'])
 

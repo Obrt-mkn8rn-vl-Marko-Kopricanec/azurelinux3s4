@@ -5,6 +5,7 @@ s4_rpm_effects_program() {
 # @s4-include Updates/effects.py
 # @s4-include Updates/baselines.py
 # @s4-include Updates/trigger_prefixes.py
+# @s4-include Updates/trigger_conditions.py
 PY
 }
 
@@ -25,7 +26,7 @@ trigger_execution = __name__ == '__main__'
 __name__ = 's4_trigger_library'
 # @s4-include Updates/triggers.py
 if trigger_execution:
-    raise SystemExit(trigger_main(file_trigger_prefix_observe))
+    raise SystemExit(trigger_main(trigger_condition_observe))
 PY
 }
 
@@ -140,7 +141,7 @@ PY
     elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
-        s4_log 'Declared script metadata, trigger-array correspondence, literal file prefixes and removal identities observed; selection/execution policy remains unfinished.'
+        s4_log 'Declared script metadata, trigger-array correspondence, literal trigger conditions and removal identities observed; selection/execution policy remains unfinished.'
     elif [[ $S4_CAPACITY_MODE == yes ]]; then
         s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
     else
