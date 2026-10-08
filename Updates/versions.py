@@ -115,7 +115,7 @@ def version_unique(pairs):
     return result
 
 
-def version_main(correspondence_guard):
+def version_main(correspondence_guard, incoming_guard=None):
     if len(sys.argv) != 2: return 64
     try:
         resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024,) * 2)
@@ -134,8 +134,12 @@ def version_main(correspondence_guard):
                     or version_identity(path.lstat()) != version_identity(before)):
                 raise ValueError('version proof changed during reading')
         proof = version_observe(correspondence_guard(json.loads(data, object_pairs_hook=version_unique)))
+        if incoming_guard is not None:
+            proof = incoming_guard(proof)
         digest = hashlib.sha256(data).hexdigest()
         proof['removal_guard']['input_sha256'] = proof['replacement_version_guard']['input_sha256'] = digest
+        if incoming_guard is not None:
+            proof['incoming_version_guard']['input_sha256'] = digest
         encoded = json.dumps(proof, sort_keys=True)
         if len(encoded.encode()) > 64 * 1024 * 1024: raise ValueError('version observations exceed output bound')
         print(encoded)

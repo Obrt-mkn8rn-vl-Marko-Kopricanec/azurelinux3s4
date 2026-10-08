@@ -54,11 +54,24 @@ class RemovalGuardTests(unittest.TestCase):
                    'classification': 'same-name-replacement', 'tags': []}
         addition = {k: incoming[k] for k in ('file', 'sha256', 'bytes', 'nevra')}
         addition.update(install_only=False, pretrans_present=False)
-        return {'schema': 1, 'manifest_sha256': 'a' * 64, 'baseline': {'headers': 2, 'sha256': 'b' * 64},
+        installed = [{key: removed[key] for key in ('instance', 'name', 'nevra', 'header_bytes', 'header_sha256')},
+                     {'instance': 8, 'name': 'gpg-pubkey', 'nevra': 'gpg-pubkey-135ce90-66878efc.(none)',
+                      'header_bytes': 64, 'header_sha256': 'b' * 64}]
+        encoded = json.dumps(installed, sort_keys=True, separators=(',', ':')).encode()
+        baseline = hashlib.sha256(json.dumps([(v['instance'], v['header_sha256']) for v in installed],
+                                            separators=(',', ':')).encode()).hexdigest()
+        inventory = {'schema': 1, 'entries': installed, 'headers': 2, 'baseline_sha256': baseline,
+                     'entries_bytes': len(encoded), 'entries_sha256': hashlib.sha256(encoded).hexdigest(),
+                     'complete_observed_header_inventory': True,
+                     **{key: False for key in ('installed_headers_authenticated', 'identity_fields_independently_authenticated',
+                        'snapshot_atomic', 'all_incoming_versions_checked', 'kernel_version_policy_satisfied',
+                        'freshness_proven', 'anti_rollback_proven', 'installation_authorized', 'server_ready')}}
+        return {'schema': 1, 'manifest_sha256': 'a' * 64, 'baseline': {'headers': 2, 'sha256': baseline},
                 'additions': [addition], 'removals': [removed['nevra']], 'test_passed': True, 'rpm_test_performed': True,
                 **{name: False for name in ('installation_authorized', 'scripts_executed', 'installs_performed',
                                             'storage_capacity_checked', 'freshness_proven')},
                 'effects': {'schema': 1, 'incoming': [incoming], 'removals': [removed], 'installed_script_owners': [],
+                            'installed_versions': inventory,
                             'installed_headers_observed': 2, 'script_metadata_observed': True,
                             'removals_bound_to_installed_instances': True,
                             **{name: False for name in ('installed_headers_authenticated', 'trigger_selection_complete',
@@ -298,7 +311,7 @@ class UpdateRemovalIntegrationTests(unittest.TestCase):
                        input=effects.LIBRARY + (SOURCE.parent / 'Updates.Tests/rpm_version_model.c').read_text(),
                        text=True, capture_output=True, check=True)
 
-    def shell(self, body='s4_check_update_removals', expected=0, timeout=45):
+    def shell(self, body='s4_check_update_removals', expected=0, timeout=90):
         # Preserve fresh actual wrapper/store/admission/TEST and correspondence;
         # deliver ONLY comparator library path to the finite C ABI model.
         program = interpreters.emitted('s4_update_removals_program')

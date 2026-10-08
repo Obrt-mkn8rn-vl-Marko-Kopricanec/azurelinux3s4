@@ -37,8 +37,9 @@ version_execution = __name__ == '__main__'
 __name__ = 's4_removal_guard_library'
 # @s4-include Updates/removals.py
 # @s4-include Updates/versions.py
+# @s4-include Updates/floors.py
 if version_execution:
-    raise SystemExit(version_main(observe))
+    raise SystemExit(version_main(observe, floor_observe))
 PY
 }
 
@@ -103,7 +104,7 @@ PY
     rm -rf -- "$directory" || return 75
     trap - EXIT
     if [[ $S4_REMOVALS_MODE == yes ]]; then
-        s4_log 'Current TEST removals have unique newer same-name/architecture replacements; complete removal, freshness, rollback and installation policy remain unproved.'
+        s4_log 'Current TEST replacements and matching incoming versions exceed observed installed floors; complete removal, kernel, freshness, rollback and installation policy remain unproved.'
     elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
