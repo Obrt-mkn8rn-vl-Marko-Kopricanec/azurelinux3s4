@@ -1,7 +1,21 @@
 s4_ssh_policy() {
+    s4_ssh_candidate configuration
+}
+
+s4_ssh_service_policy() {
+    s4_ssh_candidate service
+}
+
+s4_ssh_candidate() {
+    [[ $# == 1 && ( $1 == configuration || $1 == service ) ]] || return 64
     # Candidate bytes only; no observation, package/account/key/file/service
     # installation. LAN/caller/key authorization remains a later prerequisite.
-    timeout --kill-after=5s 30s python3 -I - <<'PY'
+    timeout --kill-after=5s 30s python3 -I - "$1" <<'PY'
+__name__ = 's4_ssh_candidate_library'
 # @s4-include SSH/policy.py
+# @s4-include SSH/service.py
+action = sys.argv[1]
+sys.argv = [sys.argv[0]]
+raise SystemExit(main() if action == 'configuration' else service_main(bundle))
 PY
 }

@@ -34,6 +34,7 @@ MODULES = (
     "test_ssh_revocations",
     "test_ssh_accounts",
     "test_ssh_home",
+    "test_ssh_service",
 )
 
 
