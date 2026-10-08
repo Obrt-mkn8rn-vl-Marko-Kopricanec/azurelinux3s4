@@ -36,6 +36,7 @@ PAYLOADS = {
     "Packages/download.py": "PY",
     "Updates/store.py": "PY",
     "Updates/effects.py": "PY",
+    "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",
     "Updates/interpreters.py": "PY",

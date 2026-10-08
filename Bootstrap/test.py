@@ -20,6 +20,7 @@ MODULES = (
     "test_update_interpreters",
     "test_update_removals",
     "test_update_versions",
+    "test_update_baselines",
     "test_web_isolation",
     "test_web_relay",
     "test_web_admission",

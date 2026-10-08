@@ -457,6 +457,7 @@ try:
         if sorted(map(binding, incoming_effects)) != sorted(map(binding, additions)):
             raise ValueError("native additions differ from the observed admitted header identities")
         proof["effects"] = {"schema": 1, "incoming": incoming_effects, "removals": removal_effects,
+            "installed_versions": installed_version_inventory(installed_effects, before),
             "installed_script_owners": [value for _, value in sorted(installed_effects.items()) if value["tags"]],
             "installed_headers_observed": before["headers"], "script_metadata_observed": True,
             "removals_bound_to_installed_instances": True, "installed_headers_authenticated": False,

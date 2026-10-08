@@ -3,6 +3,7 @@ s4_rpm_effects_program() {
     # This inventory does not predict trigger selection or approve execution.
     cat <<'PY'
 # @s4-include Updates/effects.py
+# @s4-include Updates/baselines.py
 PY
 }
 
