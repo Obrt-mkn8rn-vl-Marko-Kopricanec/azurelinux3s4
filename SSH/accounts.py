@@ -86,9 +86,15 @@ def lines(data):
     if (not 0 < len(data) <= SOURCE_LIMIT or not data.endswith(b'\n')
             or any(value < 32 and value != 10 or value == 127 for value in data)):
         raise ValueError('unsupported local account source encoding or lines')
-    values = data.decode('utf-8').splitlines()
-    if len(values) > RECORD_LIMIT or any(len(value.encode()) > 4096 for value in values):
+    # Local records end at byte LF; Unicode splitlines would invent entries.
+    # Account for every raw record, including comments/empties, before decoding.
+    raw = data[:-1].split(b'\n')
+    if len(raw) > RECORD_LIMIT or any(len(value) > 4096 for value in raw):
         raise ValueError('local account record bounds exceeded')
+    values = [value.decode('utf-8') for value in raw]
+    if any('\x80' <= character <= '\x9f' or character in '\u2028\u2029'
+           for value in values for character in value):
+        raise ValueError('unsupported non-LF Unicode separator or control')
     return [value for value in values if value and not value.startswith('#')]
 
 

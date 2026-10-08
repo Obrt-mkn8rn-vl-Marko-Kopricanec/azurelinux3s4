@@ -27,6 +27,34 @@ def tables(present=False):
             'group': ROOT_GROUP + (ADMIN_GROUP if present else b''), 'shells': ROOT_SHELLS}
 
 
+UNICODE_SEPARATORS = ('\u0085', '\u2028', '\u2029')
+
+
+def injected_tables(kind, separator):
+    data = tables(True); boundary = separator.encode('utf-8')
+    if kind == 'passwd':
+        data[kind] = ROOT_PASSWD + b'ordinary:x:1001:1001::/home/ordinary:/bin/bash' + boundary + ADMIN_PASSWD
+    elif kind == 'group':
+        data[kind] = ROOT_GROUP + b'ordinary:x:1001:' + boundary + ADMIN_GROUP
+    else:
+        data[kind] = b'/bin/sh' + boundary + b'/bin/bash\n'
+    return data
+
+
+def overlong_tables(kind, separator):
+    data = tables(True)
+    # Each apparent Unicode row is small; the actual LF record exceeds4096.
+    data[kind] += b'#' + b'a' * 2048 + separator.encode('utf-8') + b'#' + b'b' * 2048 + b'\n'
+    return data
+
+
+def benign_utf8_tables():
+    data = tables(True)
+    data['passwd'] = data['passwd'].replace(b'private-gecos-not-output', 'Zoë,管理员,Δοκιμή,👩‍💻'.encode('utf-8'))
+    for kind in data: data[kind] = '# 登记 Zoë\n'.encode('utf-8') + data[kind]
+    return data
+
+
 class SSHAccountRecordTests(unittest.TestCase):
     def test_absent_local_records_do_not_authorize_creation(self):
         self.assertEqual(ACCOUNTS.classify(tables()), {'local_status': 'absent', 'account': None, 'local_supplementary_groups': []})
@@ -122,6 +150,60 @@ class SSHAccountRecordTests(unittest.TestCase):
     def test_encoding_line_and_record_bounds_refuse(self):
         for data in (b'', b'no final LF', b'bad\r\n', b'bad\0\n', b'bad\xff\n', b'x' * 4097 + b'\n', b'\n' * 16385):
             with self.assertRaises(ValueError): ACCOUNTS.lines(data)
+
+    def test_unicode_separators_cannot_invent_an_administrator_passwd_row(self):
+        for separator in UNICODE_SEPARATORS:
+            with self.subTest(separator=ord(separator)), self.assertRaises(ValueError):
+                ACCOUNTS.classify(injected_tables('passwd', separator))
+
+    def test_unicode_separators_cannot_invent_a_private_group_row(self):
+        for separator in UNICODE_SEPARATORS:
+            with self.subTest(separator=ord(separator)), self.assertRaises(ValueError):
+                ACCOUNTS.classify(injected_tables('group', separator))
+
+    def test_unicode_separators_cannot_invent_a_bash_registration(self):
+        for separator in UNICODE_SEPARATORS:
+            with self.subTest(separator=ord(separator)), self.assertRaises(ValueError):
+                ACCOUNTS.classify(injected_tables('shells', separator))
+
+    def test_comment_unicode_separators_cannot_escape_into_source_entries(self):
+        for kind, base, entry in (('passwd', ROOT_PASSWD, ADMIN_PASSWD),
+                                  ('group', ROOT_GROUP, ADMIN_GROUP), ('shells', b'', b'/bin/bash\n')):
+            for separator in UNICODE_SEPARATORS:
+                data = tables(True); data[kind] = base + b'# ordinary comment' + separator.encode('utf-8') + entry
+                with self.subTest(kind=kind, separator=ord(separator)), self.assertRaises(ValueError):
+                    ACCOUNTS.classify(data)
+
+    def test_all_tables_enforce_raw_lf_record_bytes_before_unicode_splitting(self):
+        for kind in ('passwd', 'group', 'shells'):
+            for separator in UNICODE_SEPARATORS:
+                data = overlong_tables(kind, separator)
+                self.assertGreater(len(data[kind].split(b'\n')[-2]), 4096)
+                with self.subTest(kind=kind, separator=ord(separator)), self.assertRaisesRegex(ValueError, 'bounds'):
+                    ACCOUNTS.classify(data)
+
+    def test_utf8_record_boundary_is_bytes_with_exact4096_positive(self):
+        exact = ('é' * 2048).encode('utf-8')
+        self.assertEqual(len(exact), 4096)
+        self.assertEqual(ACCOUNTS.lines(exact + b'\n'), ['é' * 2048])
+        with self.assertRaisesRegex(ValueError, 'bounds'): ACCOUNTS.lines(exact + b'x\n')
+
+    def test_raw_lf_count_includes_comments_and_empty_records(self):
+        self.assertEqual(ACCOUNTS.lines(b'# comment\n' * ACCOUNTS.RECORD_LIMIT), [])
+        self.assertEqual(ACCOUNTS.lines(b'\n' * ACCOUNTS.RECORD_LIMIT), [])
+        for data in (b'# comment\n' * ACCOUNTS.RECORD_LIMIT + b'\n', b'\n' * ACCOUNTS.RECORD_LIMIT + b'# comment\n'):
+            with self.assertRaisesRegex(ValueError, 'bounds'): ACCOUNTS.lines(data)
+
+    def test_every_c1_control_refuses_without_unicode_record_reinterpretation(self):
+        for value in range(0x80, 0xa0):
+            data = tables(True)
+            data['passwd'] = data['passwd'].replace(b'private-gecos-not-output', ('ordinary' + chr(value) + 'gecos').encode('utf-8'))
+            with self.subTest(codepoint=value), self.assertRaises(ValueError): ACCOUNTS.classify(data)
+
+    def test_benign_utf8_gecos_and_comments_preserve_matching_record(self):
+        proof = ACCOUNTS.classify(benign_utf8_tables())
+        self.assertEqual(proof['local_status'], 'present')
+        self.assertNotIn('Zoë', json.dumps(proof, ensure_ascii=False))
 
 
 class SSHAccountSnapshotTests(unittest.TestCase):
@@ -245,6 +327,66 @@ class SSHAccountSnapshotTests(unittest.TestCase):
         def failed(fd): original(fd); raise OSError('delivered close error')
         with mock.patch.object(ACCOUNTS.os, 'close', side_effect=failed), self.assertRaisesRegex(OSError, 'close error'):
             ACCOUNTS.observe()
+
+    def write_tables(self, data):
+        for name, body in data.items():
+            path = self.root / 'etc' / name; path.write_bytes(body); path.chmod(0o644)
+
+    def private_cli(self):
+        # Only ancestry/owner delivery changes; main and parser are production.
+        code = ("import importlib.util,os; s=importlib.util.spec_from_file_location('a'," + repr(str(ROOT / 'SSH/accounts.py'))
+                + "); a=importlib.util.module_from_spec(s); s.loader.exec_module(a); a.TRUSTED_UID=os.geteuid(); "
+                + "a.root_open=lambda: os.open(" + repr(str(self.root))
+                + ",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC); raise SystemExit(a.main())")
+        return subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, timeout=10)
+
+    def test_real_private_snapshots_refuse_all_separator_injections(self):
+        for kind in ('passwd', 'group', 'shells'):
+            for separator in UNICODE_SEPARATORS:
+                self.write_tables(injected_tables(kind, separator))
+                before = {name: ACCOUNTS.identity((self.root / 'etc' / name).stat()) for name in tables()}
+                with self.subTest(kind=kind, separator=ord(separator)), self.assertRaises(ValueError): ACCOUNTS.observe()
+                self.assertEqual({name: ACCOUNTS.identity((self.root / 'etc' / name).stat()) for name in tables()}, before)
+
+    def test_real_private_snapshots_refuse_overlong_raw_lf_records(self):
+        for kind in ('passwd', 'group', 'shells'):
+            for separator in UNICODE_SEPARATORS:
+                self.write_tables(overlong_tables(kind, separator))
+                with self.subTest(kind=kind, separator=ord(separator)), self.assertRaisesRegex(ValueError, 'bounds'):
+                    ACCOUNTS.observe()
+
+    def test_private_cli_all_separator_injections_refuse75_without_json(self):
+        for kind in ('passwd', 'group', 'shells'):
+            for separator in UNICODE_SEPARATORS:
+                self.write_tables(injected_tables(kind, separator))
+                before = {name: (self.root / 'etc' / name).read_bytes() for name in tables()}
+                result = self.private_cli()
+                with self.subTest(kind=kind, separator=ord(separator)):
+                    self.assertEqual(result.returncode, 75); self.assertEqual(result.stdout, b'')
+                    self.assertEqual(result.stderr, b'SSH local account observation refused\n')
+                self.assertEqual({name: (self.root / 'etc' / name).read_bytes() for name in tables()}, before)
+
+    def test_private_cli_overlong_raw_lf_records_refuse75_without_json(self):
+        for kind in ('passwd', 'group', 'shells'):
+            for separator in UNICODE_SEPARATORS:
+                self.write_tables(overlong_tables(kind, separator))
+                result = self.private_cli()
+                with self.subTest(kind=kind, separator=ord(separator)):
+                    self.assertEqual(result.returncode, 75); self.assertEqual(result.stdout, b'')
+                    self.assertEqual(result.stderr, b'SSH local account observation refused\n')
+
+    def test_private_snapshot_benign_utf8_gecos_and_comments_remain_valid(self):
+        self.write_tables(benign_utf8_tables()); proof = ACCOUNTS.observe()
+        self.assertEqual(proof['local_status'], 'present')
+        self.assertTrue(all(flag is False for flag in proof['authority'].values()))
+        self.assertNotIn('Zoë', json.dumps(proof, ensure_ascii=False))
+
+    def test_private_cli_benign_utf8_remains_valid_without_gecos_output(self):
+        self.write_tables(benign_utf8_tables()); result = self.private_cli()
+        self.assertEqual(result.returncode, 0, result.stderr); self.assertEqual(result.stderr, b'')
+        proof = json.loads(result.stdout); self.assertEqual(proof['local_status'], 'present')
+        self.assertTrue(all(flag is False for flag in proof['authority'].values()))
+        self.assertNotIn('Zoë'.encode('utf-8'), result.stdout)
 
 
 class NativeSSHAccountTests(unittest.TestCase):
