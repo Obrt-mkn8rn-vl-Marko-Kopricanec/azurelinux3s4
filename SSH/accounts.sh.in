@@ -1,0 +1,6 @@
+s4_inspect_ssh_account() {
+    # Fixed public local records only; no identity creation or NSS/PAM operation.
+    timeout --kill-after=5s 30s python3 -I - <<'PY'
+# @s4-include SSH/accounts.py
+PY
+}

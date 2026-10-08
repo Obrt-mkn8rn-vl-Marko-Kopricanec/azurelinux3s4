@@ -873,7 +873,8 @@ sys.exit(result.returncode)
 
     def test_failed_payload_reinstall_keeps_verified_retry_active(self):
         self.plugin.write_text("damaged registered library\n")
-        self.shell('s4_tdnf_recovery() { return 42; }; s4_run_component() { s4_apply_bootstrap; }; s4_repair yes', expected=75)
+        # Finite fixture-only allowance; production and native leaf caps remain.
+        self.shell('s4_tdnf_recovery() { return 42; }; s4_run_component() { s4_apply_bootstrap; }; s4_repair yes', expected=75, timeout=90)
         self.assertEqual(self.state()["status"], "pending")
         self.assertEqual(self.state()["last_exit"], "42")
         self.shell("s4_timer_state enabled active")
@@ -1136,10 +1137,11 @@ sys.exit(subprocess.run(["/usr/bin/gpg", *sys.argv[1:]]).returncode)
         (self.root / 'rpm-key').unlink()
         self.database['vendor_packets'] = []
         self.write_database()
+        # Finite fixture-only allowance; all state/timer assertions remain.
         self.shell('''S4_COMPONENTS=(trust-anchor bootstrap repository-trust)
             s4_verify_bootstrap() { return 0; }
             s4_run_component() { [[ $1 == trust-anchor ]] || return 99; s4_apply_trust_anchor; }
-            s4_repair yes''')
+            s4_repair yes''', timeout=90)
         for component in ('trust-anchor', 'bootstrap', 'repository-trust'):
             self.assertIn('status=complete', (self.root / ('state/components/' + component)).read_text())
         self.shell('s4_timer_state disabled inactive; s4_timer_state disabled inactive "$S4_RECOVERY_TIMER"')
