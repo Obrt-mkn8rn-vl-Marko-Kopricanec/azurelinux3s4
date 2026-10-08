@@ -298,6 +298,8 @@ try:
                stat.S_ISDIR(entry["mode"]))
 
     boot_budget = boot_work_budget(files)
+    initramfs_before = None
+    existing_initramfs = initramfs_budget()
     if boot_budget["images"]:
         boot_fd, boot_signature = resolve("/boot")
         try:
@@ -309,6 +311,8 @@ try:
             if len(observations) > 32768:
                 raise ValueError("boot-work destination parent count exceeds its bound")
             boot_volume = volume(boot_fd)
+            initramfs_before = initramfs_scan(boot_fd)
+            existing_initramfs = initramfs_budget(initramfs_before)
             allocation = boot_volume["initial"]["allocation"]
             rounded = ((boot_budget["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
             charged = rounded + 2 * allocation * boot_budget["minimum_work_inodes"]
@@ -316,10 +320,16 @@ try:
             boot_volume["required_inodes"] += boot_budget["minimum_work_inodes"]
             boot_budget.update(filesystem_device=boot_volume["device"],
                                charged_bytes=charged, boot_directory_observed=True)
+            extra = ((existing_initramfs["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
+            extra += 2 * allocation * existing_initramfs["minimum_work_inodes"]
+            boot_volume["required_bytes"] += extra
+            boot_volume["required_inodes"] += existing_initramfs["minimum_work_inodes"]
+            existing_initramfs.update(filesystem_device=boot_volume["device"], charged_bytes=extra)
         finally:
             os.close(boot_fd)
     else:
         boot_budget.update(filesystem_device=None, charged_bytes=0, boot_directory_observed=False)
+        existing_initramfs.update(filesystem_device=None, charged_bytes=0)
 
     def database_scan():
         fd, signature = resolve(database)
@@ -374,6 +384,14 @@ try:
         finally:
             os.close(fd)
     _, db_after = database_scan()
+    if initramfs_before is not None:
+        fd, signature = resolve("/boot")
+        try:
+            if signature != observations["/boot"] or initramfs_scan(fd) != initramfs_before:
+                raise ValueError("existing initramfs namespace changed during capacity observation")
+            volume(fd)
+        finally:
+            os.close(fd)
     if db_after != db_before or Path("/proc/self/mountinfo").read_bytes() != mount_data:
         raise ValueError("database or mount layout changed during capacity observation")
     results = []
@@ -398,6 +416,7 @@ try:
     proof["payload_capacity_checked"] = True
     proof["capacity_observation"] = {"filesystems": sorted(results, key=lambda item: item["device"]),
         "boot_work_budget": boot_budget,
+        "existing_initramfs_work": existing_initramfs,
         "inventory_sha256": receipt["sha256"], "skipped_ghost_entries": skipped_ghosts,
         "policy": "two gross incoming copies plus per-entry metadata; no removal/hardlink credit; database reserve; five-percent or fixed headroom",
         "space_reserved": False, "scripts_capacity_checked": False, "rollback_capacity_checked": False,

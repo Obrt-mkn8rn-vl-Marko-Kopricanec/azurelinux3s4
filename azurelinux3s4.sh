@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.33.0
+S4_VERSION=0.34.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -1597,6 +1597,76 @@ def boot_work_budget(files):
             'generated_image_size_bounded', 'space_reserved', 'complete_boot_capacity_checked',
             'rollback_capacity_checked', 'installation_authorized', 'reboot_authorized', 'server_ready')},
     }
+"""Conditional existing-initramfs metadata forecast; never read image contents."""
+
+
+def initramfs_metadata(observed):
+    return (*identity(observed), observed.st_nlink, observed.st_size,
+            observed.st_blocks, observed.st_mtime_ns, observed.st_ctime_ns)
+
+
+def initramfs_scan(directory):
+    before = os.fstat(directory)
+    trusted(before)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError('initramfs observation requires a protected directory')
+    rows, count, total = [], 0, 0
+    # scandir is incremental: bound all entries before selecting image names.
+    # Do not use cached DirEntry metadata or open image contents.
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            count += 1
+            if count > 4096:
+                raise ValueError('initramfs directory entry count exceeds its bound')
+            name = entry.name
+            if not (name.startswith('initramfs-') and name.endswith('.img')):
+                continue
+            if not re.fullmatch(r'initramfs-[A-Za-z0-9][A-Za-z0-9._+~\-]{0,199}\.img', name):
+                raise ValueError('initramfs image name is outside the supported ASCII profile')
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            trusted(observed)
+            if (not stat.S_ISREG(observed.st_mode) or observed.st_mode & 0o7000
+                    or observed.st_nlink != 1 or not 0 < observed.st_size <= 2 * 1024 ** 3
+                    or observed.st_blocks < 0 or observed.st_blocks * 512 > 2 * 1024 ** 3):
+                raise ValueError('initramfs image is not a bounded ordinary single-linked file')
+            descriptor = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            try:
+                if (initramfs_metadata(os.fstat(descriptor)) != initramfs_metadata(observed)
+                        or mount_id(descriptor) != mount_id(directory)
+                        or initramfs_metadata(os.stat(name, dir_fd=directory, follow_symlinks=False))
+                           != initramfs_metadata(observed)
+                        or initramfs_metadata(os.fstat(descriptor)) != initramfs_metadata(observed)):
+                    raise ValueError('initramfs image changed or crosses a mount')
+            finally:
+                os.close(descriptor)
+            basis = max(observed.st_size, observed.st_blocks * 512)
+            total += basis
+            if len(rows) >= 128 or total > 16 * 1024 ** 3:
+                raise ValueError('initramfs image count or allocation exceeds its bound')
+            rows.append({'path': '/boot/' + name, 'metadata': list(initramfs_metadata(observed)),
+                         'logical_bytes': observed.st_size, 'allocated_bytes': observed.st_blocks * 512,
+                         'forecast_basis_bytes': basis})
+    if initramfs_metadata(os.fstat(directory)) != initramfs_metadata(before):
+        raise ValueError('initramfs directory changed during observation')
+    return {'directory_metadata': list(initramfs_metadata(before)),
+            'entries': sorted(rows, key=lambda row: row['path'])}
+
+
+def initramfs_budget(observation=None):
+    rows = observation['entries'] if observation is not None else []
+    return {
+        'schema': 1, 'observation_performed': observation is not None, 'images': rows,
+        'observation_sha256': hashlib.sha256(json.dumps(observation, sort_keys=True,
+            separators=(',', ':')).encode('ascii')).hexdigest() if observation is not None else None,
+        'minimum_work_bytes': sum(128 * 1024 ** 2 + 2 * row['forecast_basis_bytes'] for row in rows),
+        'minimum_work_inodes': 8 * len(rows),
+        'policy': 'supplemental 128MiB plus twice max(logical bytes, allocated 512-byte blocks) and eight inodes per observed image',
+        'scope': 'direct supported /boot/initramfs-*.img metadata ONLY, conditional on incoming named kernel-image declarations; no content read or trigger selection',
+        **{key: False for key in ('image_contents_read', 'images_authenticated',
+            'all_installed_kernels_accounted', 'regeneration_selection_complete', 'generated_image_size_bounded',
+            'space_reserved', 'complete_boot_capacity_checked', 'rollback_capacity_checked',
+            'installation_authorized', 'reboot_authorized', 'server_ready')},
+    }
 import hashlib
 import json
 import os
@@ -1897,6 +1967,8 @@ try:
                stat.S_ISDIR(entry["mode"]))
 
     boot_budget = boot_work_budget(files)
+    initramfs_before = None
+    existing_initramfs = initramfs_budget()
     if boot_budget["images"]:
         boot_fd, boot_signature = resolve("/boot")
         try:
@@ -1908,6 +1980,8 @@ try:
             if len(observations) > 32768:
                 raise ValueError("boot-work destination parent count exceeds its bound")
             boot_volume = volume(boot_fd)
+            initramfs_before = initramfs_scan(boot_fd)
+            existing_initramfs = initramfs_budget(initramfs_before)
             allocation = boot_volume["initial"]["allocation"]
             rounded = ((boot_budget["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
             charged = rounded + 2 * allocation * boot_budget["minimum_work_inodes"]
@@ -1915,10 +1989,16 @@ try:
             boot_volume["required_inodes"] += boot_budget["minimum_work_inodes"]
             boot_budget.update(filesystem_device=boot_volume["device"],
                                charged_bytes=charged, boot_directory_observed=True)
+            extra = ((existing_initramfs["minimum_work_bytes"] + allocation - 1) // allocation) * allocation
+            extra += 2 * allocation * existing_initramfs["minimum_work_inodes"]
+            boot_volume["required_bytes"] += extra
+            boot_volume["required_inodes"] += existing_initramfs["minimum_work_inodes"]
+            existing_initramfs.update(filesystem_device=boot_volume["device"], charged_bytes=extra)
         finally:
             os.close(boot_fd)
     else:
         boot_budget.update(filesystem_device=None, charged_bytes=0, boot_directory_observed=False)
+        existing_initramfs.update(filesystem_device=None, charged_bytes=0)
 
     def database_scan():
         fd, signature = resolve(database)
@@ -1973,6 +2053,14 @@ try:
         finally:
             os.close(fd)
     _, db_after = database_scan()
+    if initramfs_before is not None:
+        fd, signature = resolve("/boot")
+        try:
+            if signature != observations["/boot"] or initramfs_scan(fd) != initramfs_before:
+                raise ValueError("existing initramfs namespace changed during capacity observation")
+            volume(fd)
+        finally:
+            os.close(fd)
     if db_after != db_before or Path("/proc/self/mountinfo").read_bytes() != mount_data:
         raise ValueError("database or mount layout changed during capacity observation")
     results = []
@@ -1997,6 +2085,7 @@ try:
     proof["payload_capacity_checked"] = True
     proof["capacity_observation"] = {"filesystems": sorted(results, key=lambda item: item["device"]),
         "boot_work_budget": boot_budget,
+        "existing_initramfs_work": existing_initramfs,
         "inventory_sha256": receipt["sha256"], "skipped_ghost_entries": skipped_ghosts,
         "policy": "two gross incoming copies plus per-entry metadata; no removal/hardlink credit; database reserve; five-percent or fixed headroom",
         "space_reserved": False, "scripts_capacity_checked": False, "rollback_capacity_checked": False,

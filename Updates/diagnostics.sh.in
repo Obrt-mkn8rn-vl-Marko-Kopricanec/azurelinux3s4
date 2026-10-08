@@ -20,6 +20,7 @@ s4_update_capacity_program() {
     # Observe advertised capacity only; scripts/rollback and reservation remain unproved.
     cat <<'PY'
 # @s4-include Updates/boot_budget.py
+# @s4-include Updates/initramfs.py
 # @s4-include Updates/capacity.py
 PY
 }

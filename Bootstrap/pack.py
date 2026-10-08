@@ -40,6 +40,7 @@ PAYLOADS = {
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",
     "Updates/boot_budget.py": "PY",
+    "Updates/initramfs.py": "PY",
     "Updates/interpreters.py": "PY",
     "Updates/interpreter_paths.py": "PY",
     "Updates/kernel_layout.py": "PY",
