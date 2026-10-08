@@ -44,8 +44,9 @@ __name__ = 's4_removal_guard_library'
 # @s4-include Updates/removals.py
 # @s4-include Updates/versions.py
 # @s4-include Updates/floors.py
+# @s4-include Updates/kernel_paths.py
 if version_execution:
-    raise SystemExit(version_main(observe, floor_observe))
+    raise SystemExit(version_main(observe, kernel_paths))
 PY
 }
 

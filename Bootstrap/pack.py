@@ -45,6 +45,7 @@ PAYLOADS = {
     "Updates/removals.py": "PY",
     "Updates/versions.py": "PY",
     "Updates/floors.py": "PY",
+    "Updates/kernel_paths.py": "PY",
     "Web/policy.py": "PY",
     "SSH/policy.py": "PY",
     "SSH/service.py": "PY",
