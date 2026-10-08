@@ -226,7 +226,7 @@ class ProvidesPrivateTests(unittest.TestCase):
     def test_owned_private_snapshot_binds_all_five_receipts_and_is_preserved(self):
         material = self.path.read_bytes(); proof = json.loads(self.run_guard().stdout)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation', 'provider_match_observation'):
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation'):
             self.assertEqual(proof[name]['input_sha256'], hashlib.sha256(material).hexdigest())
         self.assertEqual(self.path.read_bytes(), material)
 
@@ -297,7 +297,7 @@ class ProvidesPipelineTests(unittest.TestCase):
         self.assertEqual(proof['effects']['removals'][0]['provides'], proof['effects']['installed_provides'][0]['provides'])
         original = copy.deepcopy(proof)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation', 'provider_match_observation'): original.pop(name)
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation'): original.pop(name)
         self.assertEqual(receipt['input_sha256'], hashlib.sha256((json.dumps(original, sort_keys=True) + '\n').encode()).hexdigest())
         self.assertFalse(receipt['package_trigger_matches_observed']); self.assertFalse(proof['installation_authorized'])
         self.assertIn('run 1', self.native_calls()); self.assertEqual((self.root / 'state/updates/current.json').read_bytes(), pointer)
@@ -342,7 +342,7 @@ class ProvidesPipelineTests(unittest.TestCase):
     def test_missing_projection_delivery_refuses_after_fresh_test_despite_stale_receipt(self):
         self.prepare(); pointer = (self.root / 'state/updates/current.json').read_bytes()
         delivered = triggers.emitted().replace('C.CDLL("librpm.so.9",', 'C.CDLL(' + repr(str(self.library)) + ',')
-        ending = "if trigger_execution:\n    raise SystemExit(trigger_main(provider_observe))\n"
+        ending = "if trigger_execution:\n    raise SystemExit(trigger_main(trigger_source_observe))\n"
         self.assertTrue(delivered.endswith(ending))
         # Explicit private parent-delivery MODEL: the actual guard sees a
         # missing source projection after the completed unchanged native TEST.

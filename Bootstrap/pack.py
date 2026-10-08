@@ -42,6 +42,7 @@ PAYLOADS = {
     "Updates/trigger_ranges.py": "PY",
     "Updates/provides.py": "PY",
     "Updates/provider_matches.py": "PY",
+    "Updates/trigger_sources.py": "PY",
     "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",
