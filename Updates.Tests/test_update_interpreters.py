@@ -14,6 +14,7 @@ from unittest.mock import patch
 import test_update_effects as effects
 import test_update_compatibility as compatibility
 import test_update_staging as staging
+import test_update_capacity as capacity
 
 
 SOURCE = Path(__file__).resolve().parents[1] / 'azurelinux3s4.sh'
@@ -315,9 +316,14 @@ void *headerExport(void *h,unsigned *size) {
     return result;
 }
 '''
+# Reuse the accepted finite file-array ABI MODEL; not vendor header semantics.
+LIBRARY += capacity.CAPACITY_LIBRARY[capacity.CAPACITY_LIBRARY.index('typedef struct { int index, count; } FI;'):]
+
 
 
 class UpdateInterpreterIntegrationTests(unittest.TestCase):
+    # Owned RAM-backed model workspace; not installed-disk durability evidence.
+    temporary_parent = compatibility.admission.protected_model_parent()
     command = compatibility.UpdateCompatibilityTests.command
     configure = compatibility.UpdateCompatibilityTests.configure
     calls = compatibility.UpdateCompatibilityTests.calls
@@ -334,7 +340,7 @@ class UpdateInterpreterIntegrationTests(unittest.TestCase):
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(cls.library)],
                        input=LIBRARY, text=True, capture_output=True, check=True)
 
-    def shell(self, body='s4_check_update_interpreters', expected=0, timeout=45):
+    def shell(self, body='s4_check_update_interpreters', expected=0, timeout=90):
         return staging.UpdateStagingTests.shell(self, body, expected, timeout)
 
     def test_fresh_admission_test_and_real_host_shell_observation_are_bound_without_execution(self):

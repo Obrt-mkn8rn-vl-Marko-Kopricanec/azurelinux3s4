@@ -228,6 +228,7 @@ def observe(proof):
                             raise ValueError("interpreter bytes exceed the aggregate bound")
                         receipts[command] = receipt
                         files[command] = {"path": command, "resolved_path": receipt[0], "bytes": size,
+                                          "lookup_paths": sorted({command, receipt[0], *(row[0] for row in receipt[2])}),
                                           "sha256": digest.hexdigest(), "device": before.st_dev,
                                           "inode": before.st_ino, "mode": before.st_mode, "uid": before.st_uid,
                                           "mount_id": receipt[2][-1][2], "mount_noexec": False}
@@ -252,7 +253,7 @@ def observe(proof):
     return proof
 
 
-def main():
+def main(path_guard=None):
     try:
         resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CPU, (240, 245))
@@ -268,7 +269,11 @@ def main():
             data = stream.read(32 * 1024 * 1024 + 1)
             if identity(os.fstat(stream.fileno())) != identity(before) or len(data) != before.st_size:
                 raise ValueError("interpreter proof changed during reading")
-        encoded = json.dumps(observe(json.loads(data)), sort_keys=True)
+        proof = observe(json.loads(data))
+        if path_guard is not None:
+            proof = path_guard(proof)
+            proof["interpreter_path_correspondence"]["input_sha256"] = hashlib.sha256(data).hexdigest()
+        encoded = json.dumps(proof, sort_keys=True)
         if len(encoded.encode("utf-8")) > 64 * 1024 * 1024:
             raise ValueError("interpreter observations exceed their output bound")
         print(encoded)

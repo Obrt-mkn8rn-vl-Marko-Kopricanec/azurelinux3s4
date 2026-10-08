@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.29.0
+S4_VERSION=0.30.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -1061,9 +1061,10 @@ import sys
 
 try:
     root, database, architecture = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-    if sys.argv[4:] not in ([], ["capacity"], ["effects"]):
+    if sys.argv[4:] not in ([], ["capacity"], ["effects"], ["interpreter-paths"]):
         raise ValueError("unsupported RPM diagnostic mode")
-    capacity, effects = sys.argv[4:] == ["capacity"], sys.argv[4:] == ["effects"]
+    capacity, effects = sys.argv[4:] == ["capacity"], sys.argv[4:] in (["effects"], ["interpreter-paths"])
+    path_context = sys.argv[4:] == ["interpreter-paths"]
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
     if (any(int(status[name].strip(), 16) for name in ("CapEff", "CapPrm", "CapBnd", "CapAmb"))
             or status["NoNewPrivs"].strip() != "1"):
@@ -1157,7 +1158,7 @@ try:
     if effects:
         api["rpmteDBInstance"] = bind("rpmteDBInstance", unsigned, pointer)
         api["headerGetAsString"] = bind("headerGetAsString", pointer, pointer, integer)
-    if capacity:
+    if capacity or path_context:
         extra = {
             "rpmfiNew": (pointer, pointer, pointer, integer, unsigned),
             "rpmfiFree": (pointer, pointer), "rpmfiInit": (pointer, pointer, integer),
@@ -1275,7 +1276,8 @@ try:
     install_only = {b"kernel", b"kernel-mshv", b"kernel-uvm", b"kernel-uki", b"kernel-64k", b"kernel-hwe"}
     additions, removals = [], []
     pretrans = {}
-    inventory, file_total, header_total, payload_total = [], 0, 0, 0
+    inventory, path_incoming, path_removed = [], [], []
+    file_total, header_total, payload_total = 0, 0, 0
     def tag_info(header, tag):
         td = api["rpmtdNew"]()
         if not td:
@@ -1288,7 +1290,7 @@ try:
         finally:
             api["rpmtdFreeData"](td)
             api["rpmtdFree"](td)
-    def payload(header, index):
+    def payload(header, index, owner=None):
         global file_total, header_total, payload_total
         fi, material = None, None
         try:
@@ -1350,13 +1352,42 @@ try:
                               "flags": flags, "link": link.decode("utf-8") if link else ""})
             if api["rpmfiNext"](fi) != -1:
                 raise ValueError("signed file inventory has unexpected trailing entries")
-            inventory.append({"file": records[index]["file"], "sha256": records[index]["sha256"],
-                              "bytes": records[index]["bytes"], "header_bytes": size.value, "files": files})
+            if owner is None:
+                inventory.append({"file": records[index]["file"], "sha256": records[index]["sha256"],
+                                  "bytes": records[index]["bytes"], "header_bytes": size.value, "files": files})
+            else:
+                if (size.value != owner["header_bytes"]
+                        or hashlib.sha256(C.string_at(material, size.value)).hexdigest() != owner["header_sha256"]):
+                    raise ValueError("interpreter namespace header differs from the observed owner")
+                fields = ("name", "nevra", "header_bytes", "header_sha256", "instance") if index is None else (
+                    "name", "nevra", "header_bytes", "header_sha256", "file", "sha256", "bytes")
+                value = {**{name: owner[name] for name in fields}, "files": files}
+                (path_removed if index is None else path_incoming).append(value)
         finally:
             if material:
                 libc.free(material)
             if fi:
                 api["rpmfiFree"](fi)
+    def removed_payload(owner):
+        # rpmteHeader is not populated at this pre-execution point. Read the
+        # actual database instance, retaining the iterator's weak header until
+        # its identity/export digest and file declarations have been checked.
+        instance, iterator = unsigned(owner["instance"]), None
+        try:
+            iterator = api["rpmtsInitIterator"](ts, 0, C.byref(instance), C.sizeof(instance))
+            if not iterator:
+                raise ValueError("interpreter removal header iterator is unavailable")
+            header = api["rpmdbNextIterator"](iterator)
+            if (not header or api["rpmdbGetIteratorOffset"](iterator) != instance.value
+                    or effect_identity(header) != {name: owner[name] for name in ("name", "nevra")}):
+                raise ValueError("interpreter removal header differs from its observed instance")
+            payload(header, None, owner)
+            if api["rpmdbNextIterator"](iterator):
+                raise ValueError("interpreter removal header query is ambiguous")
+            errors()
+        finally:
+            if iterator:
+                api["rpmdbFreeIterator"](iterator)
     opened, consumed, callback_errors = {}, set(), []
     callback_type = C.CFUNCTYPE(pointer, pointer, integer, C.c_uint64, C.c_uint64, pointer, pointer)
     @callback_type
@@ -1417,6 +1448,8 @@ try:
                     finally:
                         if exported:
                             libc.free(exported)
+                    if path_context:
+                        payload(header, index, incoming_effects[-1])
             finally:
                 if header:
                     api["headerFree"](header)
@@ -1463,6 +1496,8 @@ try:
                     removal_effects.append({**observed, "classification": "same-name-replacement"
                         if any(value["name"] == observed["name"] for value in incoming_effects)
                         else "other-removal"})
+                    if path_context:
+                        removed_payload(observed)
             else:
                 raise ValueError("native plan would remove a retained kernel or has an unknown element")
         if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
@@ -1516,6 +1551,11 @@ try:
             "trigger_selection_complete": False, "script_execution_plan_complete": False,
             "script_policy_satisfied": False, "removal_policy_satisfied": False,
             "rollback_policy_satisfied": False}
+    if path_context:
+        proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
+            "files": file_total, "scope": "declared native incoming/removal header file paths only",
+            "installed_headers_authenticated": False, "operation_selection_complete": False,
+            "snapshot_atomic": False, "installation_authorized": False}
     data = json.dumps(proof, sort_keys=True)
     if effects and len(data.encode("utf-8")) > 32 * 1024 * 1024:
         raise ValueError("effects report exceeds its output bound")
@@ -1923,6 +1963,8 @@ PY
 s4_update_interpreters_program() {
     # File observations only; no script/interpreter/Lua execution or selection.
     cat <<'PY'
+interpreter_execution = __name__ == '__main__'
+__name__ = 's4_interpreter_library'
 import hashlib
 import json
 import os
@@ -2153,6 +2195,7 @@ def observe(proof):
                             raise ValueError("interpreter bytes exceed the aggregate bound")
                         receipts[command] = receipt
                         files[command] = {"path": command, "resolved_path": receipt[0], "bytes": size,
+                                          "lookup_paths": sorted({command, receipt[0], *(row[0] for row in receipt[2])}),
                                           "sha256": digest.hexdigest(), "device": before.st_dev,
                                           "inode": before.st_ino, "mode": before.st_mode, "uid": before.st_uid,
                                           "mount_id": receipt[2][-1][2], "mount_noexec": False}
@@ -2177,7 +2220,7 @@ def observe(proof):
     return proof
 
 
-def main():
+def main(path_guard=None):
     try:
         resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CPU, (240, 245))
@@ -2193,7 +2236,11 @@ def main():
             data = stream.read(32 * 1024 * 1024 + 1)
             if identity(os.fstat(stream.fileno())) != identity(before) or len(data) != before.st_size:
                 raise ValueError("interpreter proof changed during reading")
-        encoded = json.dumps(observe(json.loads(data)), sort_keys=True)
+        proof = observe(json.loads(data))
+        if path_guard is not None:
+            proof = path_guard(proof)
+            proof["interpreter_path_correspondence"]["input_sha256"] = hashlib.sha256(data).hexdigest()
+        encoded = json.dumps(proof, sort_keys=True)
         if len(encoded.encode("utf-8")) > 64 * 1024 * 1024:
             raise ValueError("interpreter observations exceed their output bound")
         print(encoded)
@@ -2205,6 +2252,106 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+"""Literal declared transaction paths versus observed interpreter lookup paths."""
+
+
+INTERPRETER_PATH_LIMIT = 131072
+INTERPRETER_MATCH_LIMIT = 65536
+
+
+def interpreter_path_number(value, limit):
+    if type(value) is not int or not 0 <= value <= limit:
+        raise ValueError('interpreter path metadata integer is missing or excessive')
+    return value
+
+
+def interpreter_pathname(value):
+    return value if value == '/' else pathname(value)
+
+
+def interpreter_paths(proof):
+    source, observed = proof['namespace_inventory'], proof['interpreters']
+    if (not isinstance(source, dict) or type(source.get('schema')) is not int or source['schema'] != 1
+            or not isinstance(source.get('incoming'), list) or len(source['incoming']) > 128
+            or not isinstance(source.get('removals'), list) or len(source['removals']) > proof['baseline']['headers']
+            or any(source.get(name) is not False for name in ('installed_headers_authenticated',
+                'operation_selection_complete', 'snapshot_atomic', 'installation_authorized'))
+            or observed.get('schema') != 1 or observed.get('external_files_observed') is not True
+            or any(observed.get(name) is not False for name in ('runtime_files_authenticated', 'execution_tested',
+                'execution_policy_satisfied', 'trigger_selection_complete', 'installation_authorized'))
+            or not isinstance(observed.get('files'), list) or len(observed['files']) > 64):
+        raise ValueError('interpreter path correspondence lacks qualified current observations')
+    lookup, files = {}, set()
+    for entry in observed['files']:
+        command, resolved, paths = pathname(entry['path']), pathname(entry['resolved_path']), entry['lookup_paths']
+        if (command in files or not isinstance(paths, list) or not 1 <= len(paths) <= 1026
+                or paths != sorted(set(paths)) or command not in paths or resolved not in paths):
+            raise ValueError('interpreter lookup inventory is missing or inconsistent')
+        files.add(command)
+        for path in paths:
+            interpreter_pathname(path)
+            lookup.setdefault(path, []).append((command, 'declared' if path == command else
+                                               'resolved' if path == resolved else 'lookup-ancestor-or-link'))
+    hits, total, incoming_files, removed_instances = [], 0, set(), set()
+    for kind, records, owners in (('incoming', source['incoming'], proof['effects']['incoming']),
+                                 ('removal', source['removals'], proof['effects']['removals'])):
+        if len(records) != len(owners):
+            raise ValueError('interpreter namespace owner inventory differs from the current TEST')
+        fields = ('name', 'nevra', 'header_bytes', 'header_sha256') + (
+            ('file', 'sha256', 'bytes') if kind == 'incoming' else ('instance',))
+        for record, owner in zip(records, owners):
+            if (not isinstance(record, dict) or set(record) != {*fields, 'files'}
+                    or {name: record[name] for name in fields} != {name: owner[name] for name in fields}
+                    or not isinstance(record['files'], list)):
+                raise ValueError('interpreter namespace header/snapshot binding is inconsistent')
+            key = record['file'] if kind == 'incoming' else record['instance']
+            seen = incoming_files if kind == 'incoming' else removed_instances
+            if key in seen:
+                raise ValueError('interpreter namespace owner is repeated')
+            seen.add(key)
+            total += len(record['files'])
+            if total > INTERPRETER_PATH_LIMIT:
+                raise ValueError('interpreter declared path inventory exceeds its bound')
+            names = set()
+            binding = {name: record[name] for name in fields}
+            for item in record['files']:
+                if not isinstance(item, dict) or set(item) != {'path', 'bytes', 'mode', 'flags', 'link'}:
+                    raise ValueError('interpreter declared path record is malformed')
+                path = interpreter_pathname(item['path'])
+                if path in names:
+                    raise ValueError('interpreter declared path is repeated within a header')
+                names.add(path)
+                interpreter_path_number(item['bytes'], 16 * 1024**3)
+                mode = interpreter_path_number(item['mode'], 65535)
+                interpreter_path_number(item['flags'], 2**32 - 1)
+                if (not isinstance(item['link'], str) or len(item['link'].encode('utf-8')) > 4096
+                        or any(ord(value) < 32 or ord(value) == 127 for value in item['link'])
+                        or stat.S_ISLNK(mode) and not item['link']
+                        or not stat.S_ISLNK(mode) and item['link']):
+                    raise ValueError('interpreter declared link metadata is unsupported')
+                for command, relationship in lookup.get(path, []):
+                    hits.append({'source': kind, 'owner': binding, 'declaration': item,
+                                 'interpreter': command, 'relationship': relationship})
+                    if len(hits) > INTERPRETER_MATCH_LIMIT:
+                        raise ValueError('interpreter path correspondence exceeds its match bound')
+    if interpreter_path_number(source['files'], INTERPRETER_PATH_LIMIT) != total:
+        raise ValueError('interpreter declared file count differs from the complete inventory')
+    material = json.dumps(source, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if len(material) > 32 * 1024 * 1024:
+        raise ValueError('interpreter namespace inventory exceeds its byte bound')
+    proof['interpreter_path_correspondence'] = {
+        'schema': 1, 'matches': hits, 'declared_files': total, 'observed_interpreter_files': len(files),
+        'inventory_sha256': hashlib.sha256(material).hexdigest(),
+        'literal_path_correspondence_complete': True, 'potential_literal_path_changes': bool(hits),
+        'scope': 'literal declared incoming/removal paths versus requested/resolved/observed lookup paths ONLY',
+        **{name: False for name in ('installed_headers_authenticated', 'operation_selection_complete',
+            'alternate_aliases_checked', 'hardlink_effects_checked', 'future_interpreter_bytes_authenticated',
+            'transaction_order_complete', 'interpreter_transaction_continuity_proven', 'execution_policy_satisfied',
+            'snapshot_atomic', 'installation_authorized', 'scripts_executed', 'server_ready')},
+    }
+    return proof
+if interpreter_execution:
+    raise SystemExit(main(interpreter_paths))
 PY
 }
 
@@ -2715,7 +2862,11 @@ PY
         : >"$directory/test.py"
     fi
     s4_rpm_test_program >>"$directory/test.py" || return 75
-    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$S4_EFFECTS_MODE" <<'PY'
+    local native_effects_mode=$S4_EFFECTS_MODE
+    if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+        native_effects_mode=interpreter-paths
+    fi
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$native_effects_mode" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -2725,8 +2876,9 @@ import sys
 try:
     root = Path(sys.argv[1])
     capacity = sys.argv[4] == "yes"
-    effects = sys.argv[5] == "yes"
-    if sys.argv[4] not in ("", "yes") or sys.argv[5] not in ("", "yes") or (capacity and effects):
+    effects = sys.argv[5] in ("yes", "interpreter-paths")
+    path_context = sys.argv[5] == "interpreter-paths"
+    if sys.argv[4] not in ("", "yes") or sys.argv[5] not in ("", "yes", "interpreter-paths") or (capacity and effects):
         raise ValueError("unsupported internal diagnostic mode")
     output_limit = 32 * 1024 * 1024 if capacity or effects else 1048576
     evidence_limit = 32 * 1024 * 1024 if effects else 1048576
@@ -2746,7 +2898,7 @@ try:
         "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH",
         "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
         "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root),
-        *sys.argv[2:4], *(["capacity"] if capacity else ["effects"] if effects else [])]
+        *sys.argv[2:4], *(["capacity"] if capacity else ["interpreter-paths"] if path_context else ["effects"] if effects else [])]
     def limits():
         resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     with (root / "native.log").open("xb") as output:
@@ -2782,6 +2934,15 @@ try:
                     "trigger_selection_complete", "script_execution_plan_complete", "script_policy_satisfied",
                     "removal_policy_satisfied", "rollback_policy_satisfied"))):
             raise ValueError("native effects evidence is incomplete")
+    if path_context:
+        declared = proof.get("namespace_inventory", {})
+        if (declared.get("schema") != 1 or not isinstance(declared.get("incoming"), list)
+                or not isinstance(declared.get("removals"), list)
+                or len(declared["incoming"]) != len(proof["additions"])
+                or len(declared["removals"]) != len(proof["removals"])
+                or any(declared.get(name) is not False for name in ("installed_headers_authenticated",
+                    "operation_selection_complete", "snapshot_atomic", "installation_authorized"))):
+            raise ValueError("native interpreter namespace evidence is incomplete")
     (root / "result.json").write_text(json.dumps(proof, sort_keys=True) + "\n")
 except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
     print("azurelinux3s4: update compatibility deferred: " + str(error), file=sys.stderr)

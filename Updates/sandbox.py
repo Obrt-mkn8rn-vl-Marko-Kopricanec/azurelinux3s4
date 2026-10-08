@@ -7,8 +7,9 @@ import sys
 try:
     root = Path(sys.argv[1])
     capacity = sys.argv[4] == "yes"
-    effects = sys.argv[5] == "yes"
-    if sys.argv[4] not in ("", "yes") or sys.argv[5] not in ("", "yes") or (capacity and effects):
+    effects = sys.argv[5] in ("yes", "interpreter-paths")
+    path_context = sys.argv[5] == "interpreter-paths"
+    if sys.argv[4] not in ("", "yes") or sys.argv[5] not in ("", "yes", "interpreter-paths") or (capacity and effects):
         raise ValueError("unsupported internal diagnostic mode")
     output_limit = 32 * 1024 * 1024 if capacity or effects else 1048576
     evidence_limit = 32 * 1024 * 1024 if effects else 1048576
@@ -28,7 +29,7 @@ try:
         "--property=UnsetEnvironment=RPM_CONFIGDIR RPM_POPTEXEC_PATH LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH",
         "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin", "--setenv=LC_ALL=C", "--setenv=LANG=C",
         "--setenv=HOME=" + str(root / "home"), "--", "python3", "-I", str(root / "test.py"), str(root),
-        *sys.argv[2:4], *(["capacity"] if capacity else ["effects"] if effects else [])]
+        *sys.argv[2:4], *(["capacity"] if capacity else ["interpreter-paths"] if path_context else ["effects"] if effects else [])]
     def limits():
         resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     with (root / "native.log").open("xb") as output:
@@ -64,6 +65,15 @@ try:
                     "trigger_selection_complete", "script_execution_plan_complete", "script_policy_satisfied",
                     "removal_policy_satisfied", "rollback_policy_satisfied"))):
             raise ValueError("native effects evidence is incomplete")
+    if path_context:
+        declared = proof.get("namespace_inventory", {})
+        if (declared.get("schema") != 1 or not isinstance(declared.get("incoming"), list)
+                or not isinstance(declared.get("removals"), list)
+                or len(declared["incoming"]) != len(proof["additions"])
+                or len(declared["removals"]) != len(proof["removals"])
+                or any(declared.get(name) is not False for name in ("installed_headers_authenticated",
+                    "operation_selection_complete", "snapshot_atomic", "installation_authorized"))):
+            raise ValueError("native interpreter namespace evidence is incomplete")
     (root / "result.json").write_text(json.dumps(proof, sort_keys=True) + "\n")
 except (ValueError, KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
     print("azurelinux3s4: update compatibility deferred: " + str(error), file=sys.stderr)

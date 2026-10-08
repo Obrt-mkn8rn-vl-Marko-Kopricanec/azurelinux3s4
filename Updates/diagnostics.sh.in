@@ -26,7 +26,12 @@ PY
 s4_update_interpreters_program() {
     # File observations only; no script/interpreter/Lua execution or selection.
     cat <<'PY'
+interpreter_execution = __name__ == '__main__'
+__name__ = 's4_interpreter_library'
 # @s4-include Updates/interpreters.py
+# @s4-include Updates/interpreter_paths.py
+if interpreter_execution:
+    raise SystemExit(main(interpreter_paths))
 PY
 }
 
@@ -82,7 +87,11 @@ PY
         : >"$directory/test.py"
     fi
     s4_rpm_test_program >>"$directory/test.py" || return 75
-    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$S4_EFFECTS_MODE" <<'PY'
+    local native_effects_mode=$S4_EFFECTS_MODE
+    if [[ $S4_INTERPRETERS_MODE == yes ]]; then
+        native_effects_mode=interpreter-paths
+    fi
+    if timeout --signal=TERM --kill-after=30s 15m python3 -I - "$directory" "$database" "$S4_ARCH" "$S4_CAPACITY_MODE" "$native_effects_mode" <<'PY'
 # @s4-include Updates/sandbox.py
 PY
     then

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import socket
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -14,11 +15,24 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'azurelinux3s4.sh'
 KEY = SCRIPT.parent / 'Trust/vendor-key.asc'
 
 
+def protected_model_parent():
+    # Optional existing RAM directory, never a mount/account/permission change.
+    candidate = Path('/run/user') / str(os.geteuid())
+    try:
+        value = candidate.lstat()
+        if (stat.S_ISDIR(value.st_mode) and value.st_uid == os.geteuid() and not value.st_mode & 0o022
+                and not os.statvfs(candidate).f_flag & os.ST_NOEXEC):
+            return candidate
+    except OSError:
+        pass
+    return Path.home() / '.cache'
+
+
 class PackageAdmissionTests(unittest.TestCase):
     def setUp(self):
         previous = os.umask(0o077)
         self.addCleanup(os.umask, previous)
-        cache = Path.home() / '.cache'
+        cache = getattr(self, 'temporary_parent', Path.home() / '.cache')
         self.temporary = tempfile.TemporaryDirectory(prefix='azurelinux3s4-admission-', dir=cache)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)

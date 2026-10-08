@@ -9,9 +9,10 @@ import sys
 
 try:
     root, database, architecture = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-    if sys.argv[4:] not in ([], ["capacity"], ["effects"]):
+    if sys.argv[4:] not in ([], ["capacity"], ["effects"], ["interpreter-paths"]):
         raise ValueError("unsupported RPM diagnostic mode")
-    capacity, effects = sys.argv[4:] == ["capacity"], sys.argv[4:] == ["effects"]
+    capacity, effects = sys.argv[4:] == ["capacity"], sys.argv[4:] in (["effects"], ["interpreter-paths"])
+    path_context = sys.argv[4:] == ["interpreter-paths"]
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
     if (any(int(status[name].strip(), 16) for name in ("CapEff", "CapPrm", "CapBnd", "CapAmb"))
             or status["NoNewPrivs"].strip() != "1"):
@@ -105,7 +106,7 @@ try:
     if effects:
         api["rpmteDBInstance"] = bind("rpmteDBInstance", unsigned, pointer)
         api["headerGetAsString"] = bind("headerGetAsString", pointer, pointer, integer)
-    if capacity:
+    if capacity or path_context:
         extra = {
             "rpmfiNew": (pointer, pointer, pointer, integer, unsigned),
             "rpmfiFree": (pointer, pointer), "rpmfiInit": (pointer, pointer, integer),
@@ -223,7 +224,8 @@ try:
     install_only = {b"kernel", b"kernel-mshv", b"kernel-uvm", b"kernel-uki", b"kernel-64k", b"kernel-hwe"}
     additions, removals = [], []
     pretrans = {}
-    inventory, file_total, header_total, payload_total = [], 0, 0, 0
+    inventory, path_incoming, path_removed = [], [], []
+    file_total, header_total, payload_total = 0, 0, 0
     def tag_info(header, tag):
         td = api["rpmtdNew"]()
         if not td:
@@ -236,7 +238,7 @@ try:
         finally:
             api["rpmtdFreeData"](td)
             api["rpmtdFree"](td)
-    def payload(header, index):
+    def payload(header, index, owner=None):
         global file_total, header_total, payload_total
         fi, material = None, None
         try:
@@ -298,13 +300,42 @@ try:
                               "flags": flags, "link": link.decode("utf-8") if link else ""})
             if api["rpmfiNext"](fi) != -1:
                 raise ValueError("signed file inventory has unexpected trailing entries")
-            inventory.append({"file": records[index]["file"], "sha256": records[index]["sha256"],
-                              "bytes": records[index]["bytes"], "header_bytes": size.value, "files": files})
+            if owner is None:
+                inventory.append({"file": records[index]["file"], "sha256": records[index]["sha256"],
+                                  "bytes": records[index]["bytes"], "header_bytes": size.value, "files": files})
+            else:
+                if (size.value != owner["header_bytes"]
+                        or hashlib.sha256(C.string_at(material, size.value)).hexdigest() != owner["header_sha256"]):
+                    raise ValueError("interpreter namespace header differs from the observed owner")
+                fields = ("name", "nevra", "header_bytes", "header_sha256", "instance") if index is None else (
+                    "name", "nevra", "header_bytes", "header_sha256", "file", "sha256", "bytes")
+                value = {**{name: owner[name] for name in fields}, "files": files}
+                (path_removed if index is None else path_incoming).append(value)
         finally:
             if material:
                 libc.free(material)
             if fi:
                 api["rpmfiFree"](fi)
+    def removed_payload(owner):
+        # rpmteHeader is not populated at this pre-execution point. Read the
+        # actual database instance, retaining the iterator's weak header until
+        # its identity/export digest and file declarations have been checked.
+        instance, iterator = unsigned(owner["instance"]), None
+        try:
+            iterator = api["rpmtsInitIterator"](ts, 0, C.byref(instance), C.sizeof(instance))
+            if not iterator:
+                raise ValueError("interpreter removal header iterator is unavailable")
+            header = api["rpmdbNextIterator"](iterator)
+            if (not header or api["rpmdbGetIteratorOffset"](iterator) != instance.value
+                    or effect_identity(header) != {name: owner[name] for name in ("name", "nevra")}):
+                raise ValueError("interpreter removal header differs from its observed instance")
+            payload(header, None, owner)
+            if api["rpmdbNextIterator"](iterator):
+                raise ValueError("interpreter removal header query is ambiguous")
+            errors()
+        finally:
+            if iterator:
+                api["rpmdbFreeIterator"](iterator)
     opened, consumed, callback_errors = {}, set(), []
     callback_type = C.CFUNCTYPE(pointer, pointer, integer, C.c_uint64, C.c_uint64, pointer, pointer)
     @callback_type
@@ -365,6 +396,8 @@ try:
                     finally:
                         if exported:
                             libc.free(exported)
+                    if path_context:
+                        payload(header, index, incoming_effects[-1])
             finally:
                 if header:
                     api["headerFree"](header)
@@ -411,6 +444,8 @@ try:
                     removal_effects.append({**observed, "classification": "same-name-replacement"
                         if any(value["name"] == observed["name"] for value in incoming_effects)
                         else "other-removal"})
+                    if path_context:
+                        removed_payload(observed)
             else:
                 raise ValueError("native plan would remove a retained kernel or has an unknown element")
         if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
@@ -464,6 +499,11 @@ try:
             "trigger_selection_complete": False, "script_execution_plan_complete": False,
             "script_policy_satisfied": False, "removal_policy_satisfied": False,
             "rollback_policy_satisfied": False}
+    if path_context:
+        proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
+            "files": file_total, "scope": "declared native incoming/removal header file paths only",
+            "installed_headers_authenticated": False, "operation_selection_complete": False,
+            "snapshot_atomic": False, "installation_authorized": False}
     data = json.dumps(proof, sort_keys=True)
     if effects and len(data.encode("utf-8")) > 32 * 1024 * 1024:
         raise ValueError("effects report exceeds its output bound")
