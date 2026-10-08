@@ -176,6 +176,8 @@ try:
     def observe_effects(header, exported):
         global effects_bytes
         value = {**effect_identity(header), **audit_header(exported)}
+        if file_trigger_prefix_projection:
+            value["file_trigger_prefix_bytes"] = file_trigger_export(exported, value)
         effects_bytes += len(json.dumps(value, sort_keys=True).encode("utf-8"))
         # Retain at most 16MiB of metadata before plan/removal duplication;
         # the final 32MiB output cap is separate and positively checked.

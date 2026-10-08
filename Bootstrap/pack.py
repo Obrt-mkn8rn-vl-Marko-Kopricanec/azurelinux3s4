@@ -37,6 +37,7 @@ PAYLOADS = {
     "Updates/store.py": "PY",
     "Updates/effects.py": "PY",
     "Updates/triggers.py": "PY",
+    "Updates/trigger_prefixes.py": "PY",
     "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",

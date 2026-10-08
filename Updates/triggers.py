@@ -216,12 +216,15 @@ def trigger_pairs(pairs):
     return result
 
 
-def trigger_main():
+def trigger_main(after=None):
     try:
         resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024, 768 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CPU, (60, 65)); resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         material = trigger_private(Path(sys.argv[1]) / 'result.json')
         proof = trigger_observe(json.loads(material, object_pairs_hook=trigger_pairs))
+        if after is not None:
+            proof = after(proof)
+            proof['file_trigger_prefix_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         proof['trigger_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         output = json.dumps(proof, sort_keys=True)
         if len(output.encode('utf-8')) > TRIGGER_LIMIT:

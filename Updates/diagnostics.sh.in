@@ -4,6 +4,7 @@ s4_rpm_effects_program() {
     cat <<'PY'
 # @s4-include Updates/effects.py
 # @s4-include Updates/baselines.py
+# @s4-include Updates/trigger_prefixes.py
 PY
 }
 
@@ -20,7 +21,11 @@ s4_update_trigger_inputs_program() {
     # Use the same bounded tag catalog/inventory definitions; no script execution.
     s4_rpm_effects_program || return $?
     cat <<'PY'
+trigger_execution = __name__ == '__main__'
+__name__ = 's4_trigger_library'
 # @s4-include Updates/triggers.py
+if trigger_execution:
+    raise SystemExit(trigger_main(file_trigger_prefix_observe))
 PY
 }
 
@@ -95,6 +100,9 @@ PY
     if [[ $S4_EFFECTS_MODE == yes ]]; then
         [[ -z $S4_CAPACITY_MODE ]] || return 75
         s4_rpm_effects_program >"$directory/test.py" || return 75
+        if [[ -z $S4_INTERPRETERS_MODE && -z $S4_REMOVALS_MODE ]]; then
+            printf 'file_trigger_prefix_projection = True\n' >>"$directory/test.py" || return 75
+        fi
     else
         : >"$directory/test.py"
     fi
@@ -132,7 +140,7 @@ PY
     elif [[ $S4_INTERPRETERS_MODE == yes ]]; then
         s4_log 'Declared interpreter files observed; embedded Lua, loadability, dependencies and execution policy remain unproved.'
     elif [[ $S4_EFFECTS_MODE == yes ]]; then
-        s4_log 'Declared script metadata, trigger-array correspondence and removal identities observed; selection/execution policy remains unfinished.'
+        s4_log 'Declared script metadata, trigger-array correspondence, literal file prefixes and removal identities observed; selection/execution policy remains unfinished.'
     elif [[ $S4_CAPACITY_MODE == yes ]]; then
         s4_log 'Advertised payload capacity meets the signed-batch budget; scripts/rollback/installation remain unfinished.'
     else

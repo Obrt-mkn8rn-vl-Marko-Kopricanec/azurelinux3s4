@@ -20,6 +20,7 @@ MODULES = (
     "test_update_initramfs",
     "test_update_effects",
     "test_update_triggers",
+    "test_update_trigger_prefixes",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",
