@@ -1,4 +1,5 @@
 import copy
+import ast
 import ctypes as C
 import hashlib
 import json
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import test_update_effects as effects
 import test_update_provider_matches as providers
@@ -120,6 +122,117 @@ class HeaderInputNativeTests(unittest.TestCase):
         self.assertEqual(self.lib.headerModelImported(), 0)
 
 
+class HeaderInputCallerAliasTests(unittest.TestCase):
+    setUpClass = classmethod(HeaderInputNativeTests.setUpClass.__func__)
+    setUp = HeaderInputNativeTests.setUp
+    fixture = HeaderInputNativeTests.fixture
+
+    def delivered_observer(self):
+        for name in ('headerModelExportCreated', 'headerModelExportRetired', 'headerModelCallerFrees',
+                     'headerModelCallerDsFrees', 'headerModelCallerReads'):
+            getattr(self.lib, name).restype = C.c_uint; getattr(self.lib, name).argtypes = ()
+        self.lib.headerModelFree.restype = None; self.lib.headerModelFree.argtypes = (C.c_void_p,)
+        ordinary = self.namespace['C'].CDLL
+        buffers, caller_reads = [], []
+        def owned_buffer(*args):
+            value = C.create_string_buffer(*args); buffers.append(value); return value
+        def read(pointer, size):
+            if any(pointer == C.addressof(value) for value in buffers): caller_reads.append((pointer, size))
+            return C.string_at(pointer, size)
+        with patch.object(self.namespace['C'], 'CDLL', staticmethod(
+                lambda name, **options: ordinary(name, **options) if name else SimpleNamespace(free=self.lib.headerModelFree))), \
+                patch.object(self.namespace['C'], 'create_string_buffer', staticmethod(owned_buffer)), \
+                patch.object(self.namespace['C'], 'string_at', staticmethod(read)):
+            observer = self.namespace['header_input_native']()
+            yield observer, buffers, caller_reads
+
+    def audit(self, buffers, caller_reads, material):
+        self.assertEqual(len(buffers), 1); self.assertEqual(buffers[0].raw, material)
+        values = {name: getattr(self.lib, 'headerModel' + name)() for name in
+                  ('Imported', 'Retired', 'DsCreated', 'DsRetired', 'ExportCreated', 'ExportRetired',
+                   'CallerFrees', 'CallerDsFrees', 'CallerReads')}
+        self.assertEqual(values['Imported'], values['Retired'])
+        self.assertEqual(values['DsCreated'], values['DsRetired'])
+        self.assertEqual(values['ExportCreated'], values['ExportRetired'])
+        return {**values, 'caller_export_reads': len(caller_reads), 'caller_buffer_unchanged': True,
+                'caller_buffer_sha256': hashlib.sha256(buffers[0].raw).hexdigest(),
+                'finite_private_native_and_free_delivery_model': True}
+
+    def alias(self, fault, dependencies, exports):
+        material, arrays = self.fixture()
+        expected = 'Header input ' + ('export' if 'export' in fault else 'dependency') + ' aliases the caller buffer'
+        with patch.dict(os.environ, {'S4_HEADER_MODEL_FAULT': fault, 'S4_HEADER_MODEL_AUDIT': '1'}):
+            delivery = self.delivered_observer(); observer, buffers, reads = next(delivery)
+            try:
+                with self.assertRaisesRegex(ValueError, '^' + expected + '$'): observer(material, arrays)
+                record = self.audit(buffers, reads, material)
+                self.assertEqual((record['Imported'], record['DsCreated'], record['ExportCreated']), (1, dependencies, exports))
+                for name in ('CallerFrees', 'CallerDsFrees', 'CallerReads', 'caller_export_reads'): self.assertEqual(record[name], 0)
+                self.record = {**record, 'fault': fault, 'specific_refusal': expected}
+            finally: delivery.close()
+
+    def test_export_caller_buffer_refuses_before_read_or_free(self):
+        self.alias('export-buffer', 0, 0)
+
+    def test_second_export_caller_buffer_refuses_and_retires_both_real_dependencies(self):
+        self.alias('later-export-buffer', 2, 1)
+
+    def test_dependency_caller_buffer_refuses_before_readback_or_ownership(self):
+        self.alias('ds-buffer', 0, 1)
+
+    def test_second_dependency_caller_buffer_refuses_and_retires_first_real_dependency(self):
+        self.alias('later-ds-buffer', 1, 1)
+
+    def test_positive_delivery_retires_two_separate_exports_and_dependencies_once(self):
+        material, arrays = self.fixture()
+        with patch.dict(os.environ, {'S4_HEADER_MODEL_AUDIT': '1'}):
+            delivery = self.delivered_observer(); observer, buffers, reads = next(delivery)
+            try:
+                observer(material, arrays); record = self.audit(buffers, reads, material)
+                self.assertEqual((record['Imported'], record['DsCreated'], record['ExportCreated']), (1, 2, 2))
+                for name in ('CallerFrees', 'CallerDsFrees', 'CallerReads', 'caller_export_reads'): self.assertEqual(record[name], 0)
+                self.record = {**record, 'fault': None}
+            finally: delivery.close()
+
+    def sensitivity(self, returned_name, fault):
+        tree = ast.parse((ROOT / 'Updates/header_inputs.py').read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'header_input_native')
+        removed = []
+        class OmitKnownCallerCheck(ast.NodeTransformer):
+            def visit_If(self, node):
+                test = node.test
+                if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name) and test.left.id == returned_name
+                        and len(test.comparators) == 1 and isinstance(test.comparators[0], ast.Name)
+                        and test.comparators[0].id == 'caller_address'):
+                    removed.append(ast.dump(node, include_attributes=False)); return ast.copy_location(ast.Pass(), node)
+                return self.generic_visit(node)
+        model = OmitKnownCallerCheck().visit(function); self.assertEqual(len(removed), 1)
+        original = self.namespace['header_input_native']
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[model], type_ignores=[])), '<single-caller-check-omission-model>', 'exec'), self.namespace)
+        material, arrays = self.fixture()
+        try:
+            with patch.dict(os.environ, {'S4_HEADER_MODEL_FAULT': fault, 'S4_HEADER_MODEL_AUDIT': '1'}):
+                delivery = self.delivered_observer(); observer, buffers, reads = next(delivery)
+                try:
+                    if returned_name == 'pointer': observer(material, arrays)
+                    else:
+                        with self.assertRaisesRegex(ValueError, '^Header input dependency count differs$'): observer(material, arrays)
+                    record = self.audit(buffers, reads, material)
+                    if returned_name == 'pointer': self.assertEqual((record['CallerFrees'], record['caller_export_reads']), (2, 2))
+                    else: self.assertEqual((record['CallerDsFrees'], record['CallerReads']), (1, 1))
+                    self.record = {**record, 'explicit_single_check_omission_model': True, 'removed_node_ast': removed[0],
+                                   'model_function_ast': ast.dump(model, include_attributes=False),
+                                   'source_sha256': hashlib.sha256((ROOT / 'Updates/header_inputs.py').read_bytes()).hexdigest()}
+                finally: delivery.close()
+        finally: self.namespace['header_input_native'] = original
+
+    def test_export_alias_control_is_sensitive_to_omission_of_its_single_check(self):
+        self.sensitivity('pointer', 'export-buffer')
+
+    def test_dependency_alias_control_is_sensitive_to_omission_of_its_single_check(self):
+        self.sensitivity('handle', 'ds-buffer')
+
+
 class HeaderInputProofTests(unittest.TestCase):
     setUpClass = classmethod(HeaderInputNativeTests.setUpClass.__func__)
     setUp = HeaderInputNativeTests.setUp
@@ -226,6 +339,26 @@ class HeaderInputPrivateTests(unittest.TestCase):
         with patch.dict(os.environ, {'S4_HEADER_MODEL_FAULT': 'script-index'}):
             self.assertIn('Header input dependency receipt differs', self.run_guard(expected=75).stderr)
         self.assertEqual(self.path.read_bytes(), before)
+
+    def caller_alias(self, fault, kind):
+        # The private delivery protects Python storage even if a check is
+        # deliberately omitted; production still uses the ordinary libc free.
+        source = self.program.read_text().replace('libc = C.CDLL(None)', 'libc = C.CDLL(' + repr(str(self.library)) + ')').replace('libc.free', 'libc.headerModelFree')
+        self.program.write_text(source); before = self.path.read_bytes()
+        with patch.dict(os.environ, {'S4_HEADER_MODEL_FAULT': fault, 'S4_HEADER_MODEL_AUDIT': '1'}): result = self.run_guard(expected=75)
+        expected = 'Header input ' + kind + ' aliases the caller buffer'
+        self.assertIn(expected, result.stderr); self.assertEqual(result.stdout, '')
+        self.assertEqual(self.path.read_bytes(), before)
+        self.record = {'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr,
+                       'specific_refusal': expected, 'private_input_sha256_before': hashlib.sha256(before).hexdigest(),
+                       'private_input_sha256_after': hashlib.sha256(self.path.read_bytes()).hexdigest(),
+                       'library_and_free_delivery_model': True}
+
+    def test_export_caller_alias_on_actual_private_snapshot_withholds_all_json(self):
+        self.caller_alias('export-buffer', 'export')
+
+    def test_dependency_caller_alias_on_actual_private_snapshot_withholds_all_json(self):
+        self.caller_alias('ds-buffer', 'dependency')
 
 
 class HeaderInputPipelineTests(unittest.TestCase):

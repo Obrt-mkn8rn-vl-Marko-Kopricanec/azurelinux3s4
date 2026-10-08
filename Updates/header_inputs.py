@@ -47,8 +47,11 @@ def header_input_native():
     def observe(material, arrays):
         header, dependencies = None, []
         buffer = C.create_string_buffer(material, len(material))
+        caller_address = C.addressof(buffer)
         def exported():
             size = C.c_uint(); pointer = api['headerExport'](header, C.byref(size))
+            if pointer == caller_address:
+                raise ValueError('Header input export aliases the caller buffer')
             if pointer and pointer in [header, *dependencies]:
                 raise ValueError('Header input export aliases an owned handle')
             try:
@@ -74,7 +77,7 @@ def header_input_native():
             # COPY=1 with an explicit length; FAST is deliberately absent.
             header = api['headerImport'](buffer, len(material), 1)
             if not header: raise ValueError('Header input native import failed')
-            if header == C.addressof(buffer):
+            if header == caller_address:
                 header = None
                 raise ValueError('Header input import aliases the caller buffer')
             exported()
@@ -83,6 +86,8 @@ def header_input_native():
                 if type(present) is not int or present != int(bool(rows)):
                     raise ValueError('Header input dependency presence differs')
                 handle = api['rpmdsNew'](header, tag, 0)
+                if handle == caller_address:
+                    raise ValueError('Header input dependency aliases the caller buffer')
                 if handle:
                     if handle == header or handle in dependencies:
                         raise ValueError('Header input handles unexpectedly alias')
