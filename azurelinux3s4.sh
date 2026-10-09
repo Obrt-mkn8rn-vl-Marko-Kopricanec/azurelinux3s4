@@ -8636,6 +8636,7 @@ def publication_main(ssh_producer):
 """Observe complete protected self-contained releases; do not execute their bytes."""
 
 import struct as rel_struct
+import math as rel_math
 
 
 REL_MANIFEST_LIMIT = 4 * 1024 * 1024
@@ -8663,11 +8664,18 @@ def release_relative(value):
     return value
 
 
+def release_float(value):
+    number = float(value)
+    if not rel_math.isfinite(number):
+        raise ValueError('nonfinite release number')
+    return number
+
+
 def release_json(data):
     if (not data or len(data) > REL_MANIFEST_LIMIT or not data.endswith(b'\n')
             or any(byte < 32 and byte != 10 or byte > 126 for byte in data)):
         raise ValueError('bounded ASCII/LF release JSON required')
-    return dep_json.loads(data, object_pairs_hook=deployment_object,
+    return dep_json.loads(data, object_pairs_hook=deployment_object, parse_float=release_float,
                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite release number')))
 
 

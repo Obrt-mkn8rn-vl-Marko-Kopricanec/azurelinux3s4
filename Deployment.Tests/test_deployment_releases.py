@@ -381,3 +381,14 @@ class DeploymentReleaseTests(ReleaseFixture):
         groups = next(iter(value['targets'].values()))
         groups['Microsoft.NETCore.App.Runtime.linux-x64/10.0.4'].pop('runtime')
         self.replace_file(name, encoded(value)); self.refused(message='dependency rows required')
+
+    def test_exponent_overflow_is_nonfinite_but_finite_configuration_numbers_remain_admitted(self):
+        name = 'gateway/Mk8.Sava.Gateway.runtimeconfig.json'
+        original = (self.folder() / name).read_bytes()
+        for number in (b'1e400', b'-1e400'):
+            with self.subTest(number=number):
+                data = original.replace(b'"tfm":"net10.0"', b'"tfm":"net10.0","configProperties":{"fixture":' + number + b'}')
+                self.replace_file(name, data); self.refused(message='nonfinite release number')
+        data = original.replace(b'"tfm":"net10.0"', b'"tfm":"net10.0","configProperties":{"fixture":0.5}')
+        self.replace_file(name, data)
+        self.assertEqual(self.observe()['runtime'][1]['program'], 'Mk8.Sava.Gateway')
