@@ -157,6 +157,10 @@ def bind_iterator_delivery(namespace, proof):
     sample = [{'count_start': row['inventory_count'], 'count_end': row['inventory_count'],
                'order': row['installed_instances'].copy(), 'iterator_present': bool(row['inventory_count'])} for row in rows]
     proof['effects']['installed_name_iterators'] = namespace['trigger_iterator_receipt'](inventory, rows, sample, sample)
+    owners = [*proof['effects']['installed_script_owners'], *proof['effects']['incoming']]
+    missing = namespace['trigger_walk_lookup_plan'](owners, rows)
+    empty = [{'count_start': 0, 'count_end': 0, 'order': [], 'iterator_present': False} for _ in missing]
+    proof['effects']['ordinary_condition_name_lookups'] = namespace['trigger_walk_lookup_receipt'](inventory, missing, empty, empty)
 
 
 class TriggerProofTests(unittest.TestCase):
@@ -343,7 +347,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation');source.pop('trigger_iterator_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation');source.pop('trigger_iterator_observation');source.pop('trigger_walk_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)
