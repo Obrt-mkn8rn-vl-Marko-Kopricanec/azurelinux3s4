@@ -36,8 +36,8 @@ def release_float(value):
     return number
 
 
-def release_json(data):
-    if (not data or len(data) > REL_MANIFEST_LIMIT or not data.endswith(b'\n')
+def release_json(data, final_lf=True):
+    if (not data or len(data) > REL_MANIFEST_LIMIT or (final_lf and not data.endswith(b'\n'))
             or any(byte < 32 and byte != 10 or byte > 126 for byte in data)):
         raise ValueError('bounded ASCII/LF release JSON required')
     return dep_json.loads(data, object_pairs_hook=deployment_object, parse_float=release_float,
@@ -170,7 +170,9 @@ def release_runtime(app, files, observed):
         for name, result in observed.items():
             if name.startswith(prefix) and dep_re.search(r'\.so(?:\.[0-9]+)*$', name):
                 release_elf(result[2], False)
-        runtime = release_json(observed[prefix + program + '.runtimeconfig.json'][2])
+        # SDK writers emit complete JSON texts without a terminal LF. Preserve
+        # their exact admitted bytes; human manifests/configurations keep LF.
+        runtime = release_json(observed[prefix + program + '.runtimeconfig.json'][2], final_lf=False)
         deployment_fields(runtime, ('runtimeOptions',))
         options = runtime['runtimeOptions']
         if (type(options) is not dict or not {'tfm', 'includedFrameworks'} <= options.keys()
@@ -189,7 +191,7 @@ def release_runtime(app, files, observed):
             names.append(framework['name'])
         if set(names) != ({'Microsoft.NETCore.App'} if role == 'worker' else {'Microsoft.NETCore.App', 'Microsoft.AspNetCore.App'}):
             raise ValueError('complete role frameworks required')
-        deps = release_json(observed[prefix + program + '.deps.json'][2])
+        deps = release_json(observed[prefix + program + '.deps.json'][2], final_lf=False)
         target = '.NETCoreApp,Version=v10.0/linux-x64'
         if (type(deps) is not dict or not {'runtimeTarget', 'targets', 'libraries'} <= deps.keys()
                 or deps.keys() - {'runtimeTarget', 'compilationOptions', 'targets', 'libraries'}
