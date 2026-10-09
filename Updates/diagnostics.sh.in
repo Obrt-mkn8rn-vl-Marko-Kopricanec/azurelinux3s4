@@ -9,6 +9,7 @@ s4_rpm_effects_program() {
 # @s4-include Updates/trigger_walk.py
 # @s4-include Updates/transaction_elements.py
 # @s4-include Updates/psm_inputs.py
+# @s4-include Updates/psm_failures.py
 # @s4-include Updates/trigger_prefixes.py
 # @s4-include Updates/trigger_conditions.py
 # @s4-include Updates/provides.py
@@ -42,7 +43,7 @@ __name__ = 's4_trigger_library'
 # @s4-include Updates/psm_goals.py
 # @s4-include Updates/psm_routes.py
 if trigger_execution:
-    raise SystemExit(trigger_main(psm_route_observe))
+    raise SystemExit(trigger_main(psm_failure_observe))
 PY
 }
 
@@ -118,7 +119,7 @@ PY
         [[ -z $S4_CAPACITY_MODE ]] || return 75
         s4_rpm_effects_program >"$directory/test.py" || return 75
         if [[ -z $S4_INTERPRETERS_MODE && -z $S4_REMOVALS_MODE ]]; then
-            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\ntrigger_counts_projection = True\ntrigger_iterators_projection = True\ntrigger_walk_projection = True\ntransaction_elements_projection = True\npsm_inputs_projection = True\n' >>"$directory/test.py" || return 75
+            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\ntrigger_counts_projection = True\ntrigger_iterators_projection = True\ntrigger_walk_projection = True\ntransaction_elements_projection = True\npsm_inputs_projection = True\npsm_failures_projection = True\n' >>"$directory/test.py" || return 75
         fi
     else
         : >"$directory/test.py"

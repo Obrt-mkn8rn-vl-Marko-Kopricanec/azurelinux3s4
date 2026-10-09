@@ -238,6 +238,7 @@ for old, new in (('void *rpmdbNextIterator(', 'void *iteratorModelOldNext('),
 LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_trigger_iterators_model.c').read_text()
 LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_transaction_elements_model.c').read_text()
 LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_psm_inputs_model.c').read_text()
+LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_psm_failures_model.c').read_text()
 
 
 class UpdateEffectsTests(unittest.TestCase):

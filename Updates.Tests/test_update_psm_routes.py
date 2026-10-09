@@ -198,7 +198,7 @@ class PsmRoutePrivateTests(unittest.TestCase):
     def test_owned_private_program_only_success_binds_nineteen_hashes_without_body_execution(self):
         proof = route_proof(self.namespace, entries=[(1153, 6, [b'/bin/sh'])])
         data = json.dumps(proof).encode(); self.path.write_bytes(data); observed = json.loads(self.run_guard().stdout)
-        self.assertEqual(len(sources.RECEIPTS), 19)
+        self.assertEqual(len(sources.RECEIPTS), 20)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         self.assertTrue(observed['psm_route_observation']['rows'][0]['conditional_caller_routes'][1]['conditional_open_attempt'])
         self.assertEqual(self.path.read_bytes(), data)
@@ -260,7 +260,7 @@ class PsmRoutePipelineTests(unittest.TestCase):
     def test_shipped_parent_always_calls_new_route_hook_and_native_bypasses_stay_exact(self):
         program = triggers.emitted()
         self.assertEqual(program.count('def psm_route_case('), 1)
-        self.assertTrue(program.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_route_observe))\n'))
+        self.assertTrue(program.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_failure_observe))\n'))
         self.assertEqual(program.count('def psm_input_sample('), 1)
 
 

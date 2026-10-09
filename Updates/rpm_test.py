@@ -469,6 +469,12 @@ try:
             psm_input_api = psm_input_bind(lib)
             psm_input_before = psm_input_sample(psm_input_api, ts, element_database, element_handles, element_plan, element_before)
             errors()
+        if effects and psm_failures_projection:
+            if not transaction_elements_projection:
+                raise ValueError("PSM failures require the current ordered element projection")
+            psm_failure_api = psm_failure_bind(lib)
+            psm_failure_before = psm_failure_sample(psm_failure_api, ts, element_database, element_handles, element_plan, element_before)
+            errors()
         if effects and trigger_counts_projection:
             count_inventory, count_rows = trigger_count_plan(installed_effects, before, incoming_effects)
             count_api = trigger_count_bind(lib)
@@ -526,6 +532,10 @@ try:
         if effects and psm_inputs_projection:
             psm_input_after = psm_input_sample(psm_input_api, ts, final_element_database, final_element_handles, element_plan, element_after)
             psm_input_observation = psm_input_receipt(element_inventory, element_plan, element_observation, psm_input_before, psm_input_after)
+            errors()
+        if effects and psm_failures_projection:
+            psm_failure_after = psm_failure_sample(psm_failure_api, ts, final_element_database, final_element_handles, element_plan, element_after)
+            psm_failure_observation = psm_failure_receipt(element_inventory, element_plan, element_observation, psm_failure_before, psm_failure_after)
             errors()
     finally:
         for fd in opened.values():
@@ -587,6 +597,8 @@ try:
             proof["effects"]["ordered_transaction_elements"] = element_observation
         if psm_inputs_projection:
             proof["effects"]["current_psm_inputs"] = psm_input_observation
+        if psm_failures_projection:
+            proof["effects"]["current_psm_failures"] = psm_failure_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",
