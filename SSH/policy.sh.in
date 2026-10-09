@@ -6,15 +6,25 @@ s4_ssh_service_policy() {
     s4_ssh_candidate service
 }
 
+s4_deployment_policy() {
+    [[ $# == 1 ]] || return 64
+    s4_ssh_candidate deployment "$1"
+}
+
 s4_ssh_candidate() {
-    [[ $# == 1 && ( $1 == configuration || $1 == service ) ]] || return 64
+    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && $1 == deployment ) ]] || return 64
     # Candidate bytes only; no observation, package/account/key/file/service
     # installation. LAN/caller/key authorization remains a later prerequisite.
-    timeout --kill-after=5s 30s python3 -I - "$1" <<'PY'
+    timeout --kill-after=5s 30s python3 -I - "$@" <<'PY'
 __name__ = 's4_ssh_candidate_library'
 # @s4-include SSH/policy.py
 # @s4-include SSH/service.py
+# @s4-include Deployment/configuration.py
+# @s4-include Deployment/policy.py
 action = sys.argv[1]
+if action == 'deployment':
+    sys.argv = [sys.argv[0], sys.argv[2]]
+    raise SystemExit(deployment_main(bundle))
 sys.argv = [sys.argv[0]]
 raise SystemExit(main() if action == 'configuration' else service_main(bundle))
 PY

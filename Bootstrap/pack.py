@@ -72,6 +72,8 @@ PAYLOADS = {
     "Web/policy.py": "PY",
     "SSH/policy.py": "PY",
     "SSH/service.py": "PY",
+    "Deployment/configuration.py": "PY",
+    "Deployment/policy.py": "PY",
     "SSH/keys.py": "PY",
     "SSH/accounts.py": "PY",
     "SSH/home.py": "PY",

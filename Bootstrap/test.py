@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests", "Web.Tests", "SSH.Tests")
+TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests", "Web.Tests", "SSH.Tests", "Deployment.Tests")
 MODULES = (
     "test_bundle",
     "test_bootstrap",
@@ -64,6 +64,7 @@ MODULES = (
     "test_ssh_accounts",
     "test_ssh_home",
     "test_ssh_service",
+    "test_deployment_policy",
 )
 
 
