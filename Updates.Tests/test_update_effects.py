@@ -230,6 +230,13 @@ void *headerExport(void *h,unsigned *size) {
 # the model is not a vendor database or real temporal script execution.
 LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_trigger_counts_model.c').read_text()
 
+# Dispatch owned NAME iterators separately from the accepted PACKAGE model.
+for old, new in (('void *rpmdbNextIterator(', 'void *iteratorModelOldNext('),
+                 ('unsigned rpmdbGetIteratorOffset(', 'unsigned iteratorModelOldOffset('),
+                 ('void *rpmdbFreeIterator(', 'void *iteratorModelOldFree(')):
+    LIBRARY = LIBRARY.replace(old, new)
+LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_trigger_iterators_model.c').read_text()
+
 
 class UpdateEffectsTests(unittest.TestCase):
     command = compatibility.UpdateCompatibilityTests.command

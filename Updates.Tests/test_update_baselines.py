@@ -138,8 +138,13 @@ for old, new in (('void *rpmdbNextIterator(', 'void *baselineOldNextIterator('),
                  ('void *headerExport(', 'void *baselineOldExport(')):
     BASELINE_LIBRARY = BASELINE_LIBRARY.replace(old, new)
 BASELINE_LIBRARY += r'''
-void *rpmdbNextIterator(TS *ts) { return ts->iteration++ < 3 ? ts : NULL; }
+void *rpmdbNextIterator(TS *ts) {
+    if (!ts) return NULL;
+    if (triggerIteratorModelOwns(ts)) return triggerIteratorModelNext(ts);
+    return ts->iteration++ < 3 ? ts : NULL;
+}
 unsigned rpmdbGetIteratorOffset(TS *ts) {
+    if (triggerIteratorModelOwns(ts)) return triggerIteratorModelOffset(ts);
     return setting("baseline_duplicate_instance") ? 1 : setting("baseline_zero_instance") ? 0 : ts->iteration;
 }
 const char *baselineName(void *header) {
@@ -219,7 +224,7 @@ class InstalledVersionPipelineTests(unittest.TestCase):
         self.prepare(userland_removal=True, changed_baseline=True)
         result = self.shell(expected=75)
         self.assertEqual(result.stdout, '')
-        self.assertIn('context changed', result.stderr)
+        self.assertIn('trigger iterator export length differs from captured Header', result.stderr)
 
     def test_empty_incoming_batch_still_reports_all_installed_headers_without_package_test_claim(self):
         self.prepare(empty=True)

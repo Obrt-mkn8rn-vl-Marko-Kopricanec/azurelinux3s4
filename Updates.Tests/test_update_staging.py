@@ -6,6 +6,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -134,8 +135,16 @@ s4_verify_metadata() {{ return 0; }}
 '''
 
     def shell(self, body='s4_prepare_updates', expected=0, timeout=45):
-        result = subprocess.run(['bash', '-c', self.header() + body], text=True,
-                                capture_output=True, timeout=timeout)
+        # Emitted guards may exceed Linux's per-argument limit. Deliver the
+        # exact same command bytes in an owned file, with unchanged assertions.
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', prefix='s4-fixture-shell-',
+                                         dir=self.root, delete=False) as stream:
+            stream.write(self.header() + body); script = Path(stream.name)
+        try:
+            result = subprocess.run(['bash', str(script)], text=True,
+                                    capture_output=True, timeout=timeout)
+        finally:
+            script.unlink()
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.assertEqual(list((self.root / 'run').iterdir()), [], 'volatile workspace leaked')
         if expected:

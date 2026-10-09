@@ -32,6 +32,7 @@ MODULES = (
     "test_update_header_iteration",
     "test_update_trigger_counts",
     "test_update_trigger_arguments",
+    "test_update_trigger_iterators",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",

@@ -462,6 +462,11 @@ try:
             count_api = trigger_count_bind(lib)
             count_database, count_before = trigger_count_sample(count_api, ts, count_rows)
             errors()
+        if effects and trigger_iterators_projection:
+            iterator_inventory, iterator_rows = trigger_iterator_plan(installed_effects, before, incoming_effects)
+            iterator_api = trigger_iterator_bind(lib)
+            iterator_database, iterator_before = trigger_iterator_sample(iterator_api, libc.free, ts, iterator_inventory, iterator_rows)
+            errors()
         if api["rpmtsFlags"](ts) != flags or api["rpmtsRun"](ts, None, (1 << 7) | (1 << 8)):
             # Only capacity/inode filters: all signature, dependency, file,
             # architecture and older/already-installed package checks remain.
@@ -474,6 +479,12 @@ try:
             if final_database != count_database:
                 raise ValueError("trigger count borrowed database changes across TEST")
             count_observation = trigger_count_receipt(count_inventory, count_rows, count_before, count_after)
+            errors()
+        if effects and trigger_iterators_projection:
+            final_iterator_database, iterator_after = trigger_iterator_sample(iterator_api, libc.free, ts, iterator_inventory, iterator_rows)
+            if final_iterator_database != iterator_database:
+                raise ValueError("trigger iterator borrowed database changes across TEST")
+            iterator_observation = trigger_iterator_receipt(iterator_inventory, iterator_rows, iterator_before, iterator_after)
             errors()
     finally:
         for fd in opened.values():
@@ -527,6 +538,8 @@ try:
                 for _, value in sorted(installed_effects.items())]
         if trigger_counts_projection:
             proof["effects"]["installed_name_counts"] = count_observation
+        if trigger_iterators_projection:
+            proof["effects"]["installed_name_iterators"] = iterator_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",

@@ -146,6 +146,17 @@ def bind_count_delivery(namespace, proof):
         proof['baseline'], proof['effects']['incoming'])
     counts = [row['inventory_count'] for row in rows]
     proof['effects']['installed_name_counts'] = namespace['trigger_count_receipt'](inventory, rows, counts, counts)
+    bind_iterator_delivery(namespace, proof)
+
+
+def bind_iterator_delivery(namespace, proof):
+    """Synthetic current iterator declaration; no native traversal execution."""
+    values = proof['effects']['installed_versions']['entries']
+    inventory, rows = namespace['trigger_iterator_plan']({value['instance']: value for value in values},
+        proof['baseline'], proof['effects']['incoming'])
+    sample = [{'count_start': row['inventory_count'], 'count_end': row['inventory_count'],
+               'order': row['installed_instances'].copy(), 'iterator_present': bool(row['inventory_count'])} for row in rows]
+    proof['effects']['installed_name_iterators'] = namespace['trigger_iterator_receipt'](inventory, rows, sample, sample)
 
 
 class TriggerProofTests(unittest.TestCase):
@@ -332,7 +343,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation');source.pop('trigger_iterator_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)

@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.47.0
+S4_VERSION=0.48.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
