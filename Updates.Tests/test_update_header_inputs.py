@@ -18,17 +18,19 @@ import test_update_triggers as triggers
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / 'Updates.Tests/rpm_header_model.c'
+MATCH_MODEL = ROOT / 'Updates.Tests/rpm_header_matches_model.c'
 RENAMES = {'headerExport': 'originalHeaderExport', 'headerFree': 'originalHeaderFree',
            'headerIsEntry': 'originalHeaderIsEntry', 'rpmdsCount': 'originalDsCount',
            'rpmdsIx': 'originalDsIx', 'rpmdsTagN': 'originalDsTagN', 'rpmdsN': 'originalDsN',
-           'rpmdsEVR': 'originalDsEVR', 'rpmdsFlags': 'originalDsFlags', 'rpmdsFree': 'originalDsFree'}
+           'rpmdsEVR': 'originalDsEVR', 'rpmdsFlags': 'originalDsFlags', 'rpmdsFree': 'originalDsFree',
+           'rpmdsSingle': 'originalDsSingle'}
 
 
 def header_model_source(source):
     if 'void *rpmdsSingle(' not in source:
         source += providers.MODEL.read_text()
     return ''.join('#define ' + name + ' ' + replacement + '\n' for name, replacement in RENAMES.items()) + source + '\n' + ''.join(
-        '#undef ' + name + '\n' for name in RENAMES) + MODEL.read_text()
+        '#undef ' + name + '\n' for name in RENAMES) + MODEL.read_text() + MATCH_MODEL.read_text()
 
 
 class HeaderInputNativeTests(unittest.TestCase):
@@ -377,7 +379,7 @@ class HeaderInputPipelineTests(unittest.TestCase):
         pointer = (self.root / 'state/updates/current.json').read_bytes(); proof = json.loads(self.shell().stdout)
         receipt = proof['header_input_observation']; self.assertEqual(receipt['headers_imported'], 2)
         self.assertTrue(receipt['native_dependency_fields_read_back']); self.assertFalse(receipt['actual_header_dependency_matches_observed'])
-        raw = copy.deepcopy(proof); names = (*sources.RECEIPTS, 'header_input_observation')
+        raw = copy.deepcopy(proof); names = (*sources.RECEIPTS, 'header_input_observation', 'header_match_observation')
         for name in dict.fromkeys(names): raw.pop(name)
         digest = hashlib.sha256((json.dumps(raw, sort_keys=True) + '\n').encode()).hexdigest()
         for name in names: self.assertEqual(proof[name]['input_sha256'], digest)

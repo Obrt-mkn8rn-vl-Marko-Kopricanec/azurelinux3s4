@@ -44,8 +44,9 @@ def header_input_native():
         except AttributeError as error: raise ValueError('Header input symbol is missing: ' + name) from error
         function.restype, function.argtypes = result, tuple(arguments); api[name] = function
     libc = C.CDLL(None); libc.free.restype = None; libc.free.argtypes = (C.c_void_p,)
-    def observe(material, arrays):
+    def observe(material, arrays, after=None):
         header, dependencies = None, []
+        result = None
         buffer = C.create_string_buffer(material, len(material))
         caller_address = C.addressof(buffer)
         def exported():
@@ -95,6 +96,8 @@ def header_input_native():
                 if bool(handle) != bool(rows):
                     raise ValueError('Header input dependency allocation differs')
                 if handle: readback(handle, tag, rows)
+            if after is not None:
+                result = after(header, tuple(dependencies), caller_address)
             for (tag, rows), handle in zip(((tag, rows) for tag, rows in arrays if rows), dependencies):
                 readback(handle, tag, rows)
             exported()
@@ -107,6 +110,7 @@ def header_input_native():
                         if api[name](handle) is not None: failures.append(ValueError('Header input native cleanup failed'))
                     except BaseException as error: failures.append(error)
             if failures: raise failures[0]
+        return result
     return observe
 
 

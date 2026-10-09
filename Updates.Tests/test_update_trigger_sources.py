@@ -11,7 +11,7 @@ import test_update_triggers as triggers
 
 
 RECEIPTS = ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-            'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation')
+            'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation', 'header_match_observation')
 AUTHORITIES = ('actual_header_dependency_matches_observed', 'trigger_phase_selected',
     'transaction_temporal_sources_selected', 'provider_architectures_selected', 'trigger_eligibility_complete',
     'trigger_selection_complete', 'execution_order_complete', 'script_execution_plan_complete',
@@ -276,7 +276,7 @@ class TriggerSourcePipelineTests(unittest.TestCase):
         self.prepare(condition_ordinary=True, provider_positive=True)
         pointer = (self.root / 'state/updates/current.json').read_bytes()
         script = "def limited_sources(proof):\n    global TRIGGER_SOURCE_PAIR_LIMIT\n    TRIGGER_SOURCE_PAIR_LIMIT = 0\n    return trigger_source_observe(proof)\n"
-        ending = 'if trigger_execution:\n    raise SystemExit(trigger_main(header_input_observe))\n'
+        ending = 'if trigger_execution:\n    raise SystemExit(trigger_main(header_match_observe))\n'
         guard = triggers.emitted().replace('C.CDLL("librpm.so.9",', 'C.CDLL(' + repr(str(self.library)) + ',').replace(ending,
             script + 'if trigger_execution:\n    raise SystemExit(trigger_main(limited_sources))\n')
         self.assertIn(script, guard)
