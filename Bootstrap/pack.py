@@ -45,6 +45,7 @@ PAYLOADS = {
     "Updates/trigger_sources.py": "PY",
     "Updates/header_inputs.py": "PY",
     "Updates/header_matches.py": "PY",
+    "Updates/trigger_first.py": "PY",
     "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",

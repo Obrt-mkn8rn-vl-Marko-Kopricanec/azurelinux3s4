@@ -239,6 +239,8 @@ def trigger_main(after=None):
                 proof['header_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
             if 'header_match_observation' in proof:
                 proof['header_match_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
+            if 'trigger_first_observation' in proof:
+                proof['trigger_first_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         proof['trigger_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         output = json.dumps(proof, sort_keys=True)
         if len(output.encode('utf-8')) > TRIGGER_LIMIT:

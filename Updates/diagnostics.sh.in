@@ -31,8 +31,9 @@ __name__ = 's4_trigger_library'
 # @s4-include Updates/provider_matches.py
 # @s4-include Updates/trigger_sources.py
 # @s4-include Updates/header_matches.py
+# @s4-include Updates/trigger_first.py
 if trigger_execution:
-    raise SystemExit(trigger_main(header_match_observe))
+    raise SystemExit(trigger_main(trigger_first_observe))
 PY
 }
 
