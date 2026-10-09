@@ -151,8 +151,8 @@ LIBRARY = LIBRARY.replace('unsigned rpmdbGetIteratorOffset(', 'unsigned fixtureO
 LIBRARY += r'''
 #include <arpa/inet.h>
 static int incoming(void *h) { return *(int *)h==1; }
-int rpmtsNElements(TS *ts) { return setting("duplicate_removal") ? ts->n+2 : fixtureOldNElements(ts); }
-int rpmteType(void *element) { return setting("duplicate_removal") ? ((uintptr_t)element>=2 ? 2 : 1) : fixtureOldType(element); }
+int rpmtsNElements(TS *ts) { if(!ts) return 0; return setting("duplicate_removal") ? ts->n+2 : fixtureOldNElements(ts); }
+int rpmteType(void *element) { if(!element) return -1; return setting("duplicate_removal") ? ((uintptr_t)element>=2 ? 2 : 1) : fixtureOldType(element); }
 void *rpmdbNextIterator(TS *ts) {
     if(setting("effects_large_metadata")) return ts->iteration++ < 400 ? ts : NULL;
     return fixtureOldNextIterator(ts);
@@ -177,7 +177,7 @@ const char *rpmteN(void *element) {
     if((uintptr_t)element==2 && setting("installed_other")) return "other";
     return fixtureOldName(element);
 }
-unsigned rpmteDBInstance(void *element) { record("instance",1); return setting("removal_instance_failure") ? 999 : 1; }
+unsigned rpmteDBInstance(void *element) { if(!element) return 0; record("instance",1); return setting("removal_instance_failure") ? 999 : 1; }
 void *headerExport(void *h,unsigned *size) {
     if(setting("effects_large_metadata")) {
         *size=24+4096*4; unsigned char *result=malloc(*size); memset(result,255,*size);
@@ -236,6 +236,7 @@ for old, new in (('void *rpmdbNextIterator(', 'void *iteratorModelOldNext('),
                  ('void *rpmdbFreeIterator(', 'void *iteratorModelOldFree(')):
     LIBRARY = LIBRARY.replace(old, new)
 LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_trigger_iterators_model.c').read_text()
+LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_transaction_elements_model.c').read_text()
 
 
 class UpdateEffectsTests(unittest.TestCase):

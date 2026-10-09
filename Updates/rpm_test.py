@@ -457,6 +457,12 @@ try:
                 raise ValueError("native plan would remove a retained kernel or has an unknown element")
         if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
             raise ValueError("native plan replaced or dropped an admitted input")
+        if effects and transaction_elements_projection:
+            element_inventory, element_plan = transaction_element_plan(installed_effects, before, incoming_effects, removal_effects)
+            element_api = transaction_element_bind(lib)
+            element_snapshots = {path: records[index]["file"] for index, path in enumerate(paths)}
+            element_database, element_handles, element_before = transaction_element_sample(element_api, ts, element_plan, element_snapshots)
+            errors()
         if effects and trigger_counts_projection:
             count_inventory, count_rows = trigger_count_plan(installed_effects, before, incoming_effects)
             count_api = trigger_count_bind(lib)
@@ -505,6 +511,12 @@ try:
                     raise ValueError("trigger walk extra lookup database changes across TEST")
                 errors()
             walk_observation = trigger_walk_lookup_receipt(iterator_inventory, walk_rows, walk_before, walk_after)
+        if effects and transaction_elements_projection:
+            final_element_database, final_element_handles, element_after = transaction_element_sample(element_api, ts, element_plan, element_snapshots)
+            if final_element_database != element_database or final_element_handles != element_handles:
+                raise ValueError("transaction element borrowed handles change across TEST")
+            element_observation = transaction_element_receipt(element_inventory, element_plan, element_before, element_after)
+            errors()
     finally:
         for fd in opened.values():
             api["Fclose"](fd)
@@ -561,6 +573,8 @@ try:
             proof["effects"]["installed_name_iterators"] = iterator_observation
         if trigger_walk_projection:
             proof["effects"]["ordinary_condition_name_lookups"] = walk_observation
+        if transaction_elements_projection:
+            proof["effects"]["ordered_transaction_elements"] = element_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",

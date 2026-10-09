@@ -71,9 +71,10 @@ void *rpmtsProblems(TS *ts) { return (void *)1; }
 int rpmpsNumProblems(void *ps) { return setting("dependencies") || ran && setting("run_problem"); }
 void *rpmpsFree(void *ps) { return NULL; }
 int rpmtsOrder(TS *ts) { record("order",1); return setting("order_failure"); }
-int rpmtsNElements(TS *ts) { return ts->n+(setting("kernel_removal") || setting("userland_removal")); }
-void *rpmtsElement(TS *ts,int index) { if(setting("missing_element")) return NULL; return (void *)(uintptr_t)(index+1); }
-int rpmteType(void *element) { return setting("kernel_removal") || setting("userland_removal") ? ((uintptr_t)element==2 ? 2 : 1) : 1; }
+int rpmtsNElements(TS *ts) { return ts ? ts->n+(setting("kernel_removal") || setting("userland_removal")) : 0; }
+int rpmtsNElements (TS *ts);
+void *rpmtsElement(TS *ts,int index) { if(!ts || index<0 || index>=rpmtsNElements(ts) || setting("missing_element")) return NULL; return (void *)(uintptr_t)(index+1); }
+int rpmteType(void *element) { if(!element) return -1; return setting("kernel_removal") || setting("userland_removal") ? ((uintptr_t)element==2 ? 2 : 1) : 1; }
 const char *rpmteN(void *element) { return setting("kernel") || setting("kernel_removal") ? "kernel" : "userland"; }
 const char *rpmteNEVRA(void *element) { return "userland-1-1.x86_64"; }
 static TS *active;

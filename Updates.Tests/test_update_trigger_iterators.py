@@ -292,7 +292,7 @@ class TriggerIteratorPrivateTests(unittest.TestCase):
     def test_real_private_snapshot_success_binds_all_fourteen_original_byte_hashes(self):
         proof = triggers.TriggerProofTests.proof(self, trigger=False); data = json.dumps(proof).encode(); self.path.write_bytes(data)
         result = self.run_guard(); observed = json.loads(result.stdout)
-        self.assertEqual(len(sources.RECEIPTS), 15)
+        self.assertEqual(len(sources.RECEIPTS), 16)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual(self.path.read_bytes(), data)
 
