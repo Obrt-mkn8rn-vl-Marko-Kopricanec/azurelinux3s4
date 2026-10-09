@@ -10,6 +10,8 @@ REL_TOTAL_LIMIT = 2 * 1024 * 1024 * 1024
 REL_FILES = 4096
 REL_ENTRIES = 8192
 REL_DEP_REFERENCES = 8192
+REL_RUNTIME_GRAPH_NODES = 128
+REL_RUNTIME_GRAPH_REFERENCES = 4096
 REL_PROGRAMS = {
     'mk8.sava': {'application': 'Mk8.Sava.Application', 'gateway': 'Mk8.Sava.Gateway'},
     'mk8.drava': {'application': 'mk8.drava.Application', 'gateway': 'mk8.drava.Gateway'},
@@ -162,6 +164,25 @@ def release_elf(data, executable):
         raise ValueError('unsupported declared linux-x64 ELF header')
 
 
+def release_runtime_fallbacks(value):
+    # SDK fallback labels are bounded declarations, not selected assets or
+    # evidence that another RID is usable. Referenced labels need not be keys.
+    if type(value) is not dict or len(value) > REL_RUNTIME_GRAPH_NODES:
+        raise ValueError('runtime fallback graph node bound or type')
+    references = 0
+    for rid, fallbacks in value.items():
+        deployment_text(rid, r'[a-z0-9]+(?:[.-][a-z0-9]+)*', 128)
+        if type(fallbacks) is not list or len(fallbacks) > REL_RUNTIME_GRAPH_NODES:
+            raise ValueError('runtime fallback array type or bound')
+        references += len(fallbacks)
+        if references > REL_RUNTIME_GRAPH_REFERENCES:
+            raise ValueError('runtime fallback reference bound')
+        for fallback in fallbacks:
+            deployment_text(fallback, r'[a-z0-9]+(?:[.-][a-z0-9]+)*', 128)
+        if len(set(fallbacks)) != len(fallbacks) or rid in fallbacks:
+            raise ValueError('duplicate or self runtime fallback declaration')
+
+
 def release_runtime(app, files, observed):
     summaries = []
     for role, program in REL_PROGRAMS[app].items():
@@ -192,15 +213,20 @@ def release_runtime(app, files, observed):
         if set(names) != ({'Microsoft.NETCore.App'} if role == 'worker' else {'Microsoft.NETCore.App', 'Microsoft.AspNetCore.App'}):
             raise ValueError('complete role frameworks required')
         deps = release_json(observed[prefix + program + '.deps.json'][2], final_lf=False)
-        target = '.NETCoreApp,Version=v10.0/linux-x64'
+        framework = '.NETCoreApp,Version=v10.0'
+        target = framework + '/linux-x64'
         if (type(deps) is not dict or not {'runtimeTarget', 'targets', 'libraries'} <= deps.keys()
-                or deps.keys() - {'runtimeTarget', 'compilationOptions', 'targets', 'libraries'}
+                or deps.keys() - {'runtimeTarget', 'compilationOptions', 'targets', 'libraries', 'runtimes'}
                 or type(deps['runtimeTarget']) is not dict or deps['runtimeTarget'].get('name') != target
                 or deps['runtimeTarget'].keys() - {'name', 'signature'}
-                or type(deps['targets']) is not dict or set(deps['targets']) != {target}
+                or type(deps['targets']) is not dict or set(deps['targets']) not in ({target}, {framework, target})
+                or (framework in deps['targets'] and deps['targets'][framework] != {})
                 or type(deps['libraries']) is not dict or type(deps['targets'][target]) is not dict
                 or set(deps['targets'][target]) != set(deps['libraries']) or not 1 <= len(deps['libraries']) <= REL_FILES):
             raise ValueError('linux-x64 dependency target required')
+        # Nonportable SDK output has an empty compile target beside the exact
+        # runtime target. No nonempty compile context or other target is admitted.
+        release_runtime_fallbacks(deps.get('runtimes', {}))
         assets, references = set(), 0
         for library, groups in deps['targets'][target].items():
             if (type(groups) is not dict or groups.keys() - {'dependencies', 'runtime', 'native', 'resources', 'runtimeTargets'}

@@ -68,6 +68,7 @@ MODULES = (
     "test_deployment_publication",
     "test_deployment_releases",
     "test_deployment_runtime_metadata",
+    "test_deployment_dependency_metadata",
     "test_deployment_services",
 )
 
