@@ -12,7 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,6 +179,83 @@ class DeploymentPolicyTests(unittest.TestCase):
                 value = manifest(); value['public'].update(public); self.refuse(value)
         value = manifest(); value['public'].update(topology='direct', ipv4='8.8.8.8')
         self.assertEqual(self.candidate(value)['manifest']['topology'], 'direct')
+
+    def test_public_ipv6_site_local_and_reserved_refuse_before_candidate_producers(self):
+        for address in ('fec0::1', 'feff::1', '4000::1', '8000::1', '1fff::1'):
+            with self.subTest(address=address):
+                value = manifest(); value['public']['ipv6'] = address
+                producer = Mock(wraps=self.n['bundle'])
+                with self.assertRaisesRegex(ValueError, 'public IPv6 GUA profile'):
+                    self.n['deployment_bundle'](encoded(value), producer)
+                producer.assert_not_called()
+
+    def test_supported_unscoped_public_gua_preserves_dual_family_and_null_admin_profiles(self):
+        for admin6, public4 in ((True, '192.168.1.20'), (False, '192.168.1.20'), (False, None)):
+            with self.subTest(admin6=admin6, public4=public4):
+                value = manifest(admin6)
+                value['public'].update(ipv4=public4, ipv6='2001:4860::1')
+                result = self.candidate(value)
+                public6 = [row for row in result['manifest']['public'] if row['version'] == 6]
+                self.assertEqual(public6, [{'version': 6, 'address': '2001:4860::1', 'interface': 'eno2'}])
+                self.assertIn('ip6 daddr 2001:4860::1 tcp dport', result['files'][1]['content'])
+                self.assertEqual(result['ssh_policy']['listen_addresses'], ['192.168.90.10']
+                                 + (['fd51:b089:f5e0:90::10'] if admin6 else []))
+                self.assertTrue(all(item is False for item in result['authority'].values()))
+
+    def test_public_ipv6_scope_suffix_refuses_before_candidate_producers(self):
+        for suffix in ('%eth0', '%1', '%x accept'):
+            with self.subTest(suffix=suffix):
+                value = manifest(); value['public']['ipv6'] = '2001:4860::1' + suffix
+                producer = Mock(wraps=self.n['bundle'])
+                with self.assertRaises(ValueError):
+                    self.n['deployment_bundle'](encoded(value), producer)
+                producer.assert_not_called()
+
+    def test_public_ipv6_json_escaped_newline_scope_refuses_before_serialization(self):
+        value = manifest(); value['public']['ipv6'] = '2001:4860::1%x\n  accept'
+        data = encoded(value)
+        self.assertIn(b'\\n  accept', data)
+        self.assertEqual(data.count(b'\n'), 1)
+        decoded, _ = self.n['deployment_decode'](data)
+        self.assertEqual(decoded['public']['ipv6'], value['public']['ipv6'])
+        producer = Mock(wraps=self.n['bundle'])
+        with self.assertRaises(ValueError):
+            self.n['deployment_bundle'](data, producer)
+        producer.assert_not_called()
+
+    def test_admin_ipv6_router_scope_suffix_refuses_before_candidate_producers(self):
+        for suffix in ('%eth0', '%1', '%x accept'):
+            with self.subTest(suffix=suffix):
+                value = manifest()
+                value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2' + suffix)
+                producer = Mock(wraps=self.n['bundle'])
+                with self.assertRaises(ValueError):
+                    self.n['deployment_bundle'](encoded(value), producer)
+                producer.assert_not_called()
+
+    def test_admin_ipv6_router_json_escaped_controls_refuse_before_serialization(self):
+        for control in ('\n  accept', '\r drop', '\t #', '\x00', '\x1f', '\x7f', '\u0085', '\u2028', '\u2029'):
+            with self.subTest(control=repr(control)):
+                value = manifest()
+                value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2%x' + control)
+                data = encoded(value)
+                self.assertEqual(data.count(b'\n'), 1)
+                self.assertTrue(all(byte < 128 for byte in data))
+                decoded, _ = self.n['deployment_decode'](data)
+                self.assertEqual(decoded['admin']['ipv6']['routers'], value['admin']['ipv6']['routers'])
+                producer = Mock(wraps=self.n['bundle'])
+                with self.assertRaises(ValueError):
+                    self.n['deployment_bundle'](data, producer)
+                producer.assert_not_called()
+
+    def test_admin_ipv6_listener_scope_and_decoded_whitespace_refuse_before_ssh(self):
+        for suffix in ('%eth0', '%1', '%x\n  accept', '\n', ' ', '\t'):
+            with self.subTest(suffix=suffix):
+                value = manifest(); value['admin']['ipv6']['address'] += suffix
+                producer = Mock(wraps=self.n['bundle'])
+                with self.assertRaises(ValueError):
+                    self.n['deployment_bundle'](encoded(value), producer)
+                producer.assert_not_called()
 
     def test_domains_distinct_canonical_bounded_under_declared_zone(self):
         for domain in ('Sava.example.test', 'sava.example.test.', 'sava.other.test', '-sava.example.test', 'email.example.test', 'a' * 64 + '.example.test', 'sava\n.example.test'):
@@ -419,6 +496,43 @@ class DeploymentDeliveryTests(unittest.TestCase):
         self.assertEqual(result.stdout, b'')
         self.assertEqual(result.stderr, b'Deployment candidate refused\n')
         CAPTURES.append(capture)
+
+    def test_private_cli_supported_unscoped_public_gua_with_null_admin_ipv6(self):
+        value = manifest(False); value['public']['ipv6'] = '2001:4860::1'
+        result, capture = self.run_private(encoded(value))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b'')
+        output = json.loads(result.stdout)
+        self.assertEqual(output['source']['sha256'], capture['input_sha256'])
+        self.assertEqual(output['ssh_policy']['listen_addresses'], ['192.168.90.10'])
+        self.assertIn('ip6 daddr 2001:4860::1 tcp dport', output['files'][1]['content'])
+        self.assertTrue(all(item is False for item in output['authority'].values()))
+        CAPTURES.append(capture)
+
+    def test_private_cli_public_site_local_and_reserved_refuse_without_json(self):
+        for address in ('fec0::1', '4000::1'):
+            with self.subTest(address=address):
+                value = manifest(); value['public']['ipv6'] = address
+                result, capture = self.run_private(encoded(value))
+                self.assertEqual(result.returncode, 75)
+                self.assertEqual(result.stdout, b'')
+                self.assertEqual(result.stderr, b'Deployment candidate refused\n')
+                CAPTURES.append(capture)
+
+    def test_private_cli_public_and_router_scopes_including_escaped_newline_refuse(self):
+        for field, suffix in (('public', '%eth0'), ('public', '%x\n  accept'),
+                              ('router', '%eth0'), ('router', '%x\n  accept')):
+            with self.subTest(field=field, suffix=suffix):
+                value = manifest()
+                if field == 'public': value['public']['ipv6'] = '2001:4860::1' + suffix
+                else: value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2' + suffix)
+                data = encoded(value)
+                self.assertEqual(data.count(b'\n'), 1)
+                result, capture = self.run_private(data)
+                self.assertEqual(result.returncode, 75)
+                self.assertEqual(result.stdout, b'')
+                self.assertEqual(result.stderr, b'Deployment candidate refused\n')
+                CAPTURES.append(capture)
 
     def test_standalone_public_cli_arity_precedes_preflight_state_and_python(self):
         for arguments in (['--deployment-policy'], ['--deployment-policy', '/missing', 'extra']):

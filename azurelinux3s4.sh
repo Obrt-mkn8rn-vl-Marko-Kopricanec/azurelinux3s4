@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.56.0
+S4_VERSION=0.56.1
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -8047,12 +8047,13 @@ def deployment_text(value, pattern, maximum):
 
 
 def deployment_address(value, version):
-    if type(value) is not str or len(value) > 64:
+    if (type(value) is not str or len(value) > 64
+            or not dep_policy_re.fullmatch(r'[0-9a-f:.]+', value)):
         raise ValueError('explicit literal address required')
     address = dep_ip.ip_address(value)
     if (address.version != version or str(address) != value or address.is_unspecified
             or address.is_loopback or address.is_link_local or address.is_multicast
-            or (version == 6 and address.ipv4_mapped is not None)):
+            or (version == 6 and (address.scope_id is not None or address.ipv4_mapped is not None))):
         raise ValueError('unsupported server address')
     return address
 
@@ -8105,6 +8106,10 @@ def deployment_manifest(value):
     for version, key in ((4, 'ipv4'), (6, 'ipv6')):
         if value['public'][key] is not None:
             address = deployment_address(value['public'][key], version)
+            # Repository profile: currently allocated GUA block, not assignment proof.
+            if (version == 6 and (address not in dep_ip.ip_network('2000::/3')
+                    or address.is_reserved or address.is_site_local)):
+                raise ValueError('unsupported public IPv6 GUA profile')
             if (not address.is_global and (version == 6 or value['public']['topology'] != 'nat'
                     or not any(address in dep_ip.ip_network(prefix) for prefix in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')))
                     or address in dep_ip.ip_network(DEP_ADMIN4 if version == 4 else DEP_ADMIN6)):
