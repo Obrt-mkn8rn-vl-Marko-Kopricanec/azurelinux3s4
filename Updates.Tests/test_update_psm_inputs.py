@@ -170,7 +170,7 @@ class PsmInputPrivateTests(unittest.TestCase):
 
     def test_owned_private_binary_success_binds_eighteen_original_hashes_and_no_runtime_authority(self):
         proof = self.proof(trigger=False); data = json.dumps(proof).encode(); self.path.write_bytes(data)
-        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 20)
+        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 21)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual(self.path.read_bytes(), data)
         for flag in self.namespace['PSM_INPUT_AUTHORITIES']: self.assertIs(observed['psm_input_observation'][flag], False)
@@ -248,7 +248,7 @@ class PsmInputPipelineTests(unittest.TestCase):
     def test_interpreter_removal_bypasses_do_not_enable_or_borrow_psm_source_projection(self):
         source = triggers.emitted()
         self.assertIn('psm_inputs_projection = False', source)
-        self.assertTrue(source.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_failure_observe))\n'))
+        self.assertTrue(source.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_verification_observe))\n'))
         self.assertEqual(source.count('def psm_input_sample('), 1)
         self.assertIn('psm_inputs_projection = True', effects_program())
 

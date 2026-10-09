@@ -187,7 +187,7 @@ class PsmFailurePrivateTests(unittest.TestCase):
 
     def test_owned_private_zero_success_binds_twenty_original_hashes_and_false_authorities(self):
         proof = self.proof(trigger=False); data = json.dumps(proof).encode(); self.path.write_bytes(data)
-        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 20)
+        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 21)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         for flag in self.namespace['PSM_FAILURE_AUTHORITIES']: self.assertIs(observed['psm_failure_observation'][flag], False)
         self.assertEqual(self.path.read_bytes(), data)
@@ -280,7 +280,7 @@ class PsmFailurePipelineTests(unittest.TestCase):
     def test_shipped_mandatory_hook_default_false_and_bypass_enablement_stay_distinct(self):
         source = triggers.emitted(); delivery = (triggers.effects.SOURCE.parent / 'Updates/diagnostics.sh.in').read_text()
         self.assertIn('psm_failures_projection = False', source)
-        self.assertTrue(source.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_failure_observe))\n'))
+        self.assertTrue(source.endswith('if trigger_execution:\n    raise SystemExit(trigger_main(psm_verification_observe))\n'))
         self.assertEqual(source.count('def psm_failure_sample('), 1)
         self.assertIn('psm_failures_projection = True', delivery)
         native = (triggers.effects.SOURCE.parent / 'Updates/rpm_test.py').read_text()

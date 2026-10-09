@@ -39,6 +39,7 @@ MODULES = (
     "test_update_psm_inputs",
     "test_update_psm_routes",
     "test_update_psm_failures",
+    "test_update_psm_verification",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",

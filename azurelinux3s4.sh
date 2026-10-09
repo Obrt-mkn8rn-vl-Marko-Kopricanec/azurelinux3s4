@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.54.0
+S4_VERSION=0.55.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -1944,6 +1944,118 @@ def psm_failure_observe(proof, comparator_factory=None):
     proof['psm_failure_observation'] = {**receipt, 'current_zero_failure_counts_observed': bool(receipt['before']),
         'fresh_runtime_failure_state_required': True, **{flag: False for flag in PSM_FAILURE_AUTHORITIES}}
     return proof
+"""CURRENT verification-mask transition, not authenticated or future PSM state."""
+import ctypes as C
+import hashlib
+import json
+import os
+
+psm_verification_projection = False
+PSM_VERIFICATION_BYTES = 8 * 1024 * 1024
+PSM_UNVERIFIED = 1 << 30
+PSM_VERIFICATION_AUTHORITIES = (*PSM_FAILURE_AUTHORITIES,
+    'transaction_verification_state_authenticated', 'verification_algorithms_approved',
+    'installed_header_verification_observed', 'runtime_verification_state_continuous',
+    'future_package_verification_complete')
+
+
+def psm_verification_bind(lib):
+    api = transaction_element_bind(lib)
+    for name, result in (('rpmteVerified', C.c_int), ('rpmtsVSFlags', C.c_uint),
+                         ('rpmtsVfyFlags', C.c_uint), ('rpmtsVfyLevel', C.c_int)):
+        try: function = getattr(lib, name)
+        except AttributeError as error: raise ValueError('PSM verification symbol is missing: ' + name) from error
+        function.restype, function.argtypes = result, (C.c_void_p,)
+        api[name] = function
+    return api
+
+
+def psm_verification_rows(plan, elements, rows):
+    transaction_element_rows(plan, elements)
+    if not isinstance(rows, list) or len(rows) != len(elements):
+        raise ValueError('PSM verification complete rows are missing')
+    for element, row in zip(elements, rows):
+        if (not isinstance(row, dict) or set(row) != {'element', 'verification_mask'}
+                or not trigger_iterator_equal(row['element'], element)
+                or type(row['verification_mask']) is not int
+                or row['verification_mask'] not in (0, 1, 2, 3, PSM_UNVERIFIED)):
+            raise ValueError('PSM verification row differs from the complete current element or supported mask')
+
+
+def psm_verification_sample(api, transaction, database, handles, plan, elements):
+    # Borrow existing TS/DB/TE handles only; no new allocation, link or free.
+    transaction_element_rows(plan, elements)
+    if (type(transaction) is not int or transaction <= 0 or type(database) is not int
+            or database <= 0 or database == transaction or not isinstance(handles, list)
+            or len(handles) != len(elements) or len(handles) > TRANSACTION_ELEMENT_LIMIT
+            or any(type(handle) is not int or handle <= 0 or handle in (transaction, database) for handle in handles)
+            or len(set(handles)) != len(handles)):
+        raise ValueError('PSM verification complete borrowed handles are unsupported')
+    def context():
+        count = api['rpmtsNElements'](transaction)
+        current, mode = api['rpmtsGetRdb'](transaction), api['rpmtsGetDBMode'](transaction)
+        policy = (api['rpmtsVSFlags'](transaction), api['rpmtsVfyFlags'](transaction), api['rpmtsVfyLevel'](transaction))
+        if (type(current) is not int or current != database or type(mode) is not int or mode != os.O_RDONLY
+                or type(count) is not int or count != len(handles)
+                or any(type(value) is not int for value in policy) or policy != (0, 0, 3)):
+            raise ValueError('PSM verification borrowed context or digest/signature policy differs')
+        order = [api['rpmtsElement'](transaction, index) for index in range(len(handles))]
+        if any(type(handle) is not int for handle in order) or order != handles:
+            raise ValueError('PSM verification borrowed element order differs')
+    context()
+    controls = tuple(api[name](None) for name in ('rpmteVerified', 'rpmtsVSFlags', 'rpmtsVfyFlags', 'rpmtsVfyLevel'))
+    if any(type(value) is not int for value in controls) or controls != (0, 0, 0, 0):
+        raise ValueError('PSM verification NULL-zero getter controls failed')
+    samples = []
+    for _ in range(2):
+        rows = [{'element': element, 'verification_mask': api['rpmteVerified'](handle)}
+                for handle, element in zip(handles, elements)]
+        psm_verification_rows(plan, elements, rows); samples.append(rows)
+    if not trigger_iterator_equal(samples[0], samples[1]):
+        raise ValueError('PSM verification complete mask readback changed')
+    context()
+    return samples[0]
+
+
+def psm_verification_receipt(inventory, plan, elements, before, after):
+    rebuilt = transaction_element_receipt(inventory, plan, elements['before'], elements['after'])
+    if not trigger_iterator_equal(elements, rebuilt):
+        raise ValueError('PSM verification ordered element receipt differs')
+    psm_verification_rows(plan, elements['before'], before); psm_verification_rows(plan, elements['after'], after)
+    encoded = json.dumps({'before': before, 'after': after}, sort_keys=True, separators=(',', ':')).encode('ascii')
+    if len(encoded) > PSM_VERIFICATION_BYTES:
+        raise ValueError('PSM verification observation exceeds its serialization bound')
+    return {'schema': 1, 'before': before, 'after': after, 'elements': len(before),
+        'rows_bytes': len(encoded), 'rows_sha256': hashlib.sha256(encoded).hexdigest(),
+        'samples': 2, 'mask_readback_passes_per_sample': 2, 'null_controls': 8,
+        'verification_policy': {'header_flags': 0, 'package_flags': 0, 'required_types': 3},
+        'new_rpm_api_calls': 32 + 8 * len(before), 'new_verification_getter_calls': 2 + 4 * len(before),
+        'current_verification_masks_observed': bool(before),
+        'baseline_sha256': inventory['baseline_sha256'], 'inventory_sha256': inventory['entries_sha256'],
+        'scope': 'CURRENT rpmteVerified masks on SAME ordered borrowed elements before/after qualified TEST; masks and NULL controls are native declarations, not cryptographic authentication or future processing eligibility',
+        **{flag: False for flag in PSM_VERIFICATION_AUTHORITIES}}
+
+
+def psm_verification_observe(proof, comparator_factory=None):
+    proof = psm_failure_observe(proof, comparator_factory=comparator_factory)
+    source = proof['effects']['installed_versions']
+    inventory, plan = transaction_element_plan({row['instance']: row for row in source['entries']},
+        proof['baseline'], proof['effects']['incoming'], proof['effects']['removals'])
+    raw = proof['effects']['current_psm_verification']
+    if not isinstance(raw, dict): raise ValueError('PSM verification raw observation is missing')
+    receipt = psm_verification_receipt(inventory, plan, proof['effects']['ordered_transaction_elements'], raw['before'], raw['after'])
+    if not trigger_iterator_equal(raw, receipt):
+        raise ValueError('PSM verification raw receipt differs from rebuilt correspondence')
+    if any(row['verification_mask'] != PSM_UNVERIFIED for row in receipt['before']):
+        raise ValueError('PSM verification fresh unverified element prerequisite differs')
+    for row in receipt['after']:
+        expected = 3 if row['element']['owner']['kind'] == 'incoming' else PSM_UNVERIFIED
+        if row['verification_mask'] != expected:
+            raise ValueError('PSM verification post-TEST incoming digest/signature or unverified removal prerequisite differs')
+    proof['psm_verification_observation'] = {**receipt,
+        'current_incoming_digest_and_signature_masks_observed': bool(plan['incoming']),
+        'fresh_runtime_verification_required': True, **{flag: False for flag in PSM_VERIFICATION_AUTHORITIES}}
+    return proof
 """Observe literal file-trigger prefixes; never select files or execute scripts."""
 
 import hashlib
@@ -2999,6 +3111,12 @@ try:
             psm_failure_api = psm_failure_bind(lib)
             psm_failure_before = psm_failure_sample(psm_failure_api, ts, element_database, element_handles, element_plan, element_before)
             errors()
+        if effects and psm_verification_projection:
+            if not transaction_elements_projection:
+                raise ValueError("PSM verification requires the current ordered element projection")
+            psm_verification_api = psm_verification_bind(lib)
+            psm_verification_before = psm_verification_sample(psm_verification_api, ts, element_database, element_handles, element_plan, element_before)
+            errors()
         if effects and trigger_counts_projection:
             count_inventory, count_rows = trigger_count_plan(installed_effects, before, incoming_effects)
             count_api = trigger_count_bind(lib)
@@ -3060,6 +3178,10 @@ try:
         if effects and psm_failures_projection:
             psm_failure_after = psm_failure_sample(psm_failure_api, ts, final_element_database, final_element_handles, element_plan, element_after)
             psm_failure_observation = psm_failure_receipt(element_inventory, element_plan, element_observation, psm_failure_before, psm_failure_after)
+            errors()
+        if effects and psm_verification_projection:
+            psm_verification_after = psm_verification_sample(psm_verification_api, ts, final_element_database, final_element_handles, element_plan, element_after)
+            psm_verification_observation = psm_verification_receipt(element_inventory, element_plan, element_observation, psm_verification_before, psm_verification_after)
             errors()
     finally:
         for fd in opened.values():
@@ -3123,6 +3245,8 @@ try:
             proof["effects"]["current_psm_inputs"] = psm_input_observation
         if psm_failures_projection:
             proof["effects"]["current_psm_failures"] = psm_failure_observation
+        if psm_verification_projection:
+            proof["effects"]["current_psm_verification"] = psm_verification_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",
@@ -3407,6 +3531,8 @@ def trigger_main(after=None):
             proof['psm_route_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         if 'psm_failure_observation' in proof:
             proof['psm_failure_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
+        if 'psm_verification_observation' in proof:
+            proof['psm_verification_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         proof['trigger_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         output = json.dumps(proof, sort_keys=True)
         if len(output.encode('utf-8')) > TRIGGER_LIMIT:
@@ -4459,7 +4585,7 @@ def psm_route_observe(proof, comparator_factory=None):
     proof['psm_route_observation'] = psm_route_forecast(proof)
     return proof
 if trigger_execution:
-    raise SystemExit(trigger_main(psm_failure_observe))
+    raise SystemExit(trigger_main(psm_verification_observe))
 PY
 }
 
@@ -6017,7 +6143,7 @@ PY
         [[ -z $S4_CAPACITY_MODE ]] || return 75
         s4_rpm_effects_program >"$directory/test.py" || return 75
         if [[ -z $S4_INTERPRETERS_MODE && -z $S4_REMOVALS_MODE ]]; then
-            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\ntrigger_counts_projection = True\ntrigger_iterators_projection = True\ntrigger_walk_projection = True\ntransaction_elements_projection = True\npsm_inputs_projection = True\npsm_failures_projection = True\n' >>"$directory/test.py" || return 75
+            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\ntrigger_counts_projection = True\ntrigger_iterators_projection = True\ntrigger_walk_projection = True\ntransaction_elements_projection = True\npsm_inputs_projection = True\npsm_failures_projection = True\npsm_verification_projection = True\n' >>"$directory/test.py" || return 75
         fi
     else
         : >"$directory/test.py"

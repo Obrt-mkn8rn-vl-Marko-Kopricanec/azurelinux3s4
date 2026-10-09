@@ -172,6 +172,10 @@ def bind_iterator_delivery(namespace, proof):
     failures = [{'element': row, 'failure_count': 0} for row in elements]
     proof['effects']['current_psm_failures'] = namespace['psm_failure_receipt'](inventory, plan,
         proof['effects']['ordered_transaction_elements'], failures, failures)
+    masks_before = [{'element': row, 'verification_mask': namespace['PSM_UNVERIFIED']} for row in elements]
+    masks_after = [{'element': row, 'verification_mask': 3 if row['owner']['kind'] == 'incoming' else namespace['PSM_UNVERIFIED']} for row in elements]
+    proof['effects']['current_psm_verification'] = namespace['psm_verification_receipt'](inventory, plan,
+        proof['effects']['ordered_transaction_elements'], masks_before, masks_after)
 
 
 class TriggerProofTests(unittest.TestCase):
@@ -363,7 +367,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation');source.pop('trigger_iterator_observation');source.pop('trigger_walk_observation');source.pop('transaction_element_observation');source.pop('psm_goal_observation');source.pop('psm_input_observation');source.pop('psm_route_observation'); source.pop('psm_failure_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation');source.pop('trigger_argument_observation');source.pop('trigger_iterator_observation');source.pop('trigger_walk_observation');source.pop('transaction_element_observation');source.pop('psm_goal_observation');source.pop('psm_input_observation');source.pop('psm_route_observation'); source.pop('psm_failure_observation'); source.pop('psm_verification_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)

@@ -261,6 +261,8 @@ def trigger_main(after=None):
             proof['psm_route_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         if 'psm_failure_observation' in proof:
             proof['psm_failure_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
+        if 'psm_verification_observation' in proof:
+            proof['psm_verification_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         proof['trigger_input_observation']['input_sha256'] = hashlib.sha256(material).hexdigest()
         output = json.dumps(proof, sort_keys=True)
         if len(output.encode('utf-8')) > TRIGGER_LIMIT:
