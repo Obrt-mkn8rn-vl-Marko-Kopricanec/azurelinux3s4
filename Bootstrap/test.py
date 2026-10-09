@@ -71,6 +71,7 @@ MODULES = (
     "test_deployment_dependency_metadata",
     "test_deployment_services",
     "test_deployment_credentials",
+    "test_deployment_dns_configuration",
 )
 
 

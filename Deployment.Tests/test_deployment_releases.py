@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/credentials.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -57,12 +57,15 @@ class ReleaseFixture(unittest.TestCase):
                     for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application'))}
             if app == 'mk8.dns':
                 zone = {'ZoneId': '11111111-1111-1111-1111-111111111111', 'Origin': 'example.test.'}
-                inputs['control-plane.json'] = encoded({'PublicationSocket':
+                common = {'Epoch': '22222222-2222-2222-2222-222222222222', 'TargetNode': 'r630-authoritative-replica', 'Zones': [zone]}
+                inputs['control-plane.json'] = encoded({**common, 'PublicationSocket':
                     '/run/mk8.dns/authoritative-replica/publication.sock',
                     'KeyFile': '/run/mk8.dns/controller/inputs/key.pem',
-                    'ConnectionStringFile': '/run/mk8.dns/controller/inputs/database.txt', 'Zones': [zone]})
-                inputs['authority.json'] = encoded({'KeyFile': '/run/mk8.dns/authoritative-replica/inputs/key.pem',
-                                                    'Zones': [zone]})
+                    'ConnectionStringFile': '/run/mk8.dns/controller/inputs/database.txt',
+                    'Grants': [{'TenantId': '33333333-3333-3333-3333-333333333333', 'ZoneId': zone['ZoneId'],
+                                'Origin': zone['Origin'], 'Actor': 'private-fixture', 'Expires': '2030-01-01T00:00:00Z',
+                                'CredentialHash': 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE='}]})
+                inputs['authority.json'] = encoded({**common, 'KeyFile': '/run/mk8.dns/authoritative-replica/inputs/key.pem'})
                 for role in ('controller', 'authoritative-replica'):
                     secrets = config / role; secrets.mkdir(mode=0o700)
                     key = secrets / 'key.pem'; key.write_bytes(b'finite key bytes, not authenticated PEM\n'); key.chmod(0o600)

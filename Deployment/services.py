@@ -37,7 +37,7 @@ def application_environment(data, prefixes):
     return result
 
 
-def application_configuration(app, bindings, plan, credentials=None):
+def application_configuration(app, bindings, plan, credentials=None, dns_configuration=None):
     result, captured = [], {}
     for leaf in REL_CONFIGS[app]:
         path = '/etc/' + app + '/' + leaf
@@ -82,6 +82,9 @@ def application_configuration(app, bindings, plan, credentials=None):
                 '/run/mk8.dns/authoritative-replica/publication.sock'
                 or release_json(captured['authority.json']).get('PublicationSocket') is not None):
             raise ValueError('DNS replica-owned publication socket correspondence')
+        declared = dns_control_observe(captured, plan)
+        if dns_configuration is not None:
+            dns_configuration.extend(declared)
         observed = dns_credential_observe(captured)
         if credentials is not None:
             credentials.extend(observed)
@@ -176,16 +179,17 @@ def application_bundle(data, ssh_producer):
     candidate = deployment_bundle(data, ssh_producer)
     value, source = deployment_decode(data)
     plan = deployment_manifest(value)
-    releases, configuration, units, credentials = [], [], [], []
+    releases, configuration, units, credentials, dns_configuration = [], [], [], [], []
     for app in DEP_APPS:
         observed = release_observe(app, plan['releases'][app])
-        configuration.extend(application_configuration(app, observed['configuration'], plan, credentials))
+        configuration.extend(application_configuration(app, observed['configuration'], plan, credentials, dns_configuration))
         units.extend(application_units(app, observed, plan, credentials if app == 'mk8.dns' else ()))
         releases.append(observed)
     result = {'schema': 1, 'source': source, 'deployment_candidate_sha256': dep_hash.sha256(
                   dep_json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest(),
               'releases': releases, 'configuration': configuration, 'files': units,
               'dns_credentials': credentials,
+              'dns_control_configuration': dns_configuration,
               'dns_credential_helper': deployment_file(DNS_CREDENTIAL_HELPER_PATH[1:], '0755', DNS_CREDENTIAL_PROGRAM),
               'authority': {name: False for name in APP_AUTHORITY}}
     if len(dep_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) + 1 > APP_OUTPUT_LIMIT:
