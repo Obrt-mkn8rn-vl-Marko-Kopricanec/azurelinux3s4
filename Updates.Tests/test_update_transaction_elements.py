@@ -204,7 +204,7 @@ class TransactionElementPrivateTests(unittest.TestCase):
 
     def test_owned_private_success_binds_all_sixteen_original_byte_receipts(self):
         proof = self.proof(trigger=False); data = json.dumps(proof).encode(); self.path.write_bytes(data)
-        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 18)
+        observed = json.loads(self.run_guard().stdout); self.assertEqual(len(sources.RECEIPTS), 19)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual(self.path.read_bytes(), data)
 

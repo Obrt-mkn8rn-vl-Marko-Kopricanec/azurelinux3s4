@@ -37,6 +37,7 @@ MODULES = (
     "test_update_transaction_elements",
     "test_update_psm_goals",
     "test_update_psm_inputs",
+    "test_update_psm_routes",
     "test_update_interpreters",
     "test_update_interpreter_paths",
     "test_update_kernel_layout",

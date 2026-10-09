@@ -40,8 +40,9 @@ __name__ = 's4_trigger_library'
 # @s4-include Updates/header_iteration.py
 # @s4-include Updates/trigger_arguments.py
 # @s4-include Updates/psm_goals.py
+# @s4-include Updates/psm_routes.py
 if trigger_execution:
-    raise SystemExit(trigger_main(psm_input_observe))
+    raise SystemExit(trigger_main(psm_route_observe))
 PY
 }
 
