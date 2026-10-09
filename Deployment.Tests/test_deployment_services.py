@@ -116,8 +116,8 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
         controller = units['systemd/mk8-dns-controller.service']
         authority = units['systemd/mk8-dns-authoritative-replica.service']
         gateway = units['systemd/mk8-dns-gateway4.service']
-        self.assertIn('--role controller --control %d/control.json\n', controller)
-        self.assertIn('--role authoritative-replica --control %d/control.json --publication-socket /run/mk8.dns/authoritative-replica/publication.sock\n', authority)
+        self.assertIn('--role controller --control /run/mk8.dns/controller/inputs/control.json\n', controller)
+        self.assertIn('--role authoritative-replica --control /run/mk8.dns/authoritative-replica/inputs/control.json --publication-socket /run/mk8.dns/authoritative-replica/publication.sock\n', authority)
         self.assertNotIn('--dns-address', controller + authority)
         self.assertIn('--socket /run/mk8.dns/authoritative-replica/control.sock --health-port 18053 --dns-address 192.168.1.20 --dns-port 53\n', gateway)
         self.assertNotIn('CAP_NET_BIND_SERVICE', controller + authority)

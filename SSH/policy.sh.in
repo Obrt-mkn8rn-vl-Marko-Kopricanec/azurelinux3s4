@@ -36,6 +36,7 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/policy.py
 # @s4-include Deployment/publication.py
 # @s4-include Deployment/releases.py
+# @s4-include Deployment/credentials.py
 # @s4-include Deployment/services.py
 action = sys.argv[1]
 if action == 'applications':

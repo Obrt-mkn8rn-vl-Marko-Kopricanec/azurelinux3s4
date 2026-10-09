@@ -37,7 +37,7 @@ def application_environment(data, prefixes):
     return result
 
 
-def application_configuration(app, bindings, plan):
+def application_configuration(app, bindings, plan, credentials=None):
     result, captured = [], {}
     for leaf in REL_CONFIGS[app]:
         path = '/etc/' + app + '/' + leaf
@@ -82,6 +82,9 @@ def application_configuration(app, bindings, plan):
                 '/run/mk8.dns/authoritative-replica/publication.sock'
                 or release_json(captured['authority.json']).get('PublicationSocket') is not None):
             raise ValueError('DNS replica-owned publication socket correspondence')
+        observed = dns_credential_observe(captured)
+        if credentials is not None:
+            credentials.extend(observed)
     return result
 
 
@@ -115,7 +118,7 @@ def application_unit(name, app, role, release, arguments=(), extra=(), privilege
     return deployment_file('systemd/' + name + '.service', '0644', '\n'.join(lines))
 
 
-def application_units(app, release, plan):
+def application_units(app, release, plan, credentials=()):
     config = '/etc/' + app + '/'
     if app == 'mk8.sava':
         common = ('EnvironmentFile=' + config + 'policy.env', 'LoadCredential=rpc-key:' + config + 'rpc.key',
@@ -145,14 +148,17 @@ def application_units(app, release, plan):
                            'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false'),
                     after=('postgresql.service',)) for role in ('worker', 'gateway')]
     units = []
+    if [row['role'] for row in credentials] != ['controller', 'authoritative-replica']:
+        raise ValueError('fresh DNS credential observations required')
     for role, leaf in (('controller', 'control-plane.json'), ('authoritative-replica', 'authority.json')):
         runtime = 'mk8.dns/' + role
+        observed = next(row for row in credentials if row['role'] == role)
         arguments = ['--socket', '/run/' + runtime + '/control.sock', '--state', '/var/lib/mk8.dns/' + role,
-                     '--node', 'r630-' + role, '--role', role, '--control', '%d/control.json']
+                     '--node', 'r630-' + role, '--role', role, '--control', '/run/' + runtime + '/inputs/control.json']
         if role == 'authoritative-replica':
             arguments.extend(('--publication-socket', '/run/' + runtime + '/publication.sock'))
         units.append(application_unit('mk8-dns-' + role, app, 'application', release, arguments,
-                     extra=('LoadCredential=control.json:' + config + leaf,
+                     extra=dns_credential_unit(observed) + (
                             'RuntimeDirectory=' + runtime, 'RuntimeDirectoryMode=0700'), after=('postgresql.service',)))
     ports = set(plan['private_ports'].values())
     for index, listener in enumerate(plan['public']):
@@ -170,15 +176,17 @@ def application_bundle(data, ssh_producer):
     candidate = deployment_bundle(data, ssh_producer)
     value, source = deployment_decode(data)
     plan = deployment_manifest(value)
-    releases, configuration, units = [], [], []
+    releases, configuration, units, credentials = [], [], [], []
     for app in DEP_APPS:
         observed = release_observe(app, plan['releases'][app])
-        configuration.extend(application_configuration(app, observed['configuration'], plan))
-        units.extend(application_units(app, observed, plan))
+        configuration.extend(application_configuration(app, observed['configuration'], plan, credentials))
+        units.extend(application_units(app, observed, plan, credentials if app == 'mk8.dns' else ()))
         releases.append(observed)
     result = {'schema': 1, 'source': source, 'deployment_candidate_sha256': dep_hash.sha256(
                   dep_json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest(),
               'releases': releases, 'configuration': configuration, 'files': units,
+              'dns_credentials': credentials,
+              'dns_credential_helper': deployment_file(DNS_CREDENTIAL_HELPER_PATH[1:], '0755', DNS_CREDENTIAL_PROGRAM),
               'authority': {name: False for name in APP_AUTHORITY}}
     if len(dep_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) + 1 > APP_OUTPUT_LIMIT:
         raise ValueError('application candidate output bound')
