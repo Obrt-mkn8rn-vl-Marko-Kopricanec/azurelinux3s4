@@ -16,10 +16,16 @@ s4_deployment_publish() {
     s4_ssh_candidate publish "$1"
 }
 
+s4_application_service_policy() {
+    [[ $# == 1 ]] || return 64
+    s4_ssh_candidate applications "$1"
+}
+
 s4_ssh_candidate() {
-    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish ) ) ]] || return 64
+    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications ) ) ]] || return 64
     local allowance=30
     [[ $1 != publish ]] || allowance=90
+    [[ $1 != applications ]] || allowance=300
     # Policy actions only produce bytes. Explicit publish writes inactive private
     # bundles only; LAN/caller/key/native/activation authority remains unmet.
     timeout --kill-after=5s "${allowance}s" python3 -I - "$@" <<'PY'
@@ -29,7 +35,12 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/configuration.py
 # @s4-include Deployment/policy.py
 # @s4-include Deployment/publication.py
+# @s4-include Deployment/releases.py
+# @s4-include Deployment/services.py
 action = sys.argv[1]
+if action == 'applications':
+    sys.argv = [sys.argv[0], sys.argv[2]]
+    raise SystemExit(application_main(bundle))
 if action == 'publish':
     sys.argv = [sys.argv[0], sys.argv[2]]
     raise SystemExit(publication_main(bundle))

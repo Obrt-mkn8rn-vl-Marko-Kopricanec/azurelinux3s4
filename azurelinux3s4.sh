@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.57.0
+S4_VERSION=0.58.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -7588,10 +7588,16 @@ s4_deployment_publish() {
     s4_ssh_candidate publish "$1"
 }
 
+s4_application_service_policy() {
+    [[ $# == 1 ]] || return 64
+    s4_ssh_candidate applications "$1"
+}
+
 s4_ssh_candidate() {
-    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish ) ) ]] || return 64
+    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications ) ) ]] || return 64
     local allowance=30
     [[ $1 != publish ]] || allowance=90
+    [[ $1 != applications ]] || allowance=300
     # Policy actions only produce bytes. Explicit publish writes inactive private
     # bundles only; LAN/caller/key/native/activation authority remains unmet.
     timeout --kill-after=5s "${allowance}s" python3 -I - "$@" <<'PY'
@@ -8627,7 +8633,511 @@ def publication_main(ssh_producer):
         return 75
     print(output.decode('ascii'), end='')
     return 0
+"""Observe complete protected self-contained releases; do not execute their bytes."""
+
+import struct as rel_struct
+
+
+REL_MANIFEST_LIMIT = 4 * 1024 * 1024
+REL_FILE_LIMIT = 256 * 1024 * 1024
+REL_TOTAL_LIMIT = 2 * 1024 * 1024 * 1024
+REL_FILES = 4096
+REL_ENTRIES = 8192
+REL_DEP_REFERENCES = 8192
+REL_PROGRAMS = {
+    'mk8.sava': {'application': 'Mk8.Sava.Application', 'gateway': 'Mk8.Sava.Gateway'},
+    'mk8.drava': {'application': 'mk8.drava.Application', 'gateway': 'mk8.drava.Gateway'},
+    'mk8.dns': {'application': 'mk8.dns.Application', 'gateway': 'mk8.dns.Gateway'},
+    'mk8.email': {'worker': 'mk8.email.Application.Worker', 'gateway': 'mk8.email.Gateway'},
+}
+REL_CONFIGS = {
+    'mk8.sava': ('policy.env', 'application.env', 'gateway.env', 'rpc.key'),
+    'mk8.drava': ('application.json', 'gateway.json'),
+    'mk8.dns': ('control-plane.json', 'authority.json'),
+    'mk8.email': ('gateway.json', 'worker.json'),
+}
+
+
+def release_relative(value):
+    deployment_path('/' + value if type(value) is str else value)
+    return value
+
+
+def release_json(data):
+    if (not data or len(data) > REL_MANIFEST_LIMIT or not data.endswith(b'\n')
+            or any(byte < 32 and byte != 10 or byte > 126 for byte in data)):
+        raise ValueError('bounded ASCII/LF release JSON required')
+    return dep_json.loads(data, object_pairs_hook=deployment_object,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite release number')))
+
+
+def release_plan(data, app, declaration):
+    if dep_hash.sha256(data).hexdigest() != declaration['manifest_sha256']:
+        raise ValueError('release manifest digest mismatch')
+    value = release_json(data)
+    deployment_fields(value, ('schema', 'app', 'commit', 'tree', 'profile', 'files', 'configuration'))
+    if (type(value['schema']) is not int or value['schema'] != 1 or value['app'] != app
+            or value['commit'] != declaration['commit'] or value['tree'] != declaration['tree']
+            or value['profile'] != 'self-contained-net10-linux-x64'):
+        raise ValueError('release declaration correspondence')
+    rows = value['files']
+    if type(rows) is not list or not 1 <= len(rows) <= REL_FILES:
+        raise ValueError('release file count bound')
+    files, total = {}, 0
+    for row in rows:
+        deployment_fields(row, ('path', 'bytes', 'sha256', 'mode'))
+        name = release_relative(row['path'])
+        if (name == 'release.json' or name in files or type(row['bytes']) is not int
+                or not 0 <= row['bytes'] <= REL_FILE_LIMIT or row['mode'] not in ('0644', '0755')):
+            raise ValueError('release file identity/type/bound')
+        deployment_text(row['sha256'], r'[0-9a-f]{64}', 64)
+        total += row['bytes']
+        if total > REL_TOTAL_LIMIT:
+            raise ValueError('release aggregate byte bound')
+        files[name] = dict(row)
+    if list(files) != sorted(files):
+        raise ValueError('release files must be unique and sorted')
+    directories = set()
+    for name in files:
+        parts = name.split('/')
+        directories.update('/'.join(parts[:index]) for index in range(1, len(parts)))
+        if parts[0] not in REL_PROGRAMS[app] or len(parts) < 2:
+            raise ValueError('release role directory required')
+    if directories & files.keys() or len(directories) + len(files) + 1 > REL_ENTRIES:
+        raise ValueError('release path prefix or entry bound')
+    for role, program in REL_PROGRAMS[app].items():
+        for suffix in ('', '.dll', '.deps.json', '.runtimeconfig.json'):
+            name = role + '/' + program + suffix
+            if name not in files or files[name]['mode'] != ('0755' if not suffix else '0644') or not files[name]['bytes']:
+                raise ValueError('complete role entry required')
+        for leaf in ('libhostfxr.so', 'libhostpolicy.so', 'libcoreclr.so', 'System.Private.CoreLib.dll'):
+            if role + '/' + leaf not in files or not files[role + '/' + leaf]['bytes']:
+                raise ValueError('self-contained runtime files required')
+    deployment_fields(value['configuration'], REL_CONFIGS[app])
+    for digest in value['configuration'].values():
+        deployment_text(digest, r'[0-9a-f]{64}', 64)
+    return files, directories, total, value['configuration']
+
+
+def release_directory(info):
+    if (not dep_stat.S_ISDIR(info.st_mode) or info.st_uid != DEP_TRUSTED_UID
+            or info.st_gid != DEP_TRUSTED_UID or dep_stat.S_IMODE(info.st_mode) != 0o755):
+        raise ValueError('release requires protected root-owned 0755 directories')
+
+
+def release_file(parent, name, limit, mode, expected=None, capture=False):
+    def admit(info):
+        if (not dep_stat.S_ISREG(info.st_mode) or info.st_uid != DEP_TRUSTED_UID
+                or info.st_gid != DEP_TRUSTED_UID or info.st_nlink != 1
+                or dep_stat.S_IMODE(info.st_mode) != mode or not 0 <= info.st_size <= limit):
+            raise ValueError('unprotected or oversized release file')
+        if expected is not None and info.st_size != expected['bytes']:
+            raise ValueError('release file length mismatch')
+    before = dep_os.stat(name, dir_fd=parent, follow_symlinks=False)
+    admit(before)
+    with dep_context.ExitStack() as stack:
+        fd = dep_os.open(name, DEP_OPEN, dir_fd=parent)
+        stack.callback(dep_os.close, fd)
+        initial = dep_os.fstat(fd)
+        admit(initial)
+        if deployment_identity(before) != deployment_identity(initial):
+            raise ValueError('release file changed on open')
+        results = []
+        for _ in range(2):
+            dep_os.lseek(fd, 0, dep_os.SEEK_SET)
+            digest, size, kept = dep_hash.sha256(), 0, bytearray()
+            while True:
+                chunk = dep_os.read(fd, min(128 * 1024, limit + 1 - size))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError('actual release EOF bound')
+                digest.update(chunk)
+                kept.extend(chunk if capture else chunk[:max(0, 64 - len(kept))])
+            results.append((size, digest.hexdigest(), bytes(kept)))
+        if results[0] != results[1] or results[0][0] != initial.st_size:
+            raise ValueError('release byte readback mismatch')
+        if expected is not None and results[0][1] != expected['sha256']:
+            raise ValueError('release content digest mismatch')
+        for info in (dep_os.fstat(fd), dep_os.stat(name, dir_fd=parent, follow_symlinks=False)):
+            admit(info)
+            if deployment_identity(info) != deployment_identity(initial):
+                raise ValueError('release held/path metadata changed')
+    return results[0], initial
+
+
+def release_entries(fd, budget):
+    names = []
+    with dep_os.scandir(fd) as entries:
+        for entry in entries:
+            budget[0] += 1
+            if budget[0] > REL_ENTRIES * 2:
+                raise ValueError('release scan entry bound')
+            release_relative(entry.name)
+            if '/' in entry.name or entry.name in names:
+                raise ValueError('release directory entry identity')
+            names.append(entry.name)
+    return sorted(names)
+
+
+def release_elf(data, executable):
+    if (len(data) < 64 or data[:7] != b'\x7fELF\x02\x01\x01'
+            or rel_struct.unpack_from('<H', data, 18)[0] != 62
+            or rel_struct.unpack_from('<H', data, 16)[0] not in ((2, 3) if executable else (3,))
+            or rel_struct.unpack_from('<I', data, 20)[0] != 1):
+        raise ValueError('unsupported declared linux-x64 ELF header')
+
+
+def release_runtime(app, files, observed):
+    summaries = []
+    for role, program in REL_PROGRAMS[app].items():
+        prefix = role + '/'
+        release_elf(observed[prefix + program][2], True)
+        for name, result in observed.items():
+            if name.startswith(prefix) and dep_re.search(r'\.so(?:\.[0-9]+)*$', name):
+                release_elf(result[2], False)
+        runtime = release_json(observed[prefix + program + '.runtimeconfig.json'][2])
+        deployment_fields(runtime, ('runtimeOptions',))
+        options = runtime['runtimeOptions']
+        if (type(options) is not dict or not {'tfm', 'includedFrameworks'} <= options.keys()
+                or options.keys() - {'tfm', 'includedFrameworks', 'configProperties'} or options['tfm'] != 'net10.0'
+                or type(options.get('configProperties', {})) is not dict):
+            raise ValueError('self-contained net10 runtime options required')
+        frameworks = options['includedFrameworks']
+        if type(frameworks) is not list or not 1 <= len(frameworks) <= 2:
+            raise ValueError('runtime framework declarations')
+        names = []
+        for framework in frameworks:
+            deployment_fields(framework, ('name', 'version'))
+            if framework['name'] in names or framework['name'] not in ('Microsoft.NETCore.App', 'Microsoft.AspNetCore.App'):
+                raise ValueError('unsupported or duplicate included framework')
+            deployment_text(framework['version'], r'10\.0\.(?:0|[1-9][0-9]{0,4})', 16)
+            names.append(framework['name'])
+        if set(names) != ({'Microsoft.NETCore.App'} if role == 'worker' else {'Microsoft.NETCore.App', 'Microsoft.AspNetCore.App'}):
+            raise ValueError('complete role frameworks required')
+        deps = release_json(observed[prefix + program + '.deps.json'][2])
+        target = '.NETCoreApp,Version=v10.0/linux-x64'
+        if (type(deps) is not dict or not {'runtimeTarget', 'targets', 'libraries'} <= deps.keys()
+                or deps.keys() - {'runtimeTarget', 'compilationOptions', 'targets', 'libraries'}
+                or type(deps['runtimeTarget']) is not dict or deps['runtimeTarget'].get('name') != target
+                or deps['runtimeTarget'].keys() - {'name', 'signature'}
+                or type(deps['targets']) is not dict or set(deps['targets']) != {target}
+                or type(deps['libraries']) is not dict or type(deps['targets'][target]) is not dict
+                or set(deps['targets'][target]) != set(deps['libraries']) or not 1 <= len(deps['libraries']) <= REL_FILES):
+            raise ValueError('linux-x64 dependency target required')
+        assets, references = set(), 0
+        for library, groups in deps['targets'][target].items():
+            if (type(groups) is not dict or groups.keys() - {'dependencies', 'runtime', 'native', 'resources', 'runtimeTargets'}
+                    or type(deps['libraries'][library]) is not dict):
+                raise ValueError('dependency library correspondence')
+            dependencies = groups.get('dependencies', {})
+            if type(dependencies) is not dict:
+                raise ValueError('typed dependency edges required')
+            for name, version in dependencies.items():
+                if type(version) is not str or name + '/' + version not in deps['libraries']:
+                    raise ValueError('dependency edge outside release target')
+            for kind in ('runtime', 'native', 'resources', 'runtimeTargets'):
+                group = groups.get(kind, {})
+                if type(group) is not dict:
+                    raise ValueError('typed dependency asset group required')
+                references += len(group)
+                if references > REL_DEP_REFERENCES:
+                    raise ValueError('dependency asset reference bound')
+                for asset, metadata in group.items():
+                    release_relative(asset)
+                    if type(metadata) is not dict:
+                        raise ValueError('typed dependency asset metadata required')
+                    if kind == 'runtimeTargets' and (metadata.get('rid') != 'linux-x64' or metadata.get('assetType') not in ('runtime', 'native')):
+                        raise ValueError('unsupported runtime target asset')
+                    # RID publishes may flatten runtime/native package paths.
+                    candidates = {prefix + asset}
+                    if kind != 'resources':
+                        candidates.add(prefix + asset.rsplit('/', 1)[-1])
+                    actual = candidates & files.keys()
+                    if len(actual) != 1:
+                        raise ValueError('dependency asset absent or ambiguous in release')
+                    assets.update(actual)
+        if prefix + program + '.dll' not in assets or prefix + 'System.Private.CoreLib.dll' not in assets:
+            raise ValueError('application/core runtime dependency rows required')
+        summaries.append({'role': role, 'program': program, 'frameworks': frameworks,
+                          'dependency_files': len(assets), 'runtime_target': target})
+    return summaries
+
+
+def release_observe(app, declaration):
+    path = '/opt/' + app + '/releases/' + declaration['commit']
+    parts = deployment_path(path)
+    if dep_os.geteuid() != DEP_TRUSTED_UID:
+        raise ValueError('release observation requires root')
+    with dep_context.ExitStack() as stack:
+        root = dep_os.open('/', DEP_OPEN | dep_os.O_DIRECTORY)
+        stack.callback(dep_os.close, root)
+        initial_root = dep_os.fstat(root)
+        deployment_directory(initial_root)
+        held, links, leaves = [(root, initial_root)], [], []
+        parent = root
+        for name in parts:
+            before = dep_os.stat(name, dir_fd=parent, follow_symlinks=False)
+            release_directory(before)
+            child = dep_os.open(name, DEP_OPEN | dep_os.O_DIRECTORY, dir_fd=parent)
+            stack.callback(dep_os.close, child)
+            current = dep_os.fstat(child)
+            release_directory(current)
+            if deployment_identity(current) != deployment_identity(before):
+                raise ValueError('release ancestry changed on open')
+            links.append((parent, name, before)); held.append((child, current)); parent = child
+        result, info = release_file(parent, 'release.json', REL_MANIFEST_LIMIT, 0o400, capture=True)
+        leaves.append((parent, 'release.json', info))
+        files, directories, total, configuration = release_plan(result[2], app, declaration)
+        observed, observed_identities, budget = {}, {}, [0]
+        directory_identity = list(deployment_identity(held[-1][1]))
+
+        def walk(fd, prefix):
+            names = release_entries(fd, budget)
+            expected = {name[len(prefix):].split('/', 1)[0] for name in files if name.startswith(prefix)}
+            if not prefix:
+                expected.add('release.json')
+            if set(names) != expected:
+                raise ValueError('complete release tree membership mismatch')
+            for leaf in names:
+                name = prefix + leaf
+                if name == 'release.json':
+                    continue
+                if name in directories:
+                    before = dep_os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+                    release_directory(before)
+                    if before.st_dev != info.st_dev:
+                        raise ValueError('cross-device release directory')
+                    child = dep_os.open(leaf, DEP_OPEN | dep_os.O_DIRECTORY, dir_fd=fd)
+                    stack.callback(dep_os.close, child)
+                    current = dep_os.fstat(child)
+                    if deployment_identity(current) != deployment_identity(before):
+                        raise ValueError('release directory changed on open')
+                    held.append((child, current)); links.append((fd, leaf, before))
+                    walk(child, name + '/')
+                else:
+                    json_file = name in {role + '/' + program + suffix
+                                         for role, program in REL_PROGRAMS[app].items()
+                                         for suffix in ('.deps.json', '.runtimeconfig.json')}
+                    limit = REL_MANIFEST_LIMIT if json_file else REL_FILE_LIMIT
+                    value, current = release_file(fd, leaf, limit, int(files[name]['mode'], 8), files[name], json_file)
+                    if current.st_dev != info.st_dev:
+                        raise ValueError('cross-device release file')
+                    observed[name] = value; leaves.append((fd, leaf, current))
+                    observed_identities[name] = list(deployment_identity(current))
+            if release_entries(fd, budget) != names:
+                raise ValueError('release directory scan changed')
+
+        walk(parent, '')
+        if set(observed) != files.keys():
+            raise ValueError('incomplete observed release')
+        runtime = release_runtime(app, files, observed)
+        for fd, previous in held:
+            if deployment_identity(dep_os.fstat(fd)) != deployment_identity(previous):
+                raise ValueError('release held directory changed')
+        for fd, name, previous in links + leaves:
+            if deployment_identity(dep_os.stat(name, dir_fd=fd, follow_symlinks=False)) != deployment_identity(previous):
+                raise ValueError('release path changed')
+        fresh = dep_os.open('/', DEP_OPEN | dep_os.O_DIRECTORY)
+        stack.callback(dep_os.close, fresh)
+        if deployment_identity(dep_os.fstat(fresh)) != deployment_identity(initial_root):
+            raise ValueError('release root changed')
+    return {'app': app, 'directory': path, 'declaration': dict(declaration), 'files': list(files.values()),
+            'directory_identity': directory_identity, 'manifest_identity': list(deployment_identity(info)),
+            'observed_files': [{'path': name, 'identity': observed_identities[name]} for name in sorted(files)],
+            'file_count': len(files), 'payload_bytes': total, 'runtime': runtime, 'configuration': configuration,
+            'manifest_bytes': result[0], 'manifest_sha256': result[1],
+            'complete_tree_observed': True, 'two_file_hash_passes': True, 'checked_closes_completed': True}
+"""Produce inactive launch files only after complete release/input correspondence."""
+
+import base64 as app_base64
+
+
+APP_OUTPUT_LIMIT = 8 * 1024 * 1024
+APP_AUTHORITY = (
+    'owner_release_intent_authenticated', 'git_commit_tree_authenticated', 'release_publish_authenticated',
+    'release_analyzers_passed', 'release_build_and_tests_passed', 'runtime_version_security_approved',
+    'runtime_native_dependencies_usable', 'runtime_loader_resolution_proven', 'elf_or_managed_code_executed',
+    'application_configuration_schema_validated', 'nested_credentials_admitted', 'runtime_credential_access_proven',
+    'configuration_matches_network_and_storage_policy', 'service_accounts_provisioned', 'systemd_parser_validated',
+    'sandbox_and_jit_compatibility_proven', 'service_units_installed', 'service_units_enabled',
+    'services_started', 'application_readiness_proven', 'public_tls_usable', 'dns_publication_or_delegation_proven',
+    'mail_delivery_and_relay_refusal_proven', 'postgresql_schema_and_roles_provisioned',
+    'backup_restore_proven', 'update_rollback_and_reboot_proven', 'server_ready',
+)
+
+
+def application_environment(data, prefixes):
+    # Narrow EnvironmentFile subset: no quotes, escapes, substitutions or newlines
+    # in values. PID1 reads the original protected files; secrets never enter JSON.
+    if (not data.endswith(b'\n') or any(byte < 32 and byte != 10 or byte > 126 for byte in data)):
+        raise ValueError('bounded ASCII/LF application environment required')
+    result = {}
+    for line in data.decode('ascii').splitlines():
+        if not line or line.startswith('#'):
+            continue
+        key, separator, value = line.partition('=')
+        if (not separator or not dep_re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', key)
+                or key in result or not any(key.startswith(prefix) for prefix in prefixes)
+                or not dep_re.fullmatch(r'[A-Za-z0-9:/._+=,@;-]+', value)):
+            raise ValueError('unsupported application EnvironmentFile declaration')
+        result[key] = value
+    if not result:
+        raise ValueError('empty application environment')
+    return result
+
+
+def application_configuration(app, bindings, plan):
+    result, captured = [], {}
+    for leaf in REL_CONFIGS[app]:
+        path = '/etc/' + app + '/' + leaf
+        data = deployment_read(path)
+        if dep_hash.sha256(data).hexdigest() != bindings[leaf]:
+            raise ValueError('startup configuration digest mismatch')
+        if leaf.endswith('.json') and type(release_json(data)) is not dict:
+            raise ValueError('startup JSON object required')
+        result.append({'file': path, 'bytes': len(data), 'sha256': bindings[leaf],
+                       'mode': '0600', 'checked_readback_and_close': True})
+        captured[leaf] = data
+    if app == 'mk8.sava':
+        common = application_environment(captured['policy.env'], ('Sava__', 'ApplicationTransport__'))
+        application = application_environment(captured['application.env'], ('Sava__', 'ApplicationHosting__'))
+        gateway = application_environment(captured['gateway.env'], ('Gateway__',))
+        endpoint = 'http://127.0.0.1:' + str(plan['private_ports']['sava_application']) + '/internal/application'
+        if (common.get('ApplicationTransport__Endpoint') != endpoint
+                or 'ApplicationTransport__AccessKeyFile' in common
+                or any(key.startswith('Sava__Data') for key in common)
+                or common.keys() & application.keys()
+                or application.get('Sava__DataPath') != '/var/lib/mk8.sava/application'
+                or gateway.get('Gateway__StagingPath') != '/var/cache/mk8.sava-gateway/staging'):
+            raise ValueError('Sava launch environment correspondence')
+        key = captured['rpc.key']
+        if not dep_re.fullmatch(rb'[A-Za-z0-9+/]+={0,2}\n', key):
+            raise ValueError('canonical RPC key encoding required')
+        decoded = app_base64.b64decode(key[:-1], validate=True)
+        if not 32 <= len(decoded) <= 512 or app_base64.b64encode(decoded) != key[:-1]:
+            raise ValueError('RPC key size or encoding')
+    return result
+
+
+def application_unit(name, app, role, release, arguments=(), extra=(), privileged=False, state=True, after=()):
+    program = REL_PROGRAMS[app][role]
+    directory = release['directory'] + '/' + role
+    account = {'mk8.sava': 'mk8sava-' + role, 'mk8.drava': 'mk8drava',
+               'mk8.dns': 'mk8dns', 'mk8.email': 'mk8email'}[app]
+    lines = ['# Inactive candidate. Parser, JIT, accounts, credentials and health remain unproven.',
+             '[Unit]', 'Description=' + name, 'Wants=network-online.target',
+             'After=network-online.target' + ((' ' + ' '.join(after)) if after else ''),
+             'StartLimitIntervalSec=120', 'StartLimitBurst=5', '', '[Service]',
+             'Type=exec', 'User=' + account, 'Group=' + account, 'WorkingDirectory=' + directory,
+             'ExecStart=' + directory + '/' + program + ((' ' + ' '.join(arguments)) if arguments else ''),
+             'Environment=DOTNET_ENVIRONMENT=Production', 'Environment=ASPNETCORE_ENVIRONMENT=Production',
+             'Environment=DOTNET_EnableDiagnostics=0', 'Restart=on-failure', 'RestartSec=5s',
+             'TimeoutStartSec=120s', 'TimeoutStopSec=60s', 'KillMode=control-group', 'KillSignal=SIGTERM',
+             'UMask=0077', 'LimitNOFILE=8192', 'TasksMax=512', 'MemoryMax=2G',
+             'NoNewPrivileges=true', 'PrivateTmp=true', 'PrivateDevices=true', 'ProtectSystem=strict',
+             'ProtectHome=true', 'ProtectKernelTunables=true', 'ProtectKernelModules=true',
+             'ProtectKernelLogs=true', 'ProtectControlGroups=true', 'RestrictSUIDSGID=true',
+             'RestrictRealtime=true', 'LockPersonality=true', 'SystemCallArchitectures=native',
+             'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6',
+             'CapabilityBoundingSet=' + ('CAP_NET_BIND_SERVICE' if privileged else ''),
+             'AmbientCapabilities=' + ('CAP_NET_BIND_SERVICE' if privileged else ''),
+             'StandardOutput=journal', 'StandardError=journal']
+    if state:
+        lines.extend(('StateDirectory=' + app, 'StateDirectoryMode=0700'))
+    lines.extend(extra)
+    lines.extend(('', '[Install]', 'WantedBy=multi-user.target', ''))
+    return deployment_file('systemd/' + name + '.service', '0644', '\n'.join(lines))
+
+
+def application_units(app, release, plan):
+    config = '/etc/' + app + '/'
+    if app == 'mk8.sava':
+        common = ('EnvironmentFile=' + config + 'policy.env', 'LoadCredential=rpc-key:' + config + 'rpc.key',
+                  'Environment=ApplicationTransport__AccessKeyFile=%d/rpc-key')
+        return [application_unit('mk8-sava-application', app, 'application', release,
+                    extra=common + ('EnvironmentFile=' + config + 'application.env',
+                                    'StateDirectory=mk8.sava/application', 'StateDirectoryMode=0700'), state=False),
+                application_unit('mk8-sava-gateway', app, 'gateway', release,
+                    arguments=('--urls', 'http://127.0.0.1:' + str(plan['private_ports']['sava_gateway'])),
+                    extra=common + ('EnvironmentFile=' + config + 'gateway.env',
+                                    'CacheDirectory=mk8.sava-gateway', 'CacheDirectoryMode=0700',
+                                    'InaccessiblePaths=-/var/lib/mk8.sava/application'), state=False,
+                    after=('mk8-sava-application.service',))]
+    if app == 'mk8.drava':
+        return [application_unit('mk8-drava-' + role, app, role, release,
+                    arguments=('--bootstrap', '%d/bootstrap.json'), privileged=role == 'gateway',
+                    extra=('LoadCredential=bootstrap.json:' + config + role + '.json',
+                           'RuntimeDirectory=mk8.drava', 'RuntimeDirectoryMode=0700'),
+                    after=('mk8-drava-application.service',) if role == 'gateway' else ())
+                for role in ('application', 'gateway')]
+    if app == 'mk8.email':
+        return [application_unit('mk8-email-' + role, app, role, release,
+                    arguments=('--serve',) if role == 'worker' else (), privileged=role == 'gateway',
+                    extra=('LoadCredential=config.json:' + config + role + '.json',
+                           'Environment=MK8EMAIL_CONFIG_FILE=%d/config.json',
+                           'Environment=ASPNETCORE_URLS=http://127.0.0.1:' + str(plan['private_ports']['email_http']),
+                           'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false'),
+                    after=('postgresql.service',)) for role in ('worker', 'gateway')]
+    units = []
+    for role, leaf in (('controller', 'control-plane.json'), ('authoritative-replica', 'authority.json')):
+        arguments = ['--socket', '/run/mk8.dns/' + role + '.sock', '--state', '/var/lib/mk8.dns/' + role,
+                     '--node', 'r630-' + role, '--role', role, '--control', '%d/control.json']
+        if role == 'authoritative-replica':
+            arguments.extend(('--publication-socket', '/run/mk8.dns/publication.sock'))
+        units.append(application_unit('mk8-dns-' + role, app, 'application', release, arguments,
+                     extra=('LoadCredential=control.json:' + config + leaf,
+                            'RuntimeDirectory=mk8.dns', 'RuntimeDirectoryMode=0700'), after=('postgresql.service',)))
+    ports = set(plan['private_ports'].values())
+    for index, listener in enumerate(plan['public']):
+        port = plan['private_ports']['dns_health'] + index
+        if port > 65535 or (index and port in ports):
+            raise ValueError('distinct per-family DNS health port required')
+        units.append(application_unit('mk8-dns-gateway' + str(listener['version']), app, 'gateway', release,
+                     ('--socket', '/run/mk8.dns/authoritative-replica.sock', '--health-port', str(port),
+                      '--dns-address', listener['address'], '--dns-port', '53'), privileged=True,
+                     after=('mk8-dns-authoritative-replica.service',)))
+    return units
+
+
+def application_bundle(data, ssh_producer):
+    candidate = deployment_bundle(data, ssh_producer)
+    value, source = deployment_decode(data)
+    plan = deployment_manifest(value)
+    releases, configuration, units = [], [], []
+    for app in DEP_APPS:
+        observed = release_observe(app, plan['releases'][app])
+        configuration.extend(application_configuration(app, observed['configuration'], plan))
+        units.extend(application_units(app, observed, plan))
+        releases.append(observed)
+    result = {'schema': 1, 'source': source, 'deployment_candidate_sha256': dep_hash.sha256(
+                  dep_json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest(),
+              'releases': releases, 'configuration': configuration, 'files': units,
+              'authority': {name: False for name in APP_AUTHORITY}}
+    if len(dep_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) + 1 > APP_OUTPUT_LIMIT:
+        raise ValueError('application candidate output bound')
+    return result
+
+
+def application_main(ssh_producer):
+    try:
+        if len(dep_sys.argv) != 2:
+            raise ValueError('one protected deployment manifest required')
+        dep_resource.setrlimit(dep_resource.RLIMIT_CPU, (120, 125))
+        dep_resource.setrlimit(dep_resource.RLIMIT_AS, (384 * 1024 * 1024,) * 2)
+        dep_resource.setrlimit(dep_resource.RLIMIT_CORE, (0, 0))
+        result = application_bundle(deployment_read(dep_sys.argv[1]), ssh_producer)
+        output = dep_json.dumps(result, sort_keys=True, separators=(',', ':')) + '\n'
+    except (OSError, ValueError, TypeError, MemoryError, RecursionError, OverflowError):
+        print('Application service candidate refused', file=dep_sys.stderr)
+        return 75
+    print(output, end='')
+    return 0
 action = sys.argv[1]
+if action == 'applications':
+    sys.argv = [sys.argv[0], sys.argv[2]]
+    raise SystemExit(application_main(bundle))
 if action == 'publish':
     sys.argv = [sys.argv[0], sys.argv[2]]
     raise SystemExit(publication_main(bundle))
@@ -10001,8 +10511,12 @@ s4_main() {
     umask 077
     local action=${1:-install}
     case $action in
+        --application-service-policy)
+            [[ $# == 2 ]] || return 64
+            s4_application_service_policy "$2"
+            return $? ;;
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --ssh-service-policy\n       sudo ./azurelinux3s4.sh --deployment-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --publish-deployment-candidate ROOT_MANIFEST_JSON\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\n       ./azurelinux3s4.sh --inspect-ssh-home\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --ssh-service-policy\n       sudo ./azurelinux3s4.sh --application-service-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --deployment-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --publish-deployment-candidate ROOT_MANIFEST_JSON\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\n       ./azurelinux3s4.sh --inspect-ssh-home\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
             return 0 ;;
         --web-isolation-policy)
             [[ $# == 1 ]] || return 64

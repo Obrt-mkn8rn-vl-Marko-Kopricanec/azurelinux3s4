@@ -66,6 +66,8 @@ MODULES = (
     "test_ssh_service",
     "test_deployment_policy",
     "test_deployment_publication",
+    "test_deployment_releases",
+    "test_deployment_services",
 )
 
 
