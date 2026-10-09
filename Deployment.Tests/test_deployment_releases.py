@@ -51,6 +51,13 @@ class ReleaseFixture(unittest.TestCase):
             config.mkdir(parents=True, mode=0o700)
             (self.root / 'etc').chmod(0o700)
             inputs = {leaf: encoded({'schemaVersion': 1}) for leaf in self.n['REL_CONFIGS'][app]}
+            if app == 'mk8.drava':
+                inputs = {leaf: encoded({'schemaVersion': 1, field: {
+                    'unixSocketPath': '/run/mk8.drava/application.sock'}})
+                    for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application'))}
+            if app == 'mk8.dns':
+                inputs['control-plane.json'] = encoded({'PublicationSocket':
+                    '/run/mk8.dns/authoritative-replica/publication.sock'})
             if app == 'mk8.sava':
                 inputs = {'policy.env': b'Sava__DefaultAccount=fixture\nSava__Accounts__fixture=not-a-runtime-proof\nApplicationTransport__Endpoint=http://127.0.0.1:18581/internal/application\n',
                           'application.env': b'Sava__DataPath=/var/lib/mk8.sava/application\nSava__DataEncryptionKeys__fixture=private-fixture-only\n',

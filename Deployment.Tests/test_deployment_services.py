@@ -5,6 +5,8 @@ import copy
 import hashlib
 import json
 import os
+import shlex
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +18,23 @@ from test_deployment_releases import CAPTURES, ROOT, ReleaseFixture
 
 
 class DeploymentApplicationServiceTests(ReleaseFixture):
+    def runtime_owners(self, units):
+        owners = {}
+        for row in units:
+            values = [line.split('=', 1)[1] for line in row['content'].splitlines()
+                      if line.startswith('RuntimeDirectory=')]
+            for value in values:
+                self.assertNotIn(' ', value)
+                for previous in owners:
+                    self.assertFalse(value == previous or value.startswith(previous + '/')
+                                     or previous.startswith(value + '/'), 'overlapping runtime cleanup owners')
+                owners[value] = row['file']
+            self.assertNotIn('RuntimeDirectoryPreserve=restart', row['content'])
+        return owners
+
+    def unit_arguments(self, unit):
+        return shlex.split(next(line.split('=', 1)[1] for line in unit.splitlines() if line.startswith('ExecStart=')))
+
     def candidate(self):
         return self.n['application_bundle'](encoded(self.value), self.n['bundle'])
 
@@ -98,9 +117,9 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
         authority = units['systemd/mk8-dns-authoritative-replica.service']
         gateway = units['systemd/mk8-dns-gateway4.service']
         self.assertIn('--role controller --control %d/control.json\n', controller)
-        self.assertIn('--role authoritative-replica --control %d/control.json --publication-socket /run/mk8.dns/publication.sock\n', authority)
+        self.assertIn('--role authoritative-replica --control %d/control.json --publication-socket /run/mk8.dns/authoritative-replica/publication.sock\n', authority)
         self.assertNotIn('--dns-address', controller + authority)
-        self.assertIn('--socket /run/mk8.dns/authoritative-replica.sock --health-port 18053 --dns-address 192.168.1.20 --dns-port 53\n', gateway)
+        self.assertIn('--socket /run/mk8.dns/authoritative-replica/control.sock --health-port 18053 --dns-address 192.168.1.20 --dns-port 53\n', gateway)
         self.assertNotIn('CAP_NET_BIND_SERVICE', controller + authority)
         self.assertIn('CAP_NET_BIND_SERVICE', gateway)
 
@@ -209,3 +228,117 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
         self.assertEqual(right.returncode, 0); self.assertEqual(right.stdout, b'/manifest.json\n')
         help_result = subprocess.run(['bash', '-c', shell, 'private-cli', '--help'], capture_output=True, check=False)
         self.assertIn(b'--application-service-policy ROOT_MANIFEST_JSON', help_result.stdout)
+
+    def test_runtime_owners_are_disjoint_for_each_public_family_delivery(self):
+        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'),
+                           ('192.168.1.20', '2606:4700:4700::1111')):
+            with self.subTest(ipv4=ipv4, ipv6=ipv6):
+                self.value['public'].update(ipv4=ipv4, ipv6=ipv6)
+                result = self.candidate(); units = {row['file']: row['content'] for row in result['files']}
+                self.assertEqual(self.runtime_owners(result['files']), {
+                    'mk8.drava': 'systemd/mk8-drava-application.service',
+                    'mk8.dns/controller': 'systemd/mk8-dns-controller.service',
+                    'mk8.dns/authoritative-replica': 'systemd/mk8-dns-authoritative-replica.service'})
+                for role in ('controller', 'authoritative-replica'):
+                    args = self.unit_arguments(units['systemd/mk8-dns-' + role + '.service'])
+                    self.assertEqual(args[args.index('--socket') + 1], '/run/mk8.dns/' + role + '/control.sock')
+                replica = self.unit_arguments(units['systemd/mk8-dns-authoritative-replica.service'])
+                self.assertEqual(replica[replica.index('--publication-socket') + 1],
+                                 '/run/mk8.dns/authoritative-replica/publication.sock')
+                control = json.loads((self.root / 'etc/mk8.dns/control-plane.json').read_bytes())
+                self.assertEqual(control['PublicationSocket'], replica[replica.index('--publication-socket') + 1])
+                self.assertIsNone(json.loads((self.root / 'etc/mk8.dns/authority.json').read_bytes()).get('PublicationSocket'))
+                for family, present in ((4, ipv4), (6, ipv6)):
+                    name = 'systemd/mk8-dns-gateway' + str(family) + '.service'
+                    self.assertEqual(name in units, present is not None)
+                    if present:
+                        args = self.unit_arguments(units[name])
+                        self.assertEqual(args[args.index('--socket') + 1], replica[replica.index('--socket') + 1])
+                        self.assertNotIn('RuntimeDirectory=', units[name])
+                self.assertNotIn('RuntimeDirectory=', units['systemd/mk8-drava-gateway.service'])
+                self.assertTrue(all(flag is False for flag in result['authority'].values()))
+
+    def test_modeled_dns_controller_stop_preserves_live_replica_endpoints(self):
+        result = self.candidate(); owners = self.runtime_owners(result['files'])
+        private = self.root / 'runtime-cleanup-model'; private.mkdir()
+        for value in owners:
+            (private / value).mkdir(parents=True)
+        controller = private / 'mk8.dns/controller/control.sock'
+        control = private / 'mk8.dns/authoritative-replica/control.sock'
+        publication = private / 'mk8.dns/authoritative-replica/publication.sock'
+        for p in (controller, control, publication):
+            p.write_bytes(b'finite endpoint marker, not a socket or service\n')
+        before = (control.read_bytes(), publication.read_bytes())
+        shutil.rmtree(private / 'mk8.dns/controller')
+        self.assertFalse(controller.exists())
+        self.assertEqual((control.read_bytes(), publication.read_bytes()), before)
+        self.assertTrue((private / 'mk8.dns').is_dir())
+
+    def test_modeled_drava_gateway_stop_preserves_application_endpoint_and_configs(self):
+        result = self.candidate(); owners = self.runtime_owners(result['files'])
+        private = self.root / 'runtime-cleanup-model'; endpoint = private / 'mk8.drava/application.sock'
+        endpoint.parent.mkdir(parents=True); endpoint.write_bytes(b'finite endpoint marker\n')
+        configurations = {leaf: (self.root / 'etc/mk8.drava' / leaf).read_bytes()
+                          for leaf in ('application.json', 'gateway.json')}
+        for path, owner in owners.items():
+            if owner == 'systemd/mk8-drava-gateway.service':
+                shutil.rmtree(private / path)
+        self.assertEqual(endpoint.read_bytes(), b'finite endpoint marker\n')
+        for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application')):
+            self.assertEqual(json.loads(configurations[leaf])[field]['unixSocketPath'], '/run/mk8.drava/application.sock')
+            self.assertEqual((self.root / 'etc/mk8.drava' / leaf).read_bytes(), configurations[leaf])
+        shutil.rmtree(private / 'mk8.drava')
+        self.assertFalse(endpoint.exists())
+
+    def test_runtime_owner_control_detects_shared_and_nested_cleanup_targets(self):
+        result = self.candidate()
+        for family in ('dns', 'drava'):
+            with self.subTest(family=family):
+                units = copy.deepcopy(result['files'])
+                if family == 'dns':
+                    unit = next(row for row in units if row['file'] == 'systemd/mk8-dns-controller.service')
+                    unit['content'] = unit['content'].replace('RuntimeDirectory=mk8.dns/controller', 'RuntimeDirectory=mk8.dns')
+                else:
+                    unit = next(row for row in units if row['file'] == 'systemd/mk8-drava-gateway.service')
+                    unit['content'] += 'RuntimeDirectory=mk8.drava\n'
+                with self.assertRaisesRegex(AssertionError, 'overlapping runtime cleanup owners'):
+                    self.runtime_owners(units)
+
+    def test_drava_socket_binding_refuses_missing_mismatch_and_other_transports(self):
+        for body in ({'schemaVersion': 1}, {'application': None},
+                     {'application': {'unixSocketPath': '/run/mk8.drava/gateway.sock'}},
+                     {'application': {'unixSocketPath': '/run/mk8.drava/application.sock', 'namedPipeName': 'other'}},
+                     {'application': {'unixSocketPath': '/run/mk8.drava/application.sock', 'httpsAddress': 'https://127.0.0.1/'}}):
+            with self.subTest(body=body):
+                self.replace_configuration('mk8.drava', 'gateway.json', encoded(body))
+                with self.assertRaisesRegex(ValueError, 'application-owned Unix socket'):
+                    self.candidate()
+        self.replace_configuration('mk8.drava', 'gateway.json', encoded({
+            'application': {'unixSocketPath': '/run/mk8.drava/application.sock'}}))
+        self.replace_configuration('mk8.drava', 'application.json', encoded({
+            'listen': {'unixSocketPath': '/run/mk8.drava/gateway.sock'}}))
+        with self.assertRaisesRegex(ValueError, 'application-owned Unix socket'):
+            self.candidate()
+
+    def test_complete_emitted_program_bound_socket_mismatch_refuses_without_json(self):
+        self.replace_configuration('mk8.drava', 'gateway.json', encoded({
+            'application': {'unixSocketPath': '/run/mk8.drava/gateway.sock'}}))
+        self.manifest_file.write_bytes(encoded(self.value))
+        before = self.snapshot(); result = self.run_emitted()
+        self.assertEqual(result.returncode, 75)
+        self.assertEqual(result.stdout, b'')
+        self.assertEqual(result.stderr, b'Application service candidate refused\n')
+        self.assertEqual(self.snapshot(), before)
+
+    def test_dns_publication_configuration_binds_replica_socket_and_refuses_legacy_or_wrong_role_paths(self):
+        for value in (None, '/run/mk8.dns/publication.sock', '/run/mk8.dns/controller/publication.sock'):
+            with self.subTest(value=value):
+                self.replace_configuration('mk8.dns', 'control-plane.json', encoded({'PublicationSocket': value}))
+                with self.assertRaisesRegex(ValueError, 'replica-owned publication socket'):
+                    self.candidate()
+        self.replace_configuration('mk8.dns', 'control-plane.json', encoded({
+            'PublicationSocket': '/run/mk8.dns/authoritative-replica/publication.sock'}))
+        self.replace_configuration('mk8.dns', 'authority.json', encoded({
+            'PublicationSocket': '/run/mk8.dns/authoritative-replica/publication.sock'}))
+        with self.assertRaisesRegex(ValueError, 'replica-owned publication socket'):
+            self.candidate()

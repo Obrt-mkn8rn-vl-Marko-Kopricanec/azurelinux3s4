@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.58.0
+S4_VERSION=0.58.1
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -9026,6 +9026,21 @@ def application_configuration(app, bindings, plan):
         decoded = app_base64.b64decode(key[:-1], validate=True)
         if not 32 <= len(decoded) <= 512 or app_base64.b64encode(decoded) != key[:-1]:
             raise ValueError('RPC key size or encoding')
+    if app == 'mk8.drava':
+        # Only Application owns this cleanup-removable tree. The Gateway is a
+        # consumer, never a second RuntimeDirectory owner. Full schemas remain open.
+        for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application')):
+            endpoint = release_json(captured[leaf]).get(field)
+            if (type(endpoint) is not dict
+                    or endpoint.get('unixSocketPath') != '/run/mk8.drava/application.sock'
+                    or endpoint.get('namedPipeName', '') != '' or endpoint.get('httpsAddress', '') != ''):
+                raise ValueError('Drava application-owned Unix socket correspondence')
+    if app == 'mk8.dns':
+        # Controller is a publication client; the replica alone owns that socket.
+        if (release_json(captured['control-plane.json']).get('PublicationSocket') !=
+                '/run/mk8.dns/authoritative-replica/publication.sock'
+                or release_json(captured['authority.json']).get('PublicationSocket') is not None):
+            raise ValueError('DNS replica-owned publication socket correspondence')
     return result
 
 
@@ -9076,8 +9091,8 @@ def application_units(app, release, plan):
     if app == 'mk8.drava':
         return [application_unit('mk8-drava-' + role, app, role, release,
                     arguments=('--bootstrap', '%d/bootstrap.json'), privileged=role == 'gateway',
-                    extra=('LoadCredential=bootstrap.json:' + config + role + '.json',
-                           'RuntimeDirectory=mk8.drava', 'RuntimeDirectoryMode=0700'),
+                    extra=('LoadCredential=bootstrap.json:' + config + role + '.json',) +
+                          (('RuntimeDirectory=mk8.drava', 'RuntimeDirectoryMode=0700') if role == 'application' else ()),
                     after=('mk8-drava-application.service',) if role == 'gateway' else ())
                 for role in ('application', 'gateway')]
     if app == 'mk8.email':
@@ -9090,20 +9105,21 @@ def application_units(app, release, plan):
                     after=('postgresql.service',)) for role in ('worker', 'gateway')]
     units = []
     for role, leaf in (('controller', 'control-plane.json'), ('authoritative-replica', 'authority.json')):
-        arguments = ['--socket', '/run/mk8.dns/' + role + '.sock', '--state', '/var/lib/mk8.dns/' + role,
+        runtime = 'mk8.dns/' + role
+        arguments = ['--socket', '/run/' + runtime + '/control.sock', '--state', '/var/lib/mk8.dns/' + role,
                      '--node', 'r630-' + role, '--role', role, '--control', '%d/control.json']
         if role == 'authoritative-replica':
-            arguments.extend(('--publication-socket', '/run/mk8.dns/publication.sock'))
+            arguments.extend(('--publication-socket', '/run/' + runtime + '/publication.sock'))
         units.append(application_unit('mk8-dns-' + role, app, 'application', release, arguments,
                      extra=('LoadCredential=control.json:' + config + leaf,
-                            'RuntimeDirectory=mk8.dns', 'RuntimeDirectoryMode=0700'), after=('postgresql.service',)))
+                            'RuntimeDirectory=' + runtime, 'RuntimeDirectoryMode=0700'), after=('postgresql.service',)))
     ports = set(plan['private_ports'].values())
     for index, listener in enumerate(plan['public']):
         port = plan['private_ports']['dns_health'] + index
         if port > 65535 or (index and port in ports):
             raise ValueError('distinct per-family DNS health port required')
         units.append(application_unit('mk8-dns-gateway' + str(listener['version']), app, 'gateway', release,
-                     ('--socket', '/run/mk8.dns/authoritative-replica.sock', '--health-port', str(port),
+                     ('--socket', '/run/mk8.dns/authoritative-replica/control.sock', '--health-port', str(port),
                       '--dns-address', listener['address'], '--dns-port', '53'), privileged=True,
                      after=('mk8-dns-authoritative-replica.service',)))
     return units
