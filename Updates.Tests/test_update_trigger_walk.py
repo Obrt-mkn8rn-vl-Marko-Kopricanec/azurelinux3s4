@@ -256,7 +256,7 @@ class TriggerWalkPrivateTests(unittest.TestCase):
     def test_real_private_snapshot_success_binds_all_fifteen_original_byte_hashes(self):
         proof = self.proof(trigger=False); data = json.dumps(proof).encode(); self.path.write_bytes(data)
         result = self.run_guard(); observed = json.loads(result.stdout)
-        self.assertEqual(len(sources.RECEIPTS), 17)
+        self.assertEqual(len(sources.RECEIPTS), 18)
         for name in sources.RECEIPTS: self.assertEqual(observed[name]['input_sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual(self.path.read_bytes(), data)
 

@@ -197,7 +197,7 @@ class TriggerArgumentPrivateTests(unittest.TestCase):
 
     def test_actual_owned_snapshot_binds_all_thirteen_hashes_without_modification(self):
         before = self.path.read_bytes(); proof = json.loads(self.run_guard().stdout)
-        self.assertEqual(len(sources.RECEIPTS), 17)
+        self.assertEqual(len(sources.RECEIPTS), 18)
         for name in sources.RECEIPTS: self.assertEqual(proof[name]['input_sha256'], hashlib.sha256(before).hexdigest())
         self.assertEqual(self.path.read_bytes(), before)
 

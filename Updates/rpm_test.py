@@ -463,6 +463,12 @@ try:
             element_snapshots = {path: records[index]["file"] for index, path in enumerate(paths)}
             element_database, element_handles, element_before = transaction_element_sample(element_api, ts, element_plan, element_snapshots)
             errors()
+        if effects and psm_inputs_projection:
+            if not transaction_elements_projection:
+                raise ValueError("PSM inputs require the current ordered element projection")
+            psm_input_api = psm_input_bind(lib)
+            psm_input_before = psm_input_sample(psm_input_api, ts, element_database, element_handles, element_plan, element_before)
+            errors()
         if effects and trigger_counts_projection:
             count_inventory, count_rows = trigger_count_plan(installed_effects, before, incoming_effects)
             count_api = trigger_count_bind(lib)
@@ -516,6 +522,10 @@ try:
             if final_element_database != element_database or final_element_handles != element_handles:
                 raise ValueError("transaction element borrowed handles change across TEST")
             element_observation = transaction_element_receipt(element_inventory, element_plan, element_before, element_after)
+            errors()
+        if effects and psm_inputs_projection:
+            psm_input_after = psm_input_sample(psm_input_api, ts, final_element_database, final_element_handles, element_plan, element_after)
+            psm_input_observation = psm_input_receipt(element_inventory, element_plan, element_observation, psm_input_before, psm_input_after)
             errors()
     finally:
         for fd in opened.values():
@@ -575,6 +585,8 @@ try:
             proof["effects"]["ordinary_condition_name_lookups"] = walk_observation
         if transaction_elements_projection:
             proof["effects"]["ordered_transaction_elements"] = element_observation
+        if psm_inputs_projection:
+            proof["effects"]["current_psm_inputs"] = psm_input_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",
