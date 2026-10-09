@@ -19,6 +19,7 @@ import test_update_triggers as triggers
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / 'Updates.Tests/rpm_header_model.c'
 MATCH_MODEL = ROOT / 'Updates.Tests/rpm_header_matches_model.c'
+ITERATION_MODEL = ROOT / 'Updates.Tests/rpm_header_iteration_model.c'
 RENAMES = {'headerExport': 'originalHeaderExport', 'headerFree': 'originalHeaderFree',
            'headerIsEntry': 'originalHeaderIsEntry', 'rpmdsCount': 'originalDsCount',
            'rpmdsIx': 'originalDsIx', 'rpmdsTagN': 'originalDsTagN', 'rpmdsN': 'originalDsN',
@@ -30,7 +31,7 @@ def header_model_source(source):
     if 'void *rpmdsSingle(' not in source:
         source += providers.MODEL.read_text()
     return ''.join('#define ' + name + ' ' + replacement + '\n' for name, replacement in RENAMES.items()) + source + '\n' + ''.join(
-        '#undef ' + name + '\n' for name in RENAMES) + MODEL.read_text() + MATCH_MODEL.read_text()
+        '#undef ' + name + '\n' for name in RENAMES) + MODEL.read_text() + MATCH_MODEL.read_text() + ITERATION_MODEL.read_text()
 
 
 class HeaderInputNativeTests(unittest.TestCase):
