@@ -149,6 +149,7 @@ class ProviderProofTests(unittest.TestCase):
         owner = proof['effects']['installed_script_owners'][0]
         proof['effects']['installed_versions'] = self.namespace['installed_version_inventory']({1: owner}, proof['baseline'])
         proof['effects']['installed_provides'] = [{field: owner[field] for field in (*self.namespace['INSTALLED_VERSION_FIELDS'], 'provides')}]
+        triggers.bind_count_delivery(self.namespace, proof)
 
     def observe(self, proof, factory=None):
         return self.namespace['provider_observe'](self.namespace['trigger_observe'](proof), factory or (lambda: self.native_compare))
@@ -293,7 +294,7 @@ class ProviderPrivateTests(unittest.TestCase):
     def test_actual_file_only_snapshot_binds_six_receipts_and_preserves_input(self):
         material = self.path.read_bytes(); proof = json.loads(self.run_guard().stdout)
         for name in ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation', 'header_match_observation', 'trigger_first_observation', 'header_iteration_observation'):
+                     'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation', 'header_match_observation', 'trigger_first_observation', 'header_iteration_observation', 'trigger_count_observation'):
             self.assertEqual(proof[name]['input_sha256'], hashlib.sha256(material).hexdigest())
         self.assertEqual(self.path.read_bytes(), material)
         self.assertFalse(proof['provider_match_observation']['native_participation_checked'])
@@ -344,7 +345,7 @@ class ProviderPipelineTests(unittest.TestCase):
         self.assertEqual(compared[0]['source']['owner']['sha256'], proof['additions'][0]['sha256'])
         original = copy.deepcopy(proof)
         names = ('trigger_input_observation', 'file_trigger_prefix_observation', 'trigger_condition_observation',
-                 'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation', 'header_match_observation', 'trigger_first_observation', 'header_iteration_observation')
+                 'trigger_range_observation', 'provides_observation', 'provider_match_observation', 'trigger_source_observation', 'header_input_observation', 'header_match_observation', 'trigger_first_observation', 'header_iteration_observation', 'trigger_count_observation')
         for name in names: original.pop(name)
         digest = hashlib.sha256((json.dumps(original, sort_keys=True) + '\n').encode()).hexdigest()
         for name in names: self.assertEqual(proof[name]['input_sha256'], digest)

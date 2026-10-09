@@ -47,6 +47,7 @@ PAYLOADS = {
     "Updates/header_matches.py": "PY",
     "Updates/trigger_first.py": "PY",
     "Updates/header_iteration.py": "PY",
+    "Updates/trigger_counts.py": "PY",
     "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",

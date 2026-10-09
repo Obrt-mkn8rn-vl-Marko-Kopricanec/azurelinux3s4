@@ -226,6 +226,10 @@ void *headerExport(void *h,unsigned *size) {
 }
 '''
 
+# Current count delivery shares the SAME finite installed iterator/name model;
+# the model is not a vendor database or real temporal script execution.
+LIBRARY += (SOURCE.parent / 'Updates.Tests/rpm_trigger_counts_model.c').read_text()
+
 
 class UpdateEffectsTests(unittest.TestCase):
     command = compatibility.UpdateCompatibilityTests.command

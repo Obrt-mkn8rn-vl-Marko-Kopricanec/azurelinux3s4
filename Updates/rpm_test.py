@@ -457,6 +457,11 @@ try:
                 raise ValueError("native plan would remove a retained kernel or has an unknown element")
         if sorted(os.fsencode(value["snapshot"]) for value in additions) != sorted(paths):
             raise ValueError("native plan replaced or dropped an admitted input")
+        if effects and trigger_counts_projection:
+            count_inventory, count_rows = trigger_count_plan(installed_effects, before, incoming_effects)
+            count_api = trigger_count_bind(lib)
+            count_database, count_before = trigger_count_sample(count_api, ts, count_rows)
+            errors()
         if api["rpmtsFlags"](ts) != flags or api["rpmtsRun"](ts, None, (1 << 7) | (1 << 8)):
             # Only capacity/inode filters: all signature, dependency, file,
             # architecture and older/already-installed package checks remain.
@@ -464,6 +469,12 @@ try:
         if callback_errors or opened or consumed != set(paths):
             raise ValueError("native TEST did not consume and close exactly the admitted snapshots")
         no_problems()
+        if effects and trigger_counts_projection:
+            final_database, count_after = trigger_count_sample(count_api, ts, count_rows)
+            if final_database != count_database:
+                raise ValueError("trigger count borrowed database changes across TEST")
+            count_observation = trigger_count_receipt(count_inventory, count_rows, count_before, count_after)
+            errors()
     finally:
         for fd in opened.values():
             api["Fclose"](fd)
@@ -514,6 +525,8 @@ try:
             proof["effects"]["installed_header_exports"] = [
                 {field: value[field] for field in (*INSTALLED_VERSION_FIELDS, "header_export_hex")}
                 for _, value in sorted(installed_effects.items())]
+        if trigger_counts_projection:
+            proof["effects"]["installed_name_counts"] = count_observation
     if path_context:
         proof["namespace_inventory"] = {"schema": 1, "incoming": path_incoming, "removals": path_removed,
             "files": file_total, "scope": "declared native incoming/removal header file paths only",

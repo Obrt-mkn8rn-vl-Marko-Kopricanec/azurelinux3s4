@@ -139,6 +139,15 @@ class TriggerArrayTests(unittest.TestCase):
             self.owner([(5076,8,[b'']*4097)])
 
 
+def bind_count_delivery(namespace, proof):
+    """Synthetic native-count declaration for private fixtures, not execution."""
+    values = proof['effects']['installed_versions']['entries']
+    inventory, rows = namespace['trigger_count_plan']({value['instance']: value for value in values},
+        proof['baseline'], proof['effects']['incoming'])
+    counts = [row['inventory_count'] for row in rows]
+    proof['effects']['installed_name_counts'] = namespace['trigger_count_receipt'](inventory, rows, counts, counts)
+
+
 class TriggerProofTests(unittest.TestCase):
     namespace = None
 
@@ -159,7 +168,7 @@ class TriggerProofTests(unittest.TestCase):
         incoming_owners = [{'name':'future',**additions[0],**self.namespace['audit_header'](effects.exported([(1023,6,[b'body'])])),
                             'file_trigger_prefix_bytes':[], 'trigger_condition_bytes':[],
                             'provides':{'schema':1,'tags':[]}}] if incoming else []
-        return {'schema':1,'test_passed':True,'rpm_test_performed':incoming,
+        proof = {'schema':1,'test_passed':True,'rpm_test_performed':incoming,
             **{flag:False for flag in ('installs_performed','scripts_executed','installation_authorized','storage_capacity_checked','freshness_proven')},
             'baseline':baseline,'additions':additions,'removals':[],
             'effects':{'schema':1,'incoming':incoming_owners,'removals':[],'installed_script_owners':[owner] if trigger else [],
@@ -168,6 +177,8 @@ class TriggerProofTests(unittest.TestCase):
                 'installed_headers_observed':1,'script_metadata_observed':True,'removals_bound_to_installed_instances':True,
                 **{flag:False for flag in ('installed_headers_authenticated','trigger_selection_complete','script_execution_plan_complete',
                     'script_policy_satisfied','removal_policy_satisfied','rollback_policy_satisfied')}}}
+        bind_count_delivery(self.namespace, proof)
+        return proof
 
     def test_complete_observed_inventory_and_header_bound_owner_produce_only_qualified_correspondence(self):
         result=self.namespace['trigger_observe'](self.proof())['trigger_input_observation']
@@ -321,7 +332,7 @@ class TriggerPipelineTests(unittest.TestCase):
         proof=json.loads(self.shell().stdout);receipt=proof['trigger_input_observation']
         self.assertEqual((receipt['script_slots'],receipt['condition_references']),(1,1))
         self.assertEqual(receipt['owners'][0]['instance'],1);self.assertEqual(receipt['removed_instances'],[1])
-        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation')
+        source=copy.deepcopy(proof);source.pop('trigger_input_observation');source.pop('file_trigger_prefix_observation');source.pop('trigger_condition_observation');source.pop('trigger_range_observation');source.pop('provides_observation');source.pop('provider_match_observation');source.pop('trigger_source_observation');source.pop('header_input_observation');source.pop('header_match_observation');source.pop('trigger_first_observation');source.pop('header_iteration_observation');source.pop('trigger_count_observation')
         self.assertEqual(receipt['input_sha256'],hashlib.sha256((json.dumps(source,sort_keys=True)+'\n').encode()).hexdigest())
         self.assertFalse(receipt['trigger_selection_complete']);self.assertFalse(proof['installation_authorized'])
         self.assertEqual((self.root/'state/updates/current.json').read_bytes(),pointer)

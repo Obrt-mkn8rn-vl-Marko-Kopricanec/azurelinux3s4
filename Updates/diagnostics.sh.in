@@ -4,6 +4,7 @@ s4_rpm_effects_program() {
     cat <<'PY'
 # @s4-include Updates/effects.py
 # @s4-include Updates/baselines.py
+# @s4-include Updates/trigger_counts.py
 # @s4-include Updates/trigger_prefixes.py
 # @s4-include Updates/trigger_conditions.py
 # @s4-include Updates/provides.py
@@ -34,7 +35,7 @@ __name__ = 's4_trigger_library'
 # @s4-include Updates/trigger_first.py
 # @s4-include Updates/header_iteration.py
 if trigger_execution:
-    raise SystemExit(trigger_main(header_iteration_observe))
+    raise SystemExit(trigger_main(trigger_count_observe))
 PY
 }
 
@@ -110,7 +111,7 @@ PY
         [[ -z $S4_CAPACITY_MODE ]] || return 75
         s4_rpm_effects_program >"$directory/test.py" || return 75
         if [[ -z $S4_INTERPRETERS_MODE && -z $S4_REMOVALS_MODE ]]; then
-            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\n' >>"$directory/test.py" || return 75
+            printf 'file_trigger_prefix_projection = True\nprovides_projection = True\nheader_exports_projection = True\ntrigger_counts_projection = True\n' >>"$directory/test.py" || return 75
         fi
     else
         : >"$directory/test.py"
