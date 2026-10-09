@@ -38,8 +38,9 @@ __name__ = 's4_trigger_library'
 # @s4-include Updates/trigger_first.py
 # @s4-include Updates/header_iteration.py
 # @s4-include Updates/trigger_arguments.py
+# @s4-include Updates/psm_goals.py
 if trigger_execution:
-    raise SystemExit(trigger_main(transaction_element_observe))
+    raise SystemExit(trigger_main(psm_goal_observe))
 PY
 }
 

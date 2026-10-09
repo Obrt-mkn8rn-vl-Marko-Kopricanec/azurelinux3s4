@@ -52,6 +52,7 @@ PAYLOADS = {
     "Updates/trigger_iterators.py": "PY",
     "Updates/trigger_walk.py": "PY",
     "Updates/transaction_elements.py": "PY",
+    "Updates/psm_goals.py": "PY",
     "Updates/baselines.py": "PY",
     "Updates/rpm_test.py": "PY",
     "Updates/capacity.py": "PY",
