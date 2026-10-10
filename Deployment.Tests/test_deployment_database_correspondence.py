@@ -215,7 +215,7 @@ class DatabaseCorrespondenceTests(ReleaseFixture):
         intent = json.loads(contents['publication.json']); receipt = intent['database_profile_correspondence']
         self.assertEqual(receipt, self.observe())
         self.assertEqual(digest, hashlib.sha256(contents['publication.json']).hexdigest())
-        self.assertFalse(intent['activation_authorized']); self.assertEqual(len(contents), 13)
+        self.assertFalse(intent['activation_authorized']); self.assertEqual(len(contents), 14)
         self.assertNotIn('finite-model-only-password', contents['publication.json'].decode())
         self.assertNotIn('database_profile_correspondence', json.loads(contents['candidate.json']))
 

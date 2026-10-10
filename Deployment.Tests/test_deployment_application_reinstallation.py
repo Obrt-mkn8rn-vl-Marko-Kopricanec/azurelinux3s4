@@ -36,7 +36,8 @@ class ApplicationReinstallationTests(ReleaseFixture):
         self.state = self.root / self.n['APP_INSTALL_STATE'][1:]
         self.units = self.root / self.n['APP_INSTALL_UNITS'][1:]
         self.helpers = self.root / self.n['APP_INSTALL_HELPERS'][1:]
-        for path in (self.state, self.units, self.helpers):
+        self.sysusers = self.root / self.n['APP_INSTALL_SYSUSERS'][1:]
+        for path in (self.state, self.units, self.helpers, self.sysusers):
             path.mkdir(parents=True, mode=0o700)
             for parent in path.parents:
                 if parent == self.root.parent: break
@@ -106,7 +107,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         result = self.reinstall()
         self.assertEqual(result['disposition'], 'rollback-marker-retired'); self.assertTrue(result['rollback_marker_observed'])
         self.assertEqual(result['publication_sha256'], self.digest)
-        self.assertEqual(result['installation']['changed_files'], 10)
+        self.assertEqual(result['installation']['changed_files'], 11)
         self.assertEqual(result['installation']['installation_record_sha256'], hashlib.sha256(self.record).hexdigest())
         self.assertEqual((self.state / 'installation.json').read_bytes(), self.record)
         self.assertFalse((self.state / 'rollback.json').exists())
@@ -117,13 +118,13 @@ class ApplicationReinstallationTests(ReleaseFixture):
 
     def test_dual_family_reinstalls_both_gateway_files(self):
         self.value['public']['ipv6'] = net_fixture.PUBLIC6; self.completed()
-        result = self.reinstall(); self.assertEqual(result['installation']['files'], 11)
+        result = self.reinstall(); self.assertEqual(result['installation']['files'], 12)
         for family in (4, 6): self.assertTrue((self.units / ('mk8-dns-gateway' + str(family) + '.service')).is_file())
         self.assert_closed()
 
     def test_ipv6_only_reinstallation_retains_its_exact_family_set(self):
         self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6); self.completed()
-        self.assertEqual(self.reinstall()['installation']['files'], 10)
+        self.assertEqual(self.reinstall()['installation']['files'], 11)
         self.assertTrue((self.units / 'mk8-dns-gateway6.service').is_file())
         self.assertFalse((self.units / 'mk8-dns-gateway4.service').exists()); self.assert_closed()
 
@@ -252,7 +253,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         self.assertEqual((self.state / 'rollback.json').read_bytes(), self.marker)
         self.assertEqual(list(self.units.iterdir()), [])
         self.n['reinstallation_owner_sync'] = original
-        self.assertEqual(self.reinstall()['installation']['changed_files'], 10); self.assert_closed()
+        self.assertEqual(self.reinstall()['installation']['changed_files'], 11); self.assert_closed()
 
     def test_marker_unlink_fault_preserves_synchronized_owner_for_retry(self):
         self.completed(); real = os.unlink
@@ -277,7 +278,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         self.assertEqual(list(self.units.iterdir()), [])
         self.delivery.fsync = real
         result = self.reinstall(); self.assertFalse(result['rollback_marker_observed'])
-        self.assertEqual(result['installation']['changed_files'], 10); self.assert_closed()
+        self.assertEqual(result['installation']['changed_files'], 11); self.assert_closed()
 
     def test_zero_payload_after_transition_keeps_empty600_prefix_and_resume_inode(self):
         self.completed(); real = os.write
@@ -287,7 +288,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         self.assertEqual(first.read_bytes(), b''); self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o600)
         self.assertFalse((self.state / 'rollback.json').exists())
         self.delivery.write = real
-        self.assertEqual(self.reinstall()['installation']['changed_files'], 10)
+        self.assertEqual(self.reinstall()['installation']['changed_files'], 11)
         self.assertEqual(first.stat().st_ino, inode); self.assert_closed()
 
     def test_interrupted_second_payload_keeps_first_then_resumes_remaining_set(self):
@@ -302,7 +303,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         first = self.leaf(); identity = first.stat()
         self.assertEqual(first.read_bytes(), self.rows[0]['raw']); self.assertFalse(self.leaf(self.rows[1]).exists())
         self.n['installation_write'] = original
-        self.assertEqual(self.reinstall()['installation']['changed_files'], 9)
+        self.assertEqual(self.reinstall()['installation']['changed_files'], 10)
         self.assertEqual(first.stat(), identity); self.assert_closed()
 
     def test_original_source_change_between_transition_and_writer_withholds_payloads(self):
@@ -328,7 +329,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
         self.assertTrue(failed); self.assertEqual(list(self.units.iterdir()), [])
         self.assertEqual((self.state / 'installation.json').read_bytes(), self.record)
         self.delivery.close = real
-        self.assertEqual(self.reinstall()['installation']['changed_files'], 10); self.assert_closed()
+        self.assertEqual(self.reinstall()['installation']['changed_files'], 11); self.assert_closed()
 
     def test_unrelated_units_helpers_and_source_bytes_are_preserved(self):
         self.completed(); files = (self.units / 'other-owner.service', self.helpers / 'other-helper')
@@ -349,7 +350,7 @@ class ApplicationReinstallationTests(ReleaseFixture):
 
     def test_whole_delivered_library_positive_is_private_model_with_full_file_set(self):
         result = self.run_delivered(); self.assertEqual(result.returncode, 0, result.stderr)
-        value = json.loads(result.stdout); self.assertEqual(value['installation']['files'], 10)
+        value = json.loads(result.stdout); self.assertEqual(value['installation']['files'], 11)
         self.assertTrue(value['rollback_marker_observed']); self.assertTrue(value['checked_closes_completed'])
         self.assertTrue(all(flag is False for flag in value['authority'].values()))
         self.assertTrue(all(flag is False for flag in value['installation']['authority'].values()))

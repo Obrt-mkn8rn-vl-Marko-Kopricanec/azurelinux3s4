@@ -191,7 +191,7 @@ class SavaPolicyTests(ReleaseFixture):
         digest, contents = self.n['application_publication_plan'](encoded(self.value), self.n['bundle'])
         intent = json.loads(contents['publication.json']); self.assertEqual(intent['sava_policy_correspondence'], self.observe())
         self.assertNotIn('sava_policy_correspondence', json.loads(contents['candidate.json']))
-        self.assertEqual(digest, hashlib.sha256(contents['publication.json']).hexdigest()); self.assertEqual(len(contents), 13)
+        self.assertEqual(digest, hashlib.sha256(contents['publication.json']).hexdigest()); self.assertEqual(len(contents), 14)
 
     def test_whole_emitted_positive_binds_original_policy_and_false_authorities(self):
         before = self.source_snapshot(); result = self.run_emitted()

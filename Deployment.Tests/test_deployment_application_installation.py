@@ -28,7 +28,8 @@ class ApplicationInstallationTests(ReleaseFixture):
         self.state = self.root / self.n['APP_INSTALL_STATE'][1:]
         self.units = self.root / self.n['APP_INSTALL_UNITS'][1:]
         self.helpers = self.root / self.n['APP_INSTALL_HELPERS'][1:]
-        for path in (self.state, self.units, self.helpers):
+        self.sysusers = self.root / self.n['APP_INSTALL_SYSUSERS'][1:]
+        for path in (self.state, self.units, self.helpers, self.sysusers):
             path.mkdir(parents=True, mode=0o700)
             for parent in path.parents:
                 if parent == self.root.parent: break
@@ -42,7 +43,7 @@ class ApplicationInstallationTests(ReleaseFixture):
 
     def destinations(self):
         return {str(path.relative_to(self.root)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                for base in (self.state, self.units, self.helpers) for path in base.rglob('*')
+                for base in (self.state, self.units, self.helpers, self.sysusers) for path in base.rglob('*')
                 if path.is_file() and not path.is_symlink()}
 
     def source_snapshot(self):
@@ -102,7 +103,7 @@ class ApplicationInstallationTests(ReleaseFixture):
 
     def test_complete_single_family_files_modes_and_ownership_record_before_success(self):
         before = self.source_snapshot(); result = self.install()
-        self.assertEqual(result['files'], 10); self.assertEqual(result['changed_files'], 10)
+        self.assertEqual(result['files'], 11); self.assertEqual(result['changed_files'], 11)
         self.assertEqual(result['publication_sha256'], self.digest)
         self.assertEqual(result['installation_record_sha256'], hashlib.sha256(self.record).hexdigest())
         self.assertTrue(result['checked_closes_completed']); self.assertTrue(result['file_and_directory_fsync_returned'])
@@ -115,13 +116,13 @@ class ApplicationInstallationTests(ReleaseFixture):
 
     def test_dual_family_installs_both_complete_gateway_units(self):
         self.value['public']['ipv6'] = net_fixture.PUBLIC6
-        result = self.install(); self.assertEqual(result['files'], 11)
+        result = self.install(); self.assertEqual(result['files'], 12)
         for family in (4, 6): self.assertTrue((self.units / ('mk8-dns-gateway' + str(family) + '.service')).is_file())
         self.assert_closed()
 
     def test_ipv6_only_installs_no_ipv4_gateway(self):
         self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6)
-        self.assertEqual(self.install()['files'], 10)
+        self.assertEqual(self.install()['files'], 11)
         self.assertTrue((self.units / 'mk8-dns-gateway6.service').is_file())
         self.assertFalse((self.units / 'mk8-dns-gateway4.service').exists()); self.assert_closed()
 
@@ -156,7 +157,7 @@ class ApplicationInstallationTests(ReleaseFixture):
     def test_owned_prefix_completion_preserves_inode_and_never_unlinks(self):
         self.own(); path = self.leaf(); path.write_bytes(self.rows[0]['raw'][:31]); path.chmod(0o600)
         inode = path.stat().st_ino; self.delivery.unlink = Mock(side_effect=AssertionError('unlink forbidden'))
-        self.assertEqual(self.install()['changed_files'], 10)
+        self.assertEqual(self.install()['changed_files'], 11)
         self.assertEqual(path.stat().st_ino, inode); self.assertEqual(path.read_bytes(), self.rows[0]['raw'])
         self.delivery.unlink.assert_not_called(); self.assert_closed()
 
@@ -216,7 +217,7 @@ class ApplicationInstallationTests(ReleaseFixture):
         path = self.leaf(); self.assertEqual(path.read_bytes(), b''); self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual((self.state / 'installation.json').read_bytes(), self.record)
         del self.delivery.write
-        self.assertEqual(self.install()['changed_files'], 10); self.assert_closed()
+        self.assertEqual(self.install()['changed_files'], 11); self.assert_closed()
 
     def test_partial_ownership_write_cannot_publish_success_or_be_recovered(self):
         real = os.write
@@ -241,7 +242,7 @@ class ApplicationInstallationTests(ReleaseFixture):
         self.delivery.close = close
         with self.assertRaisesRegex(OSError, 'checked close failure'): self.install()
         self.assertTrue(self.leaf().exists()); self.assert_closed()
-        del self.delivery.close; self.assertEqual(self.install()['changed_files'], 9)
+        del self.delivery.close; self.assertEqual(self.install()['changed_files'], 10)
 
     def test_fsync_failure_can_leave_complete_bytes_without_success(self):
         real = os.fsync; armed = True
@@ -253,7 +254,7 @@ class ApplicationInstallationTests(ReleaseFixture):
         self.delivery.fsync = sync
         with self.assertRaisesRegex(OSError, 'sync failure'): self.install()
         self.assertEqual(self.leaf().read_bytes(), self.rows[0]['raw']); self.assert_closed()
-        del self.delivery.fsync; self.assertEqual(self.install()['changed_files'], 9)
+        del self.delivery.fsync; self.assertEqual(self.install()['changed_files'], 10)
 
     def test_missing_raw_source_refuses_before_installation_directory_io(self):
         (self.root / 'etc/mk8.email/gateway/database-password.txt').unlink()
@@ -288,7 +289,7 @@ class ApplicationInstallationTests(ReleaseFixture):
 
     def test_whole_delivered_library_positive_private_trampoline_binds_files(self):
         result = self.run_delivered(); self.assertEqual(result.returncode, 0, result.stderr.decode())
-        output = json.loads(result.stdout); self.assertEqual(output['files'], 10)
+        output = json.loads(result.stdout); self.assertEqual(output['files'], 11)
         self.assertEqual(output['publication_sha256'], self.digest)
         self.assertTrue(all(value is False for value in output['authority'].values()))
         for row in self.rows:

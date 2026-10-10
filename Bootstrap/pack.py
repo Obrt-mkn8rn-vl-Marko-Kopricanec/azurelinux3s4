@@ -88,6 +88,7 @@ PAYLOADS = {
     "Deployment/drava_bootstrap.py": "PY",
     "Deployment/services.py": "PY",
     "Deployment/application_publication.py": "PY",
+    "Deployment/application_accounts.py": "PY",
     "Deployment/application_installation.py": "PY",
     "Deployment/application_rollback.py": "PY",
     "Deployment/application_reinstallation.py": "PY",

@@ -3,7 +3,7 @@
 
 APP_PUB_STORE = '/var/lib/azurelinux3s4/application-candidates'
 APP_PUB_LOCK = b'azurelinux3s4-inactive-application-publication-lock-v1\n'
-APP_PUB_DIRECTORIES = ('helpers', 'systemd')
+APP_PUB_DIRECTORIES = ('helpers', 'systemd', 'sysusers')
 APP_PUB_LIMIT = 16 * 1024 * 1024
 APP_PUB_FILE_LIMIT = 64 * 1024
 APP_PUB_BASE_UNITS = ('mk8-sava-application', 'mk8-sava-gateway',
@@ -26,16 +26,19 @@ def application_publication_plan(data, ssh_producer):
         raise ValueError('fresh complete inactive application candidate required')
     database = application_database_observe(candidate)
     sava = application_sava_observe(candidate)
+    accounts = application_account_policy(candidate['files'])
     contents = {'manifest.json': data, 'candidate.json': publication_encoded(candidate)}
     rows = []
     helper = candidate['dns_credential_helper']
     payloads = [(row, row['file'], '0644') for row in candidate['files']]
+    payloads.append((accounts['file'], 'sysusers/azurelinux3s4-applications.conf', '0644'))
     payloads.append((helper, 'helpers/dns-credentials.py', '0755'))
     for entry, stored, mode in payloads:
         deployment_fields(entry, ('file', 'mode', 'bytes', 'sha256', 'content'))
         if (type(entry['content']) is not str or type(entry['bytes']) is not int
                 or entry['mode'] != mode or (stored.startswith('helpers/')
-                and entry['file'] != DNS_CREDENTIAL_HELPER_PATH[1:])):
+                and entry['file'] != DNS_CREDENTIAL_HELPER_PATH[1:])
+                or (stored.startswith('sysusers/') and entry['file'] != APP_ACCOUNT_FILE)):
             raise ValueError('fixed application payload identity/mode required')
         raw = entry['content'].encode('ascii')
         if (not 0 < len(raw) <= APP_PUB_FILE_LIMIT or not raw.endswith(b'\n')
@@ -50,9 +53,10 @@ def application_publication_plan(data, ssh_producer):
                                   'files': rows, 'stored_leaf_mode': '0400', 'directory_mode': '0700',
                                   'database_profile_correspondence': database,
                                   'sava_policy_correspondence': sava,
+                                  'service_account_policy': {name: accounts[name] for name in ('units', 'accounts', 'source_profile', 'authority', 'limits')},
                                   'activation_authorized': False})
     contents['publication.json'] = intent
-    if len(contents) not in (13, 14) or sum(map(len, contents.values())) > APP_PUB_LIMIT:
+    if len(contents) not in (14, 15) or sum(map(len, contents.values())) > APP_PUB_LIMIT:
         raise ValueError('complete application publication bound')
     return dep_hash.sha256(intent).hexdigest(), contents
 

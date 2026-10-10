@@ -8,6 +8,7 @@ are separate prerequisites. Development callers use explicitly private root IO.
 APP_INSTALL_STATE = '/var/lib/azurelinux3s4/application-installation'
 APP_INSTALL_UNITS = '/etc/systemd/system'
 APP_INSTALL_HELPERS = '/usr/libexec/azurelinux3s4'
+APP_INSTALL_SYSUSERS = '/usr/lib/sysusers.d'
 APP_INSTALL_LOCK = b'azurelinux3s4-application-file-installation-lock-v1\n'
 APP_INSTALL_AUTHORITY = ('operationally_authorized', 'release_authenticated',
                         'configuration_authenticated', 'accounts_provisioned',
@@ -25,7 +26,7 @@ def application_installation_plan(data, ssh_producer):
     rows = intent['files']
     if (intent['format'] != 'azurelinux3s4-inactive-application-candidate-v1'
             or intent['activation_authorized'] is not False
-            or type(rows) is not list or len(rows) not in (10, 11)):
+            or type(rows) is not list or len(rows) not in (11, 12)):
         raise ValueError('complete fixed installation source required')
     payloads = []
     for row in rows:
@@ -36,6 +37,10 @@ def application_installation_plan(data, ssh_producer):
                     or row['file'] != stored or mode != '0644'):
                 raise ValueError('fixed systemd installation identity required')
             parent = APP_INSTALL_UNITS
+        elif stored == 'sysusers/azurelinux3s4-applications.conf':
+            leaf, parent = 'azurelinux3s4-applications.conf', APP_INSTALL_SYSUSERS
+            if row['file'] != APP_ACCOUNT_FILE or mode != '0644':
+                raise ValueError('fixed sysusers installation identity required')
         elif stored == 'helpers/dns-credentials.py':
             leaf, parent = 'dns-credentials.py', APP_INSTALL_HELPERS
             if row['file'] != 'usr/libexec/azurelinux3s4/' + leaf or mode != '0755':
@@ -69,7 +74,7 @@ def installation_directories(stack):
     deployment_directory(dep_os.fstat(root))
     held = {'/': (root, dep_os.fstat(root))}
     links = []
-    for path in (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS):
+    for path in (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS):
         parent, prefix = root, ''
         for leaf in deployment_path(path):
             prefix += '/' + leaf
@@ -93,7 +98,7 @@ def installation_directories(stack):
 
 
 def installation_context(held, links):
-    mutable = (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS)
+    mutable = (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS)
     for path, (fd, before) in held.items():
         current = dep_os.fstat(fd)
         deployment_directory(current)

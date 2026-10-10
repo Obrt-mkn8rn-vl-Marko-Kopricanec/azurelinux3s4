@@ -34,7 +34,8 @@ class ApplicationRollbackTests(ReleaseFixture):
         self.state = self.root / self.n['APP_INSTALL_STATE'][1:]
         self.units = self.root / self.n['APP_INSTALL_UNITS'][1:]
         self.helpers = self.root / self.n['APP_INSTALL_HELPERS'][1:]
-        for path in (self.state, self.units, self.helpers):
+        self.sysusers = self.root / self.n['APP_INSTALL_SYSUSERS'][1:]
+        for path in (self.state, self.units, self.helpers, self.sysusers):
             path.mkdir(parents=True, mode=0o700)
             for parent in path.parents:
                 if parent == self.root.parent: break
@@ -97,7 +98,7 @@ class ApplicationRollbackTests(ReleaseFixture):
 
     def test_complete_first_installation_returns_to_exact_destination_absence(self):
         self.install(); before = self.source_snapshot(); result = self.rollback()
-        self.assertEqual(result['files'], 10); self.assertEqual(result['removed_files'], 10)
+        self.assertEqual(result['files'], 11); self.assertEqual(result['removed_files'], 11)
         self.assertEqual(result['disposition'], 'rolled-back'); self.assertEqual(result['publication_sha256'], self.digest)
         self.assertEqual(result['rollback_record_sha256'], hashlib.sha256(self.marker).hexdigest())
         self.assertTrue(result['checked_closes_completed']); self.assertTrue(result['file_and_directory_fsync_returned'])
@@ -109,13 +110,13 @@ class ApplicationRollbackTests(ReleaseFixture):
 
     def test_dual_family_restores_absence_of_both_public_gateways(self):
         self.value['public']['ipv6'] = net_fixture.PUBLIC6; self.install(); result = self.rollback()
-        self.assertEqual(result['files'], 11); self.assertEqual(result['removed_files'], 11)
+        self.assertEqual(result['files'], 12); self.assertEqual(result['removed_files'], 12)
         for family in (4, 6): self.assertFalse((self.units / ('mk8-dns-gateway' + str(family) + '.service')).exists())
         self.assert_closed()
 
     def test_ipv6_only_restores_only_its_qualified_units(self):
         self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6); self.install()
-        self.assertEqual(self.rollback()['removed_files'], 10); self.assertEqual(list(self.units.iterdir()), [])
+        self.assertEqual(self.rollback()['removed_files'], 11); self.assertEqual(list(self.units.iterdir()), [])
         self.assert_closed()
 
     def test_idempotent_retry_keeps_complete_marker_and_lock_identities(self):
@@ -130,7 +131,7 @@ class ApplicationRollbackTests(ReleaseFixture):
 
     def test_marker_binds_complete_original_installation_record_and_publication(self):
         value = json.loads(self.marker); self.assertEqual(value['installation_record'], {'bytes': len(self.owner), 'sha256': hashlib.sha256(self.owner).hexdigest()})
-        self.assertEqual(value['publication_sha256'], self.digest); self.assertEqual(value['files'], 10)
+        self.assertEqual(value['publication_sha256'], self.digest); self.assertEqual(value['files'], 11)
         self.assertEqual(value['restored_destination_state'], 'absent'); self.assertFalse(value['activation_authorized'])
 
     def test_all_authorities_false_and_no_production_dispatcher_or_default_call(self):
@@ -219,7 +220,7 @@ class ApplicationRollbackTests(ReleaseFixture):
         self.assertEqual((self.state / 'installation.json').read_bytes(), self.owner)
         self.assertEqual((self.state / 'rollback.json').read_bytes(), self.marker)
         del self.delivery.unlink
-        self.assertEqual(self.rollback()['removed_files'], 9); self.assert_closed()
+        self.assertEqual(self.rollback()['removed_files'], 10); self.assert_closed()
 
     def test_marker_zero_write_refuses_before_the_first_unlink(self):
         self.install(); real = os.write; self.delivery.write = lambda fd,raw: 0 if raw==self.marker else real(fd,raw)
@@ -230,7 +231,7 @@ class ApplicationRollbackTests(ReleaseFixture):
 
     def test_marker_short_writes_complete_before_retirement(self):
         self.install(); real = os.write; self.delivery.write = lambda fd,raw: real(fd,raw[:11])
-        self.assertEqual(self.rollback()['removed_files'], 10); self.assert_closed()
+        self.assertEqual(self.rollback()['removed_files'], 11); self.assert_closed()
 
     def test_parent_sync_failure_after_unlink_is_not_success_and_retry_is_safe(self):
         self.install(); real = os.fsync; fired = False
@@ -242,7 +243,7 @@ class ApplicationRollbackTests(ReleaseFixture):
         self.delivery.fsync = sync
         with self.assertRaisesRegex(OSError, 'parent sync fault'): self.rollback()
         self.assertTrue((self.state / 'installation.json').exists()); self.assertFalse(self.leaf().exists())
-        del self.delivery.fsync; self.assertEqual(self.rollback()['removed_files'], 9); self.assert_closed()
+        del self.delivery.fsync; self.assertEqual(self.rollback()['removed_files'], 10); self.assert_closed()
 
     def test_owner_unlink_failure_retains_owner_for_zero_payload_retry(self):
         self.install(); real = os.unlink
@@ -291,7 +292,7 @@ class ApplicationRollbackTests(ReleaseFixture):
             self.assertTrue(syncs, 'retained marker must be file-synchronized before first deletion')
             return real_unlink(name, *args, **kwargs)
         self.delivery.unlink = unlink
-        self.assertEqual(self.rollback()['removed_files'], 10); self.assertGreaterEqual(len(syncs), 2)
+        self.assertEqual(self.rollback()['removed_files'], 11); self.assertGreaterEqual(len(syncs), 2)
         self.assert_closed()
 
     def test_path_replacement_after_admission_refuses_before_marker_or_unlink(self):
@@ -321,7 +322,7 @@ class ApplicationRollbackTests(ReleaseFixture):
 
     def test_whole_delivered_library_positive_restores_owned_file_absence(self):
         result=self.run_delivered();self.assertEqual(result.returncode,0,result.stderr.decode());output=json.loads(result.stdout)
-        self.assertEqual(output['removed_files'],10);self.assertEqual(len(output['authority']),13)
+        self.assertEqual(output['removed_files'],11);self.assertEqual(len(output['authority']),13)
         self.assertTrue(all(v is False for v in output['authority'].values()))
         self.assertTrue(all(not self.leaf(row).exists() for row in self.rows))
         self.assertEqual((self.state/'rollback.json').read_bytes(),self.marker);self.assertFalse((self.state/'installation.json').exists())

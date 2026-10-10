@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.75.0
+S4_VERSION=0.76.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -10437,12 +10437,104 @@ def application_sava_observe(candidate):
             'sources': [{'file': '/etc/mk8.sava/' + leaf, 'bytes': len(data),
                          'sha256': dep_hash.sha256(data).hexdigest()} for leaf, data in original.items()],
             'authority': {name: False for name in SAVA_POLICY_AUTHORITY}}
+"""Fixed sysusers declarations bound to complete freshly produced service units.
+
+No NSS lookup, account creation, native parser or manager invocation is supplied.
+"""
+
+
+APP_ACCOUNT_FILE = 'usr/lib/sysusers.d/azurelinux3s4-applications.conf'
+APP_ACCOUNT_UNIT_LIMIT = 64 * 1024
+APP_ACCOUNT_UNITS = {
+    'mk8-sava-application': 'mk8sava-application',
+    'mk8-sava-gateway': 'mk8sava-gateway',
+    'mk8-drava-application': 'mk8drava', 'mk8-drava-gateway': 'mk8drava',
+    'mk8-dns-controller': 'mk8dns', 'mk8-dns-authoritative-replica': 'mk8dns',
+    'mk8-dns-gateway4': 'mk8dns', 'mk8-dns-gateway6': 'mk8dns',
+    'mk8-email-worker': 'mk8email-worker', 'mk8-email-gateway': 'mk8email-gateway',
+}
+APP_ACCOUNT_AUTHORITY = ('owner_account_intent_authenticated', 'native_sysusers_parser_passed',
+                         'sysusers_executed', 'current_nss_users_groups_admitted',
+                         'uids_gids_allocated', 'passwords_locked_and_shells_admitted',
+                         'supplementary_groups_admitted', 'service_credential_access_proven',
+                         'accounts_rollback_proven', 'server_ready')
+
+
+def application_account_policy(units):
+    # Internal pure compiler. The mandatory publisher calls this only with its
+    # freshly reconstructed full candidate, never a CLI-supplied retained receipt.
+    if type(units) is not list or len(units) not in (9, 10):
+        raise ValueError('complete application account unit set required')
+    rows, seen, accounts = [], set(), {}
+    for entry in units:
+        deployment_fields(entry, ('file', 'mode', 'bytes', 'sha256', 'content'))
+        if (type(entry['file']) is not str or not entry['file'].startswith('systemd/')
+                or not entry['file'].endswith('.service') or type(entry['mode']) is not str or entry['mode'] != '0644'
+                or type(entry['sha256']) is not str
+                or type(entry['bytes']) is not int or type(entry['content']) is not str
+                or not 0 < len(entry['content']) <= APP_ACCOUNT_UNIT_LIMIT):
+            raise ValueError('fixed account unit identity/mode required')
+        name = entry['file'][len('systemd/'):-len('.service')]
+        if name not in APP_ACCOUNT_UNITS or name in seen:
+            raise ValueError('unique supported account unit required')
+        raw = entry['content'].encode('ascii')
+        if (not raw.endswith(b'\n') or any(byte < 32 and byte != 10 or byte > 126 for byte in raw)
+                or entry['bytes'] != len(raw) or entry['sha256'] != dep_hash.sha256(raw).hexdigest()):
+            raise ValueError('account unit byte commitment mismatch')
+        section, service_sections, identities = '', 0, {}
+        for line in entry['content'].splitlines():
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('['):
+                if line not in ('[Unit]', '[Service]', '[Install]'):
+                    raise ValueError('unsupported account unit section')
+                section = line
+                service_sections += line == '[Service]'
+            key, separator, value = line.partition('=')
+            if separator and not dep_re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', key):
+                raise ValueError('canonical account unit directive required')
+            if separator and key in ('DynamicUser', 'SupplementaryGroups', 'PAMName',
+                                     'RootDirectory', 'RootImage', 'PrivateUsers'):
+                raise ValueError('unsupported account identity modifier')
+            if separator and key in ('User', 'Group'):
+                if section != '[Service]' or key in identities:
+                    raise ValueError('single service User/Group declarations required')
+                identities[key] = value
+        account = APP_ACCOUNT_UNITS[name]
+        if service_sections != 1 or identities != {'User': account, 'Group': account}:
+            raise ValueError('exact service account correspondence required')
+        seen.add(name)
+        rows.append({'file': entry['file'], 'bytes': len(raw), 'sha256': entry['sha256'],
+                     'user': account, 'group': account})
+        accounts.setdefault(account, []).append(entry['file'])
+    base = tuple(name for name in APP_ACCOUNT_UNITS if not name.startswith('mk8-dns-gateway')
+                 and not name.startswith('mk8-email-'))
+    gateways = tuple(name for name in ('mk8-dns-gateway4', 'mk8-dns-gateway6') if name in seen)
+    expected = (*base, *gateways, 'mk8-email-worker', 'mk8-email-gateway')
+    if not gateways or tuple(row['file'] for row in rows) != tuple('systemd/' + name + '.service' for name in expected):
+        raise ValueError('complete ordered account unit membership required')
+    lines = ['# Candidate declarations; account provisioning and consumer context unproven.']
+    for account in accounts:
+        # '-' delegates numeric allocation to a future admitted native consumer.
+        # No ID/range, membership, password, credential or admin account is invented.
+        lines.append('u ' + account + ' - "Application service account" / /usr/sbin/nologin')
+    file = deployment_file(APP_ACCOUNT_FILE, '0644', '\n'.join(lines) + '\n')
+    return {'file': file, 'units': rows,
+            'accounts': [{'name': name, 'primary_group': name, 'uid': None, 'gid': None,
+                          'units': owners} for name, owners in accounts.items()],
+            'source_profile': 'Pinned systemd v255 u syntax; missing users/groups only; automatic numeric allocation UNSELECTED.',
+            'authority': {name: False for name in APP_ACCOUNT_AUTHORITY},
+            'limits': ['Pure declaration compiler; no NSS/native sysusers/account creation or UID/GID/current-password/shell/access proof.',
+                       'Existing users/groups are not repaired by this fragment. Fresh complete NSS/local databases, supplementary groups, non-root uniqueness and credential access remain required.',
+                       'Full /etc,/run,/usr/lib sysusers precedence and every conflicting fragment/native consumer must be admitted. An installed fragment could be consumed at boot or by independent tools.',
+                       'The explicit nologin path is a declaration, not authenticated installed executable proof. No home directory is created; native state/cache/runtime provisioning remains separate.',
+                       'Drava and DNS retain shared per-application names; this does not establish same-UID isolation or actual numeric equality/distinctness.']}
 """Retain fresh complete application candidates in a separate inactive namespace."""
 
 
 APP_PUB_STORE = '/var/lib/azurelinux3s4/application-candidates'
 APP_PUB_LOCK = b'azurelinux3s4-inactive-application-publication-lock-v1\n'
-APP_PUB_DIRECTORIES = ('helpers', 'systemd')
+APP_PUB_DIRECTORIES = ('helpers', 'systemd', 'sysusers')
 APP_PUB_LIMIT = 16 * 1024 * 1024
 APP_PUB_FILE_LIMIT = 64 * 1024
 APP_PUB_BASE_UNITS = ('mk8-sava-application', 'mk8-sava-gateway',
@@ -10465,16 +10557,19 @@ def application_publication_plan(data, ssh_producer):
         raise ValueError('fresh complete inactive application candidate required')
     database = application_database_observe(candidate)
     sava = application_sava_observe(candidate)
+    accounts = application_account_policy(candidate['files'])
     contents = {'manifest.json': data, 'candidate.json': publication_encoded(candidate)}
     rows = []
     helper = candidate['dns_credential_helper']
     payloads = [(row, row['file'], '0644') for row in candidate['files']]
+    payloads.append((accounts['file'], 'sysusers/azurelinux3s4-applications.conf', '0644'))
     payloads.append((helper, 'helpers/dns-credentials.py', '0755'))
     for entry, stored, mode in payloads:
         deployment_fields(entry, ('file', 'mode', 'bytes', 'sha256', 'content'))
         if (type(entry['content']) is not str or type(entry['bytes']) is not int
                 or entry['mode'] != mode or (stored.startswith('helpers/')
-                and entry['file'] != DNS_CREDENTIAL_HELPER_PATH[1:])):
+                and entry['file'] != DNS_CREDENTIAL_HELPER_PATH[1:])
+                or (stored.startswith('sysusers/') and entry['file'] != APP_ACCOUNT_FILE)):
             raise ValueError('fixed application payload identity/mode required')
         raw = entry['content'].encode('ascii')
         if (not 0 < len(raw) <= APP_PUB_FILE_LIMIT or not raw.endswith(b'\n')
@@ -10489,9 +10584,10 @@ def application_publication_plan(data, ssh_producer):
                                   'files': rows, 'stored_leaf_mode': '0400', 'directory_mode': '0700',
                                   'database_profile_correspondence': database,
                                   'sava_policy_correspondence': sava,
+                                  'service_account_policy': {name: accounts[name] for name in ('units', 'accounts', 'source_profile', 'authority', 'limits')},
                                   'activation_authorized': False})
     contents['publication.json'] = intent
-    if len(contents) not in (13, 14) or sum(map(len, contents.values())) > APP_PUB_LIMIT:
+    if len(contents) not in (14, 15) or sum(map(len, contents.values())) > APP_PUB_LIMIT:
         raise ValueError('complete application publication bound')
     return dep_hash.sha256(intent).hexdigest(), contents
 
@@ -10530,6 +10626,7 @@ are separate prerequisites. Development callers use explicitly private root IO.
 APP_INSTALL_STATE = '/var/lib/azurelinux3s4/application-installation'
 APP_INSTALL_UNITS = '/etc/systemd/system'
 APP_INSTALL_HELPERS = '/usr/libexec/azurelinux3s4'
+APP_INSTALL_SYSUSERS = '/usr/lib/sysusers.d'
 APP_INSTALL_LOCK = b'azurelinux3s4-application-file-installation-lock-v1\n'
 APP_INSTALL_AUTHORITY = ('operationally_authorized', 'release_authenticated',
                         'configuration_authenticated', 'accounts_provisioned',
@@ -10547,7 +10644,7 @@ def application_installation_plan(data, ssh_producer):
     rows = intent['files']
     if (intent['format'] != 'azurelinux3s4-inactive-application-candidate-v1'
             or intent['activation_authorized'] is not False
-            or type(rows) is not list or len(rows) not in (10, 11)):
+            or type(rows) is not list or len(rows) not in (11, 12)):
         raise ValueError('complete fixed installation source required')
     payloads = []
     for row in rows:
@@ -10558,6 +10655,10 @@ def application_installation_plan(data, ssh_producer):
                     or row['file'] != stored or mode != '0644'):
                 raise ValueError('fixed systemd installation identity required')
             parent = APP_INSTALL_UNITS
+        elif stored == 'sysusers/azurelinux3s4-applications.conf':
+            leaf, parent = 'azurelinux3s4-applications.conf', APP_INSTALL_SYSUSERS
+            if row['file'] != APP_ACCOUNT_FILE or mode != '0644':
+                raise ValueError('fixed sysusers installation identity required')
         elif stored == 'helpers/dns-credentials.py':
             leaf, parent = 'dns-credentials.py', APP_INSTALL_HELPERS
             if row['file'] != 'usr/libexec/azurelinux3s4/' + leaf or mode != '0755':
@@ -10591,7 +10692,7 @@ def installation_directories(stack):
     deployment_directory(dep_os.fstat(root))
     held = {'/': (root, dep_os.fstat(root))}
     links = []
-    for path in (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS):
+    for path in (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS):
         parent, prefix = root, ''
         for leaf in deployment_path(path):
             prefix += '/' + leaf
@@ -10615,7 +10716,7 @@ def installation_directories(stack):
 
 
 def installation_context(held, links):
-    mutable = (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS)
+    mutable = (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS)
     for path, (fd, before) in held.items():
         current = dep_os.fstat(fd)
         deployment_directory(current)

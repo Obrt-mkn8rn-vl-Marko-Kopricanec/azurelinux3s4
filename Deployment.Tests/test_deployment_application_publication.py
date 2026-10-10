@@ -87,7 +87,7 @@ class ApplicationPublicationTests(ReleaseFixture):
 
     def test_complete_single_family_units_helper_and_original_manifest_retained(self):
         before = self.source_snapshot(); result = self.publish()
-        self.assertEqual(result['stored_files'], 13)
+        self.assertEqual(result['stored_files'], 14)
         self.assertEqual(result['bundle'], self.n['APP_PUB_STORE'] + '/' + self.digest)
         self.assertEqual(result['disposition'], 'published')
         self.assertEqual(set(self.store_snapshot(self.final)), set(self.contents))
@@ -105,7 +105,7 @@ class ApplicationPublicationTests(ReleaseFixture):
     def test_dual_public_family_retains_both_exact_gateway_units(self):
         self.value['public']['ipv6'] = net_fixture.PUBLIC6
         result = self.publish(); final = self.root / result['bundle'][1:]
-        self.assertEqual(result['stored_files'], 14)
+        self.assertEqual(result['stored_files'], 15)
         for version in (4, 6):
             self.assertTrue((final / ('systemd/mk8-dns-gateway' + str(version) + '.service')).is_file())
         self.assert_closed()
@@ -113,7 +113,7 @@ class ApplicationPublicationTests(ReleaseFixture):
     def test_ipv6_only_public_variant_retains_only_ipv6_gateway(self):
         self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6)
         result = self.publish(); final = self.root / result['bundle'][1:]
-        self.assertEqual(result['stored_files'], 13)
+        self.assertEqual(result['stored_files'], 14)
         self.assertTrue((final / 'systemd/mk8-dns-gateway6.service').is_file())
         self.assertFalse((final / 'systemd/mk8-dns-gateway4.service').exists()); self.assert_closed()
 
@@ -122,7 +122,7 @@ class ApplicationPublicationTests(ReleaseFixture):
         self.assertEqual(intent['format'], 'azurelinux3s4-inactive-application-candidate-v1')
         self.assertFalse(intent['activation_authorized'])
         self.assertEqual(intent['candidate']['sha256'], hashlib.sha256(self.contents['candidate.json']).hexdigest())
-        self.assertEqual(len(intent['files']), 10)
+        self.assertEqual(len(intent['files']), 11)
         for row in intent['files']:
             self.assertEqual(row['sha256'], hashlib.sha256(self.contents[row['stored']]).hexdigest())
         helper = intent['files'][-1]
@@ -301,7 +301,7 @@ class ApplicationPublicationTests(ReleaseFixture):
         result = self.run_emitted()
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
-        self.assertEqual(receipt['stored_files'], 13)
+        self.assertEqual(receipt['stored_files'], 14)
         self.assertEqual(receipt['publication_sha256'], self.digest)
         self.assertTrue(all(value is False for value in receipt['authority'].values()))
         self.assertEqual(set(self.store_snapshot(self.final)), set(self.contents))
