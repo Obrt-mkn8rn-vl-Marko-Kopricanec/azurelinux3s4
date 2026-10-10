@@ -80,6 +80,7 @@ MODULES = (
     "test_deployment_email_presentation",
     "test_deployment_postgresql_profile",
     "test_deployment_database_correspondence",
+    "test_deployment_sava_policy",
 )
 
 

@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/email_presentation.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py', 'Deployment/database_correspondence.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/email_presentation.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py', 'Deployment/database_correspondence.py', 'Deployment/sava_policy.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -78,8 +78,8 @@ class ReleaseFixture(unittest.TestCase):
                 database = config / 'controller/database.txt'
                 database.write_bytes(b'Host=/run/postgresql;Port=5432;Database=mk8dns;Username=mk8dns;Password=finite-model-only-password'); database.chmod(0o600)
             if app == 'mk8.sava':
-                inputs = {'policy.env': b'Sava__DefaultAccount=fixture\nSava__Accounts__fixture=not-a-runtime-proof\nApplicationTransport__Endpoint=http://127.0.0.1:18581/internal/application\n',
-                          'application.env': b'Sava__DataPath=/var/lib/mk8.sava/application\nSava__DataEncryptionKeys__fixture=private-fixture-only\n',
+                inputs = {'policy.env': b'Sava__DefaultAccount=fixture\nSava__Accounts__fixture=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\nApplicationTransport__Endpoint=http://127.0.0.1:18581/internal/application\n',
+                          'application.env': b'Sava__DataPath=/var/lib/mk8.sava/application\nSava__DataEncryptionKeys__fixture=QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=\n',
                           'gateway.env': b'Gateway__StagingPath=/var/cache/mk8.sava-gateway/staging\n',
                           'rpc.key': b'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n'}
             if app == 'mk8.email':
