@@ -77,6 +77,7 @@ MODULES = (
     "test_deployment_application_publication",
     "test_deployment_drava_bootstrap",
     "test_deployment_email_transport",
+    "test_deployment_email_presentation",
 )
 
 

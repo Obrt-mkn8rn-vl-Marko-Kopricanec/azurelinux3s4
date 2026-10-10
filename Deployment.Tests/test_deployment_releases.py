@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/email_presentation.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -86,6 +86,7 @@ class ReleaseFixture(unittest.TestCase):
                 for role in ('worker', 'gateway'):
                     runtime = '/run/credentials/mk8-email-' + role + '.service/'
                     value = {'Database': {'PasswordFile': runtime + 'database-password.txt'},
+                             'Smtp': {'Hostname': self.value['domains']['mk8.email']},
                              'Messaging': {'Enabled': True, 'EncryptionKeyId': 'primary',
                                            'EncryptionKeyFile': runtime + 'messaging-key.txt',
                                            'DecryptionKeys': [{'Id': 'old', 'KeyFile': runtime + 'messaging-decrypt-old.txt'}]},
@@ -97,6 +98,9 @@ class ReleaseFixture(unittest.TestCase):
                                      Dkim={'EnableSigning': True, 'PrivateKeyPath': runtime + 'dkim-key.pem'})
                         names.extend(('oauth-signing.txt', 'mfa-key.txt', 'dkim-key.pem'))
                     else:
+                        value['Smtp'].update(EnableSubmission=True, EnableStartTls=True)
+                        value['Imap'] = {'EnableImap': False, 'EnableImplicitTls': True}
+                        value['Jmap'] = {'Port': self.value['private_ports']['email_http']}
                         value['Tls'] = {'CertificatePath': runtime + 'tls-certificate.pem', 'CertificateKeyPath': runtime + 'tls-key.pem'}
                         value['Admin'] = {'AllowedNetworks': ['192.168.90.0/24'],
                                           'DataProtectionKeyPath': '/var/lib/mk8.email/gateway/data-protection',

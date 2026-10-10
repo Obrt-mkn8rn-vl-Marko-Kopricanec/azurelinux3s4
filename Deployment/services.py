@@ -92,6 +92,7 @@ def application_configuration(app, bindings, plan, credentials=None, dns_configu
     if app == 'mk8.email':
         email_role_observe(captured, plan)
         email_transport_observe(captured)
+        email_presentation_observe(captured, plan)
         observed = email_credential_observe(captured)
         if email_credentials is not None:
             email_credentials.extend(observed)
