@@ -285,7 +285,7 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
                 shutil.rmtree(private / path)
         self.assertEqual(endpoint.read_bytes(), b'finite endpoint marker\n')
         for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application')):
-            self.assertEqual(json.loads(configurations[leaf])[field]['unixSocketPath'], '/run/mk8.drava/application.sock')
+            self.assertEqual(json.loads(configurations[leaf])[field]['unixSocketPath'], '/var/lib/mk8.drava/application/application.sock')
             self.assertEqual((self.root / 'etc/mk8.drava' / leaf).read_bytes(), configurations[leaf])
         shutil.rmtree(private / 'mk8.drava')
         self.assertFalse(endpoint.exists())
@@ -307,14 +307,14 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
     def test_drava_socket_binding_refuses_missing_mismatch_and_other_transports(self):
         for body in ({'schemaVersion': 1}, {'application': None},
                      {'application': {'unixSocketPath': '/run/mk8.drava/gateway.sock'}},
-                     {'application': {'unixSocketPath': '/run/mk8.drava/application.sock', 'namedPipeName': 'other'}},
-                     {'application': {'unixSocketPath': '/run/mk8.drava/application.sock', 'httpsAddress': 'https://127.0.0.1/'}}):
+                     {'application': {'unixSocketPath': '/var/lib/mk8.drava/application/application.sock', 'namedPipeName': 'other'}},
+                     {'application': {'unixSocketPath': '/var/lib/mk8.drava/application/application.sock', 'httpsAddress': 'https://127.0.0.1/'}}):
             with self.subTest(body=body):
                 self.replace_configuration('mk8.drava', 'gateway.json', encoded(body))
                 with self.assertRaisesRegex(ValueError, 'application-owned Unix socket'):
                     self.candidate()
         self.replace_configuration('mk8.drava', 'gateway.json', encoded({
-            'application': {'unixSocketPath': '/run/mk8.drava/application.sock'}}))
+            'application': {'unixSocketPath': '/var/lib/mk8.drava/application/application.sock'}}))
         self.replace_configuration('mk8.drava', 'application.json', encoded({
             'listen': {'unixSocketPath': '/run/mk8.drava/gateway.sock'}}))
         with self.assertRaisesRegex(ValueError, 'application-owned Unix socket'):

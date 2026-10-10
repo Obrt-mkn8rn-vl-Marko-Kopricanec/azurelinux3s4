@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -52,9 +52,15 @@ class ReleaseFixture(unittest.TestCase):
             (self.root / 'etc').chmod(0o700)
             inputs = {leaf: encoded({'schemaVersion': 1}) for leaf in self.n['REL_CONFIGS'][app]}
             if app == 'mk8.drava':
-                inputs = {leaf: encoded({'schemaVersion': 1, field: {
-                    'unixSocketPath': '/run/mk8.drava/application.sock'}})
-                    for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application'))}
+                inputs = {leaf: encoded({'schemaVersion': 1, 'siteId': 'fixture-site',
+                    'gatewayId': 'fixture-gateway', 'stateDirectory': '/var/lib/mk8.drava/' + role,
+                    'httpPort': 80, 'httpsPort': 0, field: {
+                    'unixSocketPath': '/var/lib/mk8.drava/application/application.sock',
+                    'identityTokenPath': '/run/credentials/mk8-drava-' + role + '.service/ipc'},
+                    **({'nodeId': 'fixture-node'} if role == 'application' else {'discoveryEnabled': False})})
+                    for leaf, role, field in (('application.json', 'application', 'listen'),
+                                              ('gateway.json', 'gateway', 'application'))}
+                token = config / 'ipc-token.txt'; token.write_bytes(b'A' * 48 + b'\n'); token.chmod(0o600)
             if app == 'mk8.dns':
                 zone = {'ZoneId': '11111111-1111-1111-1111-111111111111', 'Origin': 'example.test.'}
                 common = {'Epoch': '22222222-2222-2222-2222-222222222222', 'TargetNode': 'r630-authoritative-replica', 'Zones': [zone]}

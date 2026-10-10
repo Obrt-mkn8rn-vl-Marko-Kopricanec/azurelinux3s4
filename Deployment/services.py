@@ -73,9 +73,10 @@ def application_configuration(app, bindings, plan, credentials=None, dns_configu
         for leaf, field in (('application.json', 'listen'), ('gateway.json', 'application')):
             endpoint = release_json(captured[leaf]).get(field)
             if (type(endpoint) is not dict
-                    or endpoint.get('unixSocketPath') != '/run/mk8.drava/application.sock'
+                    or endpoint.get('unixSocketPath') != DRAVA_SOCKET
                     or endpoint.get('namedPipeName', '') != '' or endpoint.get('httpsAddress', '') != ''):
                 raise ValueError('Drava application-owned Unix socket correspondence')
+        result[0]['ipc_identity'] = drava_bootstrap_observe(captured, plan)
     if app == 'mk8.dns':
         # Controller is a publication client; the replica alone owns that socket.
         if (release_json(captured['control-plane.json']).get('PublicationSocket') !=
@@ -143,9 +144,11 @@ def application_units(app, release, plan, credentials=()):
     if app == 'mk8.drava':
         return [application_unit('mk8-drava-' + role, app, role, release,
                     arguments=('--bootstrap', '%d/bootstrap.json'), privileged=role == 'gateway',
-                    extra=('LoadCredential=bootstrap.json:' + config + role + '.json',) +
+                    extra=('LoadCredential=bootstrap.json:' + config + role + '.json',
+                           'LoadCredential=ipc:' + DRAVA_IPC_SOURCE,
+                           'StateDirectory=mk8.drava/' + role, 'StateDirectoryMode=0700') +
                           (('RuntimeDirectory=mk8.drava', 'RuntimeDirectoryMode=0700') if role == 'application' else ()),
-                    after=('mk8-drava-application.service',) if role == 'gateway' else ())
+                    after=('mk8-drava-application.service',) if role == 'gateway' else (), state=False)
                 for role in ('application', 'gateway')]
     if app == 'mk8.email':
         if [row['role'] for row in credentials] != ['worker', 'gateway']:

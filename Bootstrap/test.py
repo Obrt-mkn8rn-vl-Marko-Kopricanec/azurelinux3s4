@@ -75,6 +75,7 @@ MODULES = (
     "test_deployment_email_credentials",
     "test_deployment_email_role_policy",
     "test_deployment_application_publication",
+    "test_deployment_drava_bootstrap",
 )
 
 
