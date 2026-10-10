@@ -1,5 +1,7 @@
 """Declared role/state ownership and LAN admin inputs, without account operations."""
 
+import deployment_fixture as net_fixture
+
 import copy
 import hashlib
 import json
@@ -110,26 +112,26 @@ class EmailRolePolicyTests(ReleaseFixture):
     def test_admin_networks_reject_wide_loopback_public_alias_duplicate_and_late_extra_rows(self):
         original = self.control()
         for networks in (None, [], {}, True, ['0.0.0.0/0'], ['192.168.0.0/16'], ['fc00::/7'],
-                         ['127.0.0.1/32'], ['192.168.90.0/24', '192.168.90.0/24'],
-                         ['192.168.90.0/24', '2001:4860::/64'], ['192.168.90.0/24', None],
-                         ['192.168.90.0/24', 'fd51:b089:f5e0:90::/64', '0.0.0.0/0']):
+                         ['127.0.0.1/32'], [str(net_fixture.ADMIN4), str(net_fixture.ADMIN4)],
+                         [str(net_fixture.ADMIN4), str(net_fixture.PUBLIC6).split('::')[0] + '::/64'], [str(net_fixture.ADMIN4), None],
+                         [str(net_fixture.ADMIN4), str(net_fixture.ADMIN6), '0.0.0.0/0']):
             with self.subTest(networks=networks):
                 value = copy.deepcopy(original); value['Admin']['AllowedNetworks'] = networks
                 self.refused(value, message='network declarations')
 
     def test_declared_ipv6_admin_is_optional_and_requires_its_manifest_entry(self):
-        value = self.control(); value['Admin']['AllowedNetworks'] = ['192.168.90.0/24', 'fd51:b089:f5e0:90::/64']
+        value = self.control(); value['Admin']['AllowedNetworks'] = [str(net_fixture.ADMIN4), str(net_fixture.ADMIN6)]
         self.replace(value); candidate = self.candidate()
         self.assertFalse(candidate['authority']['configuration_matches_network_and_storage_policy'])
         self.value['admin']['ipv6'] = None
         with self.assertRaisesRegex(ValueError, 'network declarations'): self.candidate()
-        value['Admin']['AllowedNetworks'] = ['192.168.90.0/24']; self.replace(value)
+        value['Admin']['AllowedNetworks'] = [str(net_fixture.ADMIN4)]; self.replace(value)
         self.assertEqual(len(self.candidate()['files']), 9)
 
     def test_admin_prefix_order_and_canonical_literal_spelling_are_required(self):
         original = self.control()
-        for networks in (['fd51:b089:f5e0:90::/64', '192.168.90.0/24'], ['192.168.90.1/24'],
-                         ['192.168.90.0/24 '], ['192.168.90.0/24', 'fd51:b089:f5e0:0090::/64']):
+        for networks in ([str(net_fixture.ADMIN6), str(net_fixture.ADMIN4)], [((net_fixture.admin4(1)) + '/24')],
+                         [((str(net_fixture.ADMIN4)) + ' ')], [str(net_fixture.ADMIN4), net_fixture.ADMIN6.network_address.exploded + '/64']):
             with self.subTest(networks=networks):
                 value = copy.deepcopy(original); value['Admin']['AllowedNetworks'] = networks; self.refused(value)
 
@@ -143,7 +145,7 @@ class EmailRolePolicyTests(ReleaseFixture):
         self.replace(original); self.assertEqual(len(self.candidate()['files']), 9)
 
     def test_ipv4_ipv6_and_dual_public_variants_keep_lan_only_admin_and_distinct_state_owners(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'), ('192.168.1.20', '2606:4700:4700::1111')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             with self.subTest(ipv4=ipv4, ipv6=ipv6):
                 self.value['public'].update(ipv4=ipv4, ipv6=ipv6); self.value['admin']['ipv6'] = None
                 units = {row['file']: row['content'] for row in self.candidate()['files']}

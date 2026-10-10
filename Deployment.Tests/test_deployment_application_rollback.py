@@ -1,5 +1,7 @@
 """Owned first-installation rollback in private filesystems; no manager actions."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import hashlib
 import json
@@ -106,13 +108,13 @@ class ApplicationRollbackTests(ReleaseFixture):
         self.assertEqual(before, self.source_snapshot()); self.assert_closed()
 
     def test_dual_family_restores_absence_of_both_public_gateways(self):
-        self.value['public']['ipv6'] = '2001:4860::20'; self.install(); result = self.rollback()
+        self.value['public']['ipv6'] = net_fixture.PUBLIC6; self.install(); result = self.rollback()
         self.assertEqual(result['files'], 11); self.assertEqual(result['removed_files'], 11)
         for family in (4, 6): self.assertFalse((self.units / ('mk8-dns-gateway' + str(family) + '.service')).exists())
         self.assert_closed()
 
     def test_ipv6_only_restores_only_its_qualified_units(self):
-        self.value['public'].update(ipv4=None, ipv6='2001:4860::20'); self.install()
+        self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6); self.install()
         self.assertEqual(self.rollback()['removed_files'], 10); self.assertEqual(list(self.units.iterdir()), [])
         self.assert_closed()
 
@@ -183,7 +185,7 @@ class ApplicationRollbackTests(ReleaseFixture):
         self.refused('destination unexpectedly present')
 
     def test_changed_manifest_cannot_reuse_old_owner_or_rollback_marker(self):
-        self.install(); self.value['public']['ipv4'] = '8.8.4.4'; self.refused('publication bytes mismatch')
+        self.install(); self.value['public']['ipv4'] = net_fixture.OTHER_PUBLIC4; self.refused('publication bytes mismatch')
 
     def test_foreign_state_entry_is_preserved_without_cleanup(self):
         self.install(); path = self.state / 'foreign'; path.write_bytes(b'preserve')

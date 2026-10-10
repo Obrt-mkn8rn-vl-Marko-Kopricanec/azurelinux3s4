@@ -170,7 +170,7 @@ def application_units(app, release, plan, credentials=()):
         runtime = 'mk8.dns/' + role
         observed = next(row for row in credentials if row['role'] == role)
         arguments = ['--socket', '/run/' + runtime + '/control.sock', '--state', '/var/lib/mk8.dns/' + role,
-                     '--node', 'r630-' + role, '--role', role, '--control', '/run/' + runtime + '/inputs/control.json']
+                     '--node', plan['dns_nodes'][role], '--role', role, '--control', '/run/' + runtime + '/inputs/control.json']
         if role == 'authoritative-replica':
             arguments.extend(('--publication-socket', '/run/' + runtime + '/publication.sock'))
         units.append(application_unit('mk8-dns-' + role, app, 'application', release, arguments,

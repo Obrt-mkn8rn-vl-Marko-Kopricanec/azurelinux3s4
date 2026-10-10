@@ -1,5 +1,7 @@
 """Original-byte Drava bootstrap declarations and explicit private delivery models."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -154,7 +156,7 @@ class DravaBootstrapTests(ReleaseFixture):
 
     def test_unassigned_wildcard_scoped_and_mismatched_ingress_refuse_before_token(self):
         original = self.role('gateway')
-        for address in ('0.0.0.0', '::', '192.168.90.20', '::1%lo', '::1%x\naccept', 'LOCALHOST', None):
+        for address in ('0.0.0.0', '::', net_fixture.admin4(20), '::1%lo', '::1%x\naccept', 'LOCALHOST', None):
             changed = copy.deepcopy(original); changed['bindAddress'] = address
             self.refuse_before_nested('gateway', changed, 'literal ingress')
 

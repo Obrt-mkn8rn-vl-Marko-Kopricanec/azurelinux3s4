@@ -112,8 +112,8 @@ def dns_control_observe(captured, plan):
         dns_fields(value, ('Epoch', 'TargetNode', 'Zones', 'KeyFile'),
                    ('ConnectionStringFile', 'PublicationSocket', 'Grants', 'SigningScanSeconds'))
         epoch = dns_guid(value['Epoch'])
-        if value['TargetNode'] != 'r630-authoritative-replica':
-            raise ValueError('fixed replica target-node declaration required')
+        if value['TargetNode'] != plan['dns_nodes']['authoritative-replica']:
+            raise ValueError('exact declared replica target-node correspondence required')
         runtime = '/run/mk8.dns/' + role + '/inputs/'
         if value['KeyFile'] != runtime + 'key.pem':
             raise ValueError('DNS role-owned key reference required')

@@ -1,5 +1,7 @@
 """Complete inactive application bundles with private IO and explicit root delivery."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import fcntl
@@ -101,7 +103,7 @@ class ApplicationPublicationTests(ReleaseFixture):
         self.assertFalse(self.pending.exists()); self.assert_closed()
 
     def test_dual_public_family_retains_both_exact_gateway_units(self):
-        self.value['public']['ipv6'] = '2001:4860::20'
+        self.value['public']['ipv6'] = net_fixture.PUBLIC6
         result = self.publish(); final = self.root / result['bundle'][1:]
         self.assertEqual(result['stored_files'], 14)
         for version in (4, 6):
@@ -109,7 +111,7 @@ class ApplicationPublicationTests(ReleaseFixture):
         self.assert_closed()
 
     def test_ipv6_only_public_variant_retains_only_ipv6_gateway(self):
-        self.value['public'].update(ipv4=None, ipv6='2001:4860::20')
+        self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6)
         result = self.publish(); final = self.root / result['bundle'][1:]
         self.assertEqual(result['stored_files'], 13)
         self.assertTrue((final / 'systemd/mk8-dns-gateway6.service').is_file())

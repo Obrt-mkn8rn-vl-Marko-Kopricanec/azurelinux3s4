@@ -1,5 +1,7 @@
 """Role-specific literal file declarations and the complete private emitted entry."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -68,7 +70,7 @@ class EmailCredentialTests(ReleaseFixture):
         self.assertEqual(len(value['authority']), 27); self.assertTrue(all(flag is False for flag in value['authority'].values()))
 
     def test_delivery_is_independent_of_public_family_and_absent_admin_ipv6(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'), ('192.168.1.20', '2606:4700:4700::1111')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             with self.subTest(ipv4=ipv4, ipv6=ipv6):
                 self.value['public'].update(ipv4=ipv4, ipv6=ipv6); self.value['admin']['ipv6'] = None
                 rows = self.candidate()['email_credentials']; self.assertEqual([len(row['inputs']) for row in rows], [8, 7])

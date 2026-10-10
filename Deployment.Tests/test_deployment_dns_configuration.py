@@ -1,5 +1,7 @@
 """Complete typed DNS declarations; no serializer, crypto, database or app run."""
 
+import deployment_fixture as net_fixture
+
 import base64
 import copy
 import hashlib
@@ -51,12 +53,12 @@ class DNSControlConfigurationTests(ReleaseFixture):
             data = (self.root / 'etc/mk8.dns' / leaf).read_bytes()
             self.assertEqual((row['original_bytes'], row['original_sha256']), (len(data), hashlib.sha256(data).hexdigest()))
             self.assertEqual(len(row['authority']), 16); self.assertTrue(all(flag is False for flag in row['authority'].values()))
-            self.assertEqual(row['target_node_declaration'], 'r630-authoritative-replica')
+            self.assertEqual(row['target_node_declaration'], self.value['dns_nodes']['authoritative-replica'])
         self.assertEqual(len(value['authority']), 27); self.assertTrue(all(flag is False for flag in value['authority'].values()))
         self.assertEqual(before, self.snapshot())
 
     def test_valid_pair_is_independent_of_public_family_and_missing_admin_ipv6(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'), ('192.168.1.20', '2606:4700:4700::1111')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             with self.subTest(ipv4=ipv4, ipv6=ipv6):
                 self.value['public'].update(ipv4=ipv4, ipv6=ipv6); self.value['admin']['ipv6'] = None
                 value = self.candidate(); self.assertEqual(len(value['dns_control_configuration']), 2)
@@ -86,7 +88,7 @@ class DNSControlConfigurationTests(ReleaseFixture):
 
     def test_target_must_match_the_declared_replica_unit_node(self):
         original = self.control()
-        for bad in ('r630-controller', 'other-replica', None, [], True, 'r630-authoritative-replica\n'):
+        for bad in ('test-controller', 'other-replica', None, [], True, self.value['dns_nodes']['authoritative-replica'] + '\n'):
             with self.subTest(bad=bad):
                 value = copy.deepcopy(original); value['TargetNode'] = bad; self.refuse(value)
 

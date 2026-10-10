@@ -1,5 +1,7 @@
 """Original Email transport declarations, independent budget controls and private IO."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -66,7 +68,7 @@ class EmailTransportTests(ReleaseFixture):
 
     def test_database_endpoint_refuses_remote_list_scope_alias_and_controls(self):
         original = self.role()
-        for host in ('192.168.90.1', 'example.test', '127.1', '::1%eth0', 'localhost\n', '', None, True, ['localhost']):
+        for host in (net_fixture.admin4(1), 'example.test', '127.1', '::1%eth0', 'localhost\n', '', None, True, ['localhost']):
             with self.subTest(host=host):
                 value = copy.deepcopy(original); value['Database']['Host'] = host
                 self.refused('worker', value, 'PostgreSQL endpoint')

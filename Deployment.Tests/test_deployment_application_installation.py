@@ -1,5 +1,7 @@
 """Private root delivery of the disconnected fixed application-file installer."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import fcntl
@@ -112,13 +114,13 @@ class ApplicationInstallationTests(ReleaseFixture):
         self.assertEqual(before, self.source_snapshot()); self.assert_closed()
 
     def test_dual_family_installs_both_complete_gateway_units(self):
-        self.value['public']['ipv6'] = '2001:4860::20'
+        self.value['public']['ipv6'] = net_fixture.PUBLIC6
         result = self.install(); self.assertEqual(result['files'], 11)
         for family in (4, 6): self.assertTrue((self.units / ('mk8-dns-gateway' + str(family) + '.service')).is_file())
         self.assert_closed()
 
     def test_ipv6_only_installs_no_ipv4_gateway(self):
-        self.value['public'].update(ipv4=None, ipv6='2001:4860::20')
+        self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6)
         self.assertEqual(self.install()['files'], 10)
         self.assertTrue((self.units / 'mk8-dns-gateway6.service').is_file())
         self.assertFalse((self.units / 'mk8-dns-gateway4.service').exists()); self.assert_closed()
@@ -177,7 +179,7 @@ class ApplicationInstallationTests(ReleaseFixture):
         self.assertEqual(list(self.units.iterdir()), [])
 
     def test_changed_manifest_after_installation_refuses_and_preserves_all_files(self):
-        self.install(); self.value['public']['ipv4'] = '8.8.4.4'
+        self.install(); self.value['public']['ipv4'] = net_fixture.OTHER_PUBLIC4
         self.refused('publication bytes mismatch')
 
     def test_foreign_extra_state_entry_is_not_removed_or_adopted(self):

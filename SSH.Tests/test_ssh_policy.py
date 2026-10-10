@@ -65,10 +65,10 @@ class SSHPolicyTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_public_cgnat_reserved_link_local_mapped_and_broad_prefixes_refuse(self):
-        for prefix, listener in [("0.0.0.0/0", "10.0.0.1"), ("8.8.8.0/24", "8.8.8.8"),
+        for prefix, listener in [("0.0.0.0/0", "10.0.0.1"), ("192.0.2.0/24", "192.0.2.8"),
                                  ("100.64.0.0/10", "100.64.0.1"), ("198.18.0.0/15", "198.18.0.1"),
                                  ("169.254.0.0/16", "169.254.1.2"), ("127.0.0.0/8", "127.0.0.1"),
-                                 ("::/0", "::1"), ("2001:4860::/32", "2001:4860::1"),
+                                 ("::/0", "::1"), ("2001:db8::/32", "2001:db8::1"),
                                  ("fe80::/10", "fe80::1"), ("::ffff:a00:0/104", "::ffff:a00:1")]:
             with self.subTest(prefix=prefix), self.assertRaises(ValueError):
                 POLICY.bundle([prefix], [listener])

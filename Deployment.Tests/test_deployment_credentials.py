@@ -1,5 +1,7 @@
 """Inactive DNS credential correspondence and finite private preparation IO."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import hashlib
 import inspect
@@ -58,7 +60,7 @@ class DNSCredentialCandidateTests(ReleaseFixture):
         self.assertEqual(collections.Counter(self.delivery.acquired), collections.Counter(self.delivery.closed))
 
     def test_all_family_units_keep_disjoint_runtime_owners_and_matching_helper_paths(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'), ('192.168.1.20', '2606:4700:4700::1111')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             with self.subTest(ipv4=ipv4, ipv6=ipv6):
                 self.value['public'].update(ipv4=ipv4, ipv6=ipv6)
                 value = self.candidate(); self.runtime_owners(value['files'])

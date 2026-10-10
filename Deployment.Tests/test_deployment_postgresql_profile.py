@@ -1,5 +1,7 @@
 """Fixed inactive PostgreSQL declarations and finite authentication-route models."""
 
+import deployment_fixture as net_fixture
+
 import copy
 import hashlib
 import ipaddress
@@ -82,8 +84,8 @@ class PostgreSQLProfileTests(unittest.TestCase):
 
     def test_every_public_admin_nonloopback_and_alternate_loopback_address_routes_to_reject(self):
         text = self.profile()[0][1]['content']
-        for address in ('192.168.90.10', '192.168.1.20', '8.8.8.8', '127.0.0.2',
-                        '2001:4860::1', 'fd51:b089:f5e0:90::10', '::2'):
+        for address in (net_fixture.admin4(10), net_fixture.nat4(), net_fixture.PUBLIC4, '127.0.0.2',
+                        net_fixture.PUBLIC6, net_fixture.admin6(10), '::2'):
             for database, user in (('mk8dns', 'mk8dns'), ('mk8email', 'mk8email_worker'), ('mk8email', 'mk8email_gateway')):
                 self.assertEqual(route(text, 'host', database, user, address), 'reject')
 
@@ -159,7 +161,7 @@ class PostgreSQLProfileTests(unittest.TestCase):
 
     def test_same_compiler_profile_is_independent_of_admin_and_public_address_families(self):
         baseline = self.profile()
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2001:4860::20'), ('192.168.1.20', '2001:4860::20')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             value = policy_fixture.manifest(False); value['public'].update(ipv4=ipv4, ipv6=ipv6)
             candidate = self.candidate(value); self.assertEqual(tuple(candidate['files'][2:4]), baseline[0])
             self.assertTrue(all(flag is False for flag in candidate['authority'].values()))

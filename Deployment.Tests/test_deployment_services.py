@@ -1,5 +1,7 @@
 """Source-grounded launch candidates and the actual emitted private entry."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -119,25 +121,25 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
         self.assertIn('--role controller --control /run/mk8.dns/controller/inputs/control.json\n', controller)
         self.assertIn('--role authoritative-replica --control /run/mk8.dns/authoritative-replica/inputs/control.json --publication-socket /run/mk8.dns/authoritative-replica/publication.sock\n', authority)
         self.assertNotIn('--dns-address', controller + authority)
-        self.assertIn('--socket /run/mk8.dns/authoritative-replica/control.sock --health-port 18053 --dns-address 192.168.1.20 --dns-port 53\n', gateway)
+        self.assertIn(('--socket /run/mk8.dns/authoritative-replica/control.sock --health-port 18053 --dns-address ' + (net_fixture.nat4()) + ' --dns-port 53\n'), gateway)
         self.assertNotIn('CAP_NET_BIND_SERVICE', controller + authority)
         self.assertIn('CAP_NET_BIND_SERVICE', gateway)
 
     def test_two_public_families_receive_distinct_dns_health_ports(self):
-        self.value['public']['ipv6'] = '2606:4700:4700::1111'
+        self.value['public']['ipv6'] = net_fixture.PUBLIC6
         units = {row['file']: row['content'] for row in self.candidate()['files']}
         self.assertEqual(len(units), 10)
-        self.assertIn('--health-port 18053 --dns-address 192.168.1.20', units['systemd/mk8-dns-gateway4.service'])
-        self.assertIn('--health-port 18054 --dns-address 2606:4700:4700::1111', units['systemd/mk8-dns-gateway6.service'])
+        self.assertIn(('--health-port 18053 --dns-address ' + (net_fixture.nat4())), units['systemd/mk8-dns-gateway4.service'])
+        self.assertIn(('--health-port 18054 --dns-address ' + (net_fixture.PUBLIC6)), units['systemd/mk8-dns-gateway6.service'])
         self.value['private_ports']['email_http'] = 18054
         with self.assertRaisesRegex(ValueError, 'per-family DNS health'): self.candidate()
 
     def test_ipv6_only_public_and_null_admin_ipv6_are_preserved(self):
         self.value['admin']['ipv6'] = None
-        self.value['public'].update(ipv4=None, ipv6='2606:4700:4700::1111')
+        self.value['public'].update(ipv4=None, ipv6=net_fixture.PUBLIC6)
         units = {row['file']: row['content'] for row in self.candidate()['files']}
         self.assertNotIn('systemd/mk8-dns-gateway4.service', units)
-        self.assertIn('--health-port 18053 --dns-address 2606:4700:4700::1111', units['systemd/mk8-dns-gateway6.service'])
+        self.assertIn(('--health-port 18053 --dns-address ' + (net_fixture.PUBLIC6)), units['systemd/mk8-dns-gateway6.service'])
 
     def test_configuration_hashes_are_bound_and_secret_bytes_are_not_serialized(self):
         result = self.candidate(); output = json.dumps(result)
@@ -159,7 +161,7 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
 
     def test_address_admission_precedes_release_observation(self):
         observer = Mock(); self.n['release_observe'] = observer
-        self.value['public']['ipv6'] = '2001:4860::1%x\n  accept'
+        self.value['public']['ipv6'] = ((net_fixture.PUBLIC6) + '%x\n  accept')
         with self.assertRaises(ValueError): self.candidate()
         observer.assert_not_called()
 
@@ -230,8 +232,8 @@ class DeploymentApplicationServiceTests(ReleaseFixture):
         self.assertIn(b'--application-service-policy ROOT_MANIFEST_JSON', help_result.stdout)
 
     def test_runtime_owners_are_disjoint_for_each_public_family_delivery(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2606:4700:4700::1111'),
-                           ('192.168.1.20', '2606:4700:4700::1111')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6),
+                           (net_fixture.nat4(), net_fixture.PUBLIC6)):
             with self.subTest(ipv4=ipv4, ipv6=ipv6):
                 self.value['public'].update(ipv4=ipv4, ipv6=ipv6)
                 result = self.candidate(); units = {row['file']: row['content'] for row in result['files']}

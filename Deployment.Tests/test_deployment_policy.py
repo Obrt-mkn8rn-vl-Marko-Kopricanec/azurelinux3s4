@@ -1,5 +1,7 @@
 """Explicit manifest, private FD deliveries and candidate policy regressions."""
 
+import deployment_fixture as net_fixture
+
 import copy
 import hashlib
 import json
@@ -29,11 +31,12 @@ def library():
 
 def manifest(ipv6=True):
     return {'schema': 1, 'hardware': 'Dell R630', 'architecture': 'x86_64', 'os': 'Azure Linux 3',
-            'admin': {'ipv4': {'interface': 'eno1.90', 'address': '192.168.90.10', 'routers': ['192.168.90.1']},
-                      'ipv6': {'interface': 'eno1.90', 'address': 'fd51:b089:f5e0:90::10', 'routers': ['fd51:b089:f5e0:90::1']} if ipv6 else None},
-            'public': {'interface': 'eno2', 'topology': 'nat', 'ipv4': '192.168.1.20', 'ipv6': None},
+            'admin': {'ipv4': {'interface': 'testlan0', 'prefix': str(net_fixture.ADMIN4), 'address': net_fixture.admin4(10), 'routers': [net_fixture.admin4(1)]},
+                      'ipv6': {'interface': 'testlan0', 'prefix': str(net_fixture.ADMIN6), 'address': net_fixture.admin6(10), 'routers': [net_fixture.admin6(1)]} if ipv6 else None},
+            'public': {'interface': 'testwan0', 'topology': 'nat', 'ipv4': net_fixture.nat4(), 'ipv6': None},
             'domains': {app: app.split('.')[1] + '.example.test' for app in ('mk8.sava', 'mk8.drava', 'mk8.dns', 'mk8.email')},
             'dns_zone': 'example.test',
+            'dns_nodes': {'controller': 'controller', 'authoritative-replica': 'replica'},
             'releases': {app: {'commit': '1' * 40, 'tree': '2' * 40, 'manifest_sha256': '3' * 64} for app in ('mk8.sava', 'mk8.drava', 'mk8.dns', 'mk8.email')},
             'private_ports': {'sava_gateway': 18580, 'sava_application': 18581, 'email_http': 18081, 'email_admin': 18082, 'dns_health': 18053},
             'mail': {'implicit_submission': False, 'pop3s': False, 'sieve': False}}
@@ -101,27 +104,27 @@ class DeploymentPolicyTests(unittest.TestCase):
 
     def test_exact_admin_prefixes_exclude_general_private_and_ula(self):
         result = self.candidate()
-        self.assertEqual(result['ssh_policy']['source_prefixes'], ['192.168.90.0/24', 'fd51:b089:f5e0:90::/64'])
+        self.assertEqual(result['ssh_policy']['source_prefixes'], [str(net_fixture.ADMIN4), str(net_fixture.ADMIN6)])
         ssh = result['files'][0]['content']
-        self.assertIn('ListenAddress 192.168.90.10\n', ssh)
-        self.assertIn('ListenAddress fd51:b089:f5e0:90::10\n', ssh)
+        self.assertIn(('ListenAddress ' + (net_fixture.admin4(10)) + '\n'), ssh)
+        self.assertIn(('ListenAddress ' + (net_fixture.admin6(10)) + '\n'), ssh)
         self.assertNotIn('fc00::/7', ssh)
         self.assertNotIn('192.168.0.0/16', ssh)
         self.assertNotIn('ListenAddress 0.0.0.0', ssh)
 
     def test_unassigned_admin_ipv6_omits_listener_independently_of_public_ipv6(self):
-        value = manifest(False); value['public']['ipv6'] = '2606:4700:4700::1111'
+        value = manifest(False); value['public']['ipv6'] = net_fixture.PUBLIC6
         result = self.candidate(value)
-        self.assertEqual(result['ssh_policy']['listen_addresses'], ['192.168.90.10'])
+        self.assertEqual(result['ssh_policy']['listen_addresses'], [net_fixture.admin4(10)])
         nft = result['files'][1]['content']
-        self.assertNotIn('fd51:b089:f5e0:90', nft)
-        self.assertIn('ip6 daddr 2606:4700:4700::1111', nft)
+        self.assertNotIn(str(net_fixture.ADMIN6.network_address).split('::')[0], nft)
+        self.assertIn(('ip6 daddr ' + (net_fixture.PUBLIC6)), nft)
         self.assertIn('packet-too-big', nft)
 
     def test_ssh_router_and_destination_checks_precede_stateful_and_loopback_accept(self):
         nft = self.candidate()['files'][1]['content']
-        self.assertLess(nft.index('saddr { 192.168.90.1 } tcp dport 22 drop'), nft.index('saddr 192.168.90.0/24'))
-        self.assertIn('iifname "eno1.90" ip saddr 192.168.90.0/24 ip daddr 192.168.90.10 tcp dport 22 accept', nft)
+        self.assertLess(nft.index(('saddr { ' + (net_fixture.admin4(1)) + ' } tcp dport 22 drop')), nft.index(('saddr ' + (str(net_fixture.ADMIN4)))))
+        self.assertIn(('iifname "testlan0" ip saddr ' + (str(net_fixture.ADMIN4)) + ' ip daddr ' + (net_fixture.admin4(10)) + ' tcp dport 22 accept'), nft)
         self.assertLess(nft.index('  tcp dport 22 drop'), nft.index('iifname "lo" accept'))
         self.assertLess(nft.index('  tcp dport 22 drop'), nft.index('ct state established,related accept'))
 
@@ -156,28 +159,28 @@ class DeploymentPolicyTests(unittest.TestCase):
                 self.refuse(value)
 
     def test_admin_wildcard_public_linklocal_other_prefix_boundary_or_mapped_refuses(self):
-        for version, addresses in (('ipv4', ('0.0.0.0', '8.8.8.8', '192.168.91.10', '192.168.90.0', '192.168.90.255', '192.168.090.10')),
-                                   ('ipv6', ('::', 'fe80::10', '::ffff:c0a8:5a0a', 'fd51:b089:f5e0:91::10', 'fd51:b089:f5e0:90::', 'fd51:b089:f5e0:90::10%eno1'))):
+        for version, addresses in (('ipv4', ('0.0.0.0', net_fixture.PUBLIC4, net_fixture.admin4(266), net_fixture.admin4(0), net_fixture.admin4(255), net_fixture.noncanonical4())),
+                                   ('ipv6', ('::', 'fe80::10', net_fixture.mapped4(), net_fixture.admin6(10, neighbor=True), net_fixture.admin6(0), ((net_fixture.admin6(10)) + '%eno1')))):
             for address in addresses:
                 with self.subTest(address=address):
                     value = manifest(); value['admin'][version]['address'] = address; self.refuse(value)
 
     def test_interface_syntax_and_admin_public_collision(self):
-        for interface in ('lo', 'eno1.90', 'eno2" accept', 'eno2\n', 'e' * 16, '*', '../eno2'):
+        for interface in ('lo', 'testlan0', 'testwan0" accept', 'testwan0\n', 'e' * 16, '*', '../testwan0'):
             with self.subTest(interface=interface):
                 value = manifest(); value['public']['interface'] = interface; self.refuse(value)
 
     def test_router_exclusion_requires_unique_exact_same_prefix_nonlistener_addresses(self):
-        for routers in ([], ['192.168.90.10'], ['192.168.91.1'], ['192.168.90.1'] * 2, ['192.168.90.255'], '192.168.90.1'):
+        for routers in ([], [net_fixture.admin4(10)], [net_fixture.admin4(257)], [net_fixture.admin4(1)] * 2, [net_fixture.admin4(255)], net_fixture.admin4(1)):
             with self.subTest(routers=routers):
                 value = manifest(); value['admin']['ipv4']['routers'] = routers; self.refuse(value)
 
     def test_public_listener_mode_and_address_admission(self):
-        for public in ({'topology': 'direct'}, {'ipv4': '192.168.90.20'}, {'ipv4': '127.0.0.1'},
-                       {'ipv4': None}, {'ipv6': 'fd51:b089:f5e0:90::20'}, {'topology': 'vpn'}):
+        for public in ({'topology': 'direct'}, {'ipv4': net_fixture.admin4(20)}, {'ipv4': '127.0.0.1'},
+                       {'ipv4': None}, {'ipv6': net_fixture.admin6(20)}, {'topology': 'vpn'}):
             with self.subTest(public=public):
                 value = manifest(); value['public'].update(public); self.refuse(value)
-        value = manifest(); value['public'].update(topology='direct', ipv4='8.8.8.8')
+        value = manifest(); value['public'].update(topology='direct', ipv4=net_fixture.PUBLIC4)
         self.assertEqual(self.candidate(value)['manifest']['topology'], 'direct')
 
     def test_public_ipv6_site_local_and_reserved_refuse_before_candidate_producers(self):
@@ -190,29 +193,29 @@ class DeploymentPolicyTests(unittest.TestCase):
                 producer.assert_not_called()
 
     def test_supported_unscoped_public_gua_preserves_dual_family_and_null_admin_profiles(self):
-        for admin6, public4 in ((True, '192.168.1.20'), (False, '192.168.1.20'), (False, None)):
+        for admin6, public4 in ((True, net_fixture.nat4()), (False, net_fixture.nat4()), (False, None)):
             with self.subTest(admin6=admin6, public4=public4):
                 value = manifest(admin6)
-                value['public'].update(ipv4=public4, ipv6='2001:4860::1')
+                value['public'].update(ipv4=public4, ipv6=net_fixture.PUBLIC6)
                 result = self.candidate(value)
                 public6 = [row for row in result['manifest']['public'] if row['version'] == 6]
-                self.assertEqual(public6, [{'version': 6, 'address': '2001:4860::1', 'interface': 'eno2'}])
-                self.assertIn('ip6 daddr 2001:4860::1 tcp dport', result['files'][1]['content'])
-                self.assertEqual(result['ssh_policy']['listen_addresses'], ['192.168.90.10']
-                                 + (['fd51:b089:f5e0:90::10'] if admin6 else []))
+                self.assertEqual(public6, [{'version': 6, 'address': net_fixture.PUBLIC6, 'interface': 'testwan0'}])
+                self.assertIn(('ip6 daddr ' + (net_fixture.PUBLIC6) + ' tcp dport'), result['files'][1]['content'])
+                self.assertEqual(result['ssh_policy']['listen_addresses'], [net_fixture.admin4(10)]
+                                 + ([net_fixture.admin6(10)] if admin6 else []))
                 self.assertTrue(all(item is False for item in result['authority'].values()))
 
     def test_public_ipv6_scope_suffix_refuses_before_candidate_producers(self):
         for suffix in ('%eth0', '%1', '%x accept'):
             with self.subTest(suffix=suffix):
-                value = manifest(); value['public']['ipv6'] = '2001:4860::1' + suffix
+                value = manifest(); value['public']['ipv6'] = net_fixture.PUBLIC6 + suffix
                 producer = Mock(wraps=self.n['bundle'])
                 with self.assertRaises(ValueError):
                     self.n['deployment_bundle'](encoded(value), producer)
                 producer.assert_not_called()
 
     def test_public_ipv6_json_escaped_newline_scope_refuses_before_serialization(self):
-        value = manifest(); value['public']['ipv6'] = '2001:4860::1%x\n  accept'
+        value = manifest(); value['public']['ipv6'] = ((net_fixture.PUBLIC6) + '%x\n  accept')
         data = encoded(value)
         self.assertIn(b'\\n  accept', data)
         self.assertEqual(data.count(b'\n'), 1)
@@ -227,7 +230,7 @@ class DeploymentPolicyTests(unittest.TestCase):
         for suffix in ('%eth0', '%1', '%x accept'):
             with self.subTest(suffix=suffix):
                 value = manifest()
-                value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2' + suffix)
+                value['admin']['ipv6']['routers'].append(net_fixture.admin6(2) + suffix)
                 producer = Mock(wraps=self.n['bundle'])
                 with self.assertRaises(ValueError):
                     self.n['deployment_bundle'](encoded(value), producer)
@@ -237,7 +240,7 @@ class DeploymentPolicyTests(unittest.TestCase):
         for control in ('\n  accept', '\r drop', '\t #', '\x00', '\x1f', '\x7f', '\u0085', '\u2028', '\u2029'):
             with self.subTest(control=repr(control)):
                 value = manifest()
-                value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2%x' + control)
+                value['admin']['ipv6']['routers'].append(((net_fixture.admin6(2)) + '%x') + control)
                 data = encoded(value)
                 self.assertEqual(data.count(b'\n'), 1)
                 self.assertTrue(all(byte < 128 for byte in data))
@@ -477,11 +480,11 @@ class DeploymentDeliveryTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual(output['source']['sha256'], capture['input_sha256'])
         self.assertTrue(all(value is False for value in output['authority'].values()))
-        self.assertEqual(output['ssh_policy']['listen_addresses'], ['192.168.90.10', 'fd51:b089:f5e0:90::10'])
+        self.assertEqual(output['ssh_policy']['listen_addresses'], [net_fixture.admin4(10), net_fixture.admin6(10)])
         CAPTURES.append(capture)
 
     def test_duplicate_and_wrong_network_private_cli_refuse_without_json(self):
-        wrong = manifest(); wrong['admin']['ipv4']['address'] = '192.168.91.10'
+        wrong = manifest(); wrong['admin']['ipv4']['address'] = net_fixture.admin4(266)
         for data in (encoded(manifest()).replace(b'"schema":1', b'"schema":1,"schema":1'), encoded(wrong)):
             with self.subTest(sha=hashlib.sha256(data).hexdigest()):
                 result, capture = self.run_private(data)
@@ -498,14 +501,14 @@ class DeploymentDeliveryTests(unittest.TestCase):
         CAPTURES.append(capture)
 
     def test_private_cli_supported_unscoped_public_gua_with_null_admin_ipv6(self):
-        value = manifest(False); value['public']['ipv6'] = '2001:4860::1'
+        value = manifest(False); value['public']['ipv6'] = net_fixture.PUBLIC6
         result, capture = self.run_private(encoded(value))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, b'')
         output = json.loads(result.stdout)
         self.assertEqual(output['source']['sha256'], capture['input_sha256'])
-        self.assertEqual(output['ssh_policy']['listen_addresses'], ['192.168.90.10'])
-        self.assertIn('ip6 daddr 2001:4860::1 tcp dport', output['files'][1]['content'])
+        self.assertEqual(output['ssh_policy']['listen_addresses'], [net_fixture.admin4(10)])
+        self.assertIn(('ip6 daddr ' + (net_fixture.PUBLIC6) + ' tcp dport'), output['files'][1]['content'])
         self.assertTrue(all(item is False for item in output['authority'].values()))
         CAPTURES.append(capture)
 
@@ -524,8 +527,8 @@ class DeploymentDeliveryTests(unittest.TestCase):
                               ('router', '%eth0'), ('router', '%x\n  accept')):
             with self.subTest(field=field, suffix=suffix):
                 value = manifest()
-                if field == 'public': value['public']['ipv6'] = '2001:4860::1' + suffix
-                else: value['admin']['ipv6']['routers'].append('fd51:b089:f5e0:90::2' + suffix)
+                if field == 'public': value['public']['ipv6'] = net_fixture.PUBLIC6 + suffix
+                else: value['admin']['ipv6']['routers'].append(net_fixture.admin6(2) + suffix)
                 data = encoded(value)
                 self.assertEqual(data.count(b'\n'), 1)
                 result, capture = self.run_private(data)

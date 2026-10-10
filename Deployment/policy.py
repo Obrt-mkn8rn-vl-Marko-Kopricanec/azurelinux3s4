@@ -8,8 +8,8 @@ import resource as dep_resource
 import sys as dep_sys
 
 
-DEP_ADMIN4 = '192.168.90.0/24'
-DEP_ADMIN6 = 'fd51:b089:f5e0:90::/64'  # Stable proposal, not an observed assignment.
+# Protocol address classes only, never deployment allocations or defaults.
+DEP_PRIVATE4 = ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')
 DEP_APPS = ('mk8.sava', 'mk8.drava', 'mk8.dns', 'mk8.email')
 DEP_PORT_NAMES = ('sava_gateway', 'sava_application', 'email_http', 'email_admin', 'dns_health')
 DEP_AUTHORITY = (
@@ -49,15 +49,23 @@ def deployment_address(value, version):
 
 
 def deployment_admin(value, version):
-    deployment_fields(value, ('interface', 'address', 'routers'))
+    deployment_fields(value, ('interface', 'prefix', 'address', 'routers'))
     interface = deployment_text(value['interface'], r'[A-Za-z][A-Za-z0-9_.-]{0,14}', 15)
     if interface == 'lo':
         raise ValueError('admin interface cannot be loopback')
-    prefix = DEP_ADMIN4 if version == 4 else DEP_ADMIN6
-    network = dep_ip.ip_network(prefix)
+    prefix = value['prefix']
+    if (type(prefix) is not str or not 3 <= len(prefix) <= 64
+            or not dep_policy_re.fullmatch(r'[0-9a-f:./]+', prefix)):
+        raise ValueError('explicit canonical admin prefix required')
+    network = dep_ip.ip_network(prefix, strict=True)
+    bounds = DEP_PRIVATE4 if version == 4 else ('fd00::/8',)
+    if (network.version != version or network.with_prefixlen != prefix
+            or not (24 <= network.prefixlen <= 30 if version == 4 else 64 <= network.prefixlen <= 126)
+            or not any(network.subnet_of(dep_ip.ip_network(bound)) for bound in bounds)):
+        raise ValueError('bounded private admin prefix required')
     address = deployment_address(value['address'], version)
     if address not in network or address in (network.network_address, network.broadcast_address):
-        raise ValueError('admin listener outside exact owner prefix')
+        raise ValueError('admin listener outside exact declared prefix')
     if type(value['routers']) is not list or not 1 <= len(value['routers']) <= 4:
         raise ValueError('explicit bounded admin router exclusions required')
     routers = [deployment_address(item, version) for item in value['routers']]
@@ -78,7 +86,7 @@ def deployment_domain(value):
 
 def deployment_manifest(value):
     deployment_fields(value, ('schema', 'hardware', 'architecture', 'os', 'admin', 'public',
-                              'domains', 'dns_zone', 'releases', 'private_ports', 'mail'))
+                              'domains', 'dns_zone', 'dns_nodes', 'releases', 'private_ports', 'mail'))
     if (type(value['schema']) is not int or value['schema'] != 1 or value['hardware'] != 'Dell R630'
             or value['architecture'] != 'x86_64' or value['os'] != 'Azure Linux 3'):
         raise ValueError('unsupported deployment target profile')
@@ -86,6 +94,7 @@ def deployment_manifest(value):
     admin = [deployment_admin(value['admin']['ipv4'], 4)]
     if value['admin']['ipv6'] is not None:
         admin.append(deployment_admin(value['admin']['ipv6'], 6))
+    admin_networks = [dep_ip.ip_network(row['prefix']) for row in admin]
     deployment_fields(value['public'], ('interface', 'topology', 'ipv4', 'ipv6'))
     public_interface = deployment_text(value['public']['interface'], r'[A-Za-z][A-Za-z0-9_.-]{0,14}', 15)
     if public_interface == 'lo' or public_interface in {item['interface'] for item in admin}:
@@ -101,8 +110,8 @@ def deployment_manifest(value):
                     or address.is_reserved or address.is_site_local)):
                 raise ValueError('unsupported public IPv6 GUA profile')
             if (not address.is_global and (version == 6 or value['public']['topology'] != 'nat'
-                    or not any(address in dep_ip.ip_network(prefix) for prefix in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')))
-                    or address in dep_ip.ip_network(DEP_ADMIN4 if version == 4 else DEP_ADMIN6)):
+                    or not any(address in dep_ip.ip_network(prefix) for prefix in DEP_PRIVATE4))
+                    or any(address.version == network.version and address in network for network in admin_networks)):
                 raise ValueError('unsupported public listener/topology')
             public.append({'version': version, 'address': str(address), 'interface': public_interface})
     if not public:
@@ -112,6 +121,11 @@ def deployment_manifest(value):
     domains = {app: deployment_domain(value['domains'][app]) for app in DEP_APPS}
     if len(set(domains.values())) != 4 or any(name == zone or not name.endswith('.' + zone) for name in domains.values()):
         raise ValueError('four distinct service names under the explicit zone required')
+    deployment_fields(value['dns_nodes'], ('controller', 'authoritative-replica'))
+    nodes = {role: deployment_text(value['dns_nodes'][role], r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', 63)
+             for role in ('controller', 'authoritative-replica')}
+    if len(set(nodes.values())) != 2:
+        raise ValueError('distinct explicit DNS node identities required')
     deployment_fields(value['releases'], DEP_APPS)
     releases = {}
     for app in DEP_APPS:
@@ -128,7 +142,7 @@ def deployment_manifest(value):
     if any(type(item) is not bool for item in value['mail'].values()):
         raise ValueError('explicit mail protocol switches required')
     return {'admin': admin, 'public': public, 'topology': value['public']['topology'],
-            'domains': domains, 'dns_zone': zone, 'releases': releases,
+            'domains': domains, 'dns_zone': zone, 'dns_nodes': nodes, 'releases': releases,
             'private_ports': dict(ports), 'mail': dict(value['mail'])}
 
 
@@ -219,13 +233,13 @@ def deployment_bundle(data, ssh_producer):
               'source': source, 'manifest': plan, 'ssh_policy': ssh, 'files': files,
               'authority': {key: False for key in DEP_AUTHORITY},
               'prerequisites': [
-                  'Owner-approved SAME actual topology/listener/interface/VLAN-parent/router/original-client/account/key authority and complete kernel/controller/hooks before activation. ULA proposal and CIDR membership prove no origin or assignment.',
+                  'Owner-approved SAME actual topology/listener/interface/VLAN-parent/router/original-client/account/key authority and complete kernel/controller/hooks before activation. Declared private prefixes and CIDR membership prove no origin or assignment.',
                   'Native nftables/SSHD/PostgreSQL parsing, complete actual invocation/configuration and dual-family positive/refusal tests. Stateful related traffic, output acceptance and ICMP/ND admission are declarations, not isolation or anti-spoof proof.',
                   'Authenticate complete releases/runtime/native dependencies and all application configuration bytes; provision distinct users, secrets and application-specific services, enrollment/TLS/DNS/mail and health checks. Contract path spelling is prospective and must be adapted to authenticated release manifests.',
                   'Conflict-safe checked root destinations, atomic service/firewall transition and console recovery, actual durable boot/repair/update/rollback and consistent off-host backup/restore. No file applier, reservation, certificate issuance or reboot is supplied.',
               ],
               'limits': ['Source ownership and sequential repeated bytes/FD/path metadata are local observations under trusted root/base/Python/kernel and finite honest IO/scheduling, not credential-intent authority, content authenticity, atomicity, ABA protection or concurrent-root safety.',
-                         'The IPv6 /64 is the stable proposed allocation only. Null admin IPv6 omits that SSH listener/prefix; public IPv6 and required ICMPv6 remain independent. No all-RFC1918/ULA/link-local admin allowance.',
+                         'Each admin prefix is mandatory original manifest data, with no address allocation/default in tracked code. IPv4 private /24../30 and locally assigned ULA /64../126 are conservative declaration bounds. Null admin IPv6 omits that SSH listener/prefix; public IPv6 and required ICMPv6 remain independent. No all-RFC1918/ULA/link-local admin allowance or assignment/origin approval.',
                          'Firewall candidate contains no flush and was not loaded. Existing tables/hooks/TC/BPF/routes/NAT/proxy/VPN sources can affect semantics. Name-only interface matching does not bind ifindex/MAC/VLAN identity. Router exclusions do not establish direct original origin.',
                          'PostgreSQL peer/SCRAM and17+ feature prerequisites do not create roles/passwords/databases, authenticate a native server or local peer mappings, reconcile actual app connections, or grant SQL privileges. All server/update/SSH/Web/lifecycle and physical durability gates remain open.']}
     if len(dep_policy_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) > 256 * 1024:

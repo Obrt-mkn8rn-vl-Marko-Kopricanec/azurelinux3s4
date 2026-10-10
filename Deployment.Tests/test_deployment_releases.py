@@ -1,5 +1,7 @@
 """Complete synthetic release trees with real private IO and explicit root delivery."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -63,7 +65,7 @@ class ReleaseFixture(unittest.TestCase):
                 token = config / 'ipc-token.txt'; token.write_bytes(b'A' * 48 + b'\n'); token.chmod(0o600)
             if app == 'mk8.dns':
                 zone = {'ZoneId': '11111111-1111-1111-1111-111111111111', 'Origin': 'example.test.'}
-                common = {'Epoch': '22222222-2222-2222-2222-222222222222', 'TargetNode': 'r630-authoritative-replica', 'Zones': [zone]}
+                common = {'Epoch': '22222222-2222-2222-2222-222222222222', 'TargetNode': self.value['dns_nodes']['authoritative-replica'], 'Zones': [zone]}
                 inputs['control-plane.json'] = encoded({**common, 'PublicationSocket':
                     '/run/mk8.dns/authoritative-replica/publication.sock',
                     'KeyFile': '/run/mk8.dns/controller/inputs/key.pem',
@@ -103,7 +105,7 @@ class ReleaseFixture(unittest.TestCase):
                         value['Imap'] = {'EnableImap': False, 'EnableImplicitTls': True}
                         value['Jmap'] = {'Port': self.value['private_ports']['email_http']}
                         value['Tls'] = {'CertificatePath': runtime + 'tls-certificate.pem', 'CertificateKeyPath': runtime + 'tls-key.pem'}
-                        value['Admin'] = {'AllowedNetworks': ['192.168.90.0/24'],
+                        value['Admin'] = {'AllowedNetworks': [self.value['admin']['ipv4']['prefix']],
                                           'DataProtectionKeyPath': '/var/lib/mk8.email/gateway/data-protection',
                                           'AuditLogPath': '/var/lib/mk8.email/gateway/audit/admin.jsonl',
                                           'HealthStatusPath': '/var/lib/mk8.email/gateway/health/status.json'}

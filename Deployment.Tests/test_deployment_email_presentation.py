@@ -1,5 +1,7 @@
 """Declared Email protocol/URL correspondence and explicit private delivery controls."""
 
+import deployment_fixture as net_fixture
+
 import collections
 import copy
 import hashlib
@@ -230,7 +232,7 @@ class EmailPresentationTests(ReleaseFixture):
                 self.refused(changed, message='gateway Email TLS')
 
     def test_ipv4_ipv6_and_dual_public_variants_do_not_claim_actual_ipv6_mail_or_proxy_enforcement(self):
-        for ipv4, ipv6 in (('192.168.1.20', None), (None, '2001:4860::20'), ('192.168.1.20', '2001:4860::20')):
+        for ipv4, ipv6 in ((net_fixture.nat4(), None), (None, net_fixture.PUBLIC6), (net_fixture.nat4(), net_fixture.PUBLIC6)):
             self.value['public'].update(ipv4=ipv4, ipv6=ipv6); candidate = self.candidate(); observed = self.observe()
             self.assertFalse(observed['authority']['actual_ipv6_mail_listeners_usable'])
             self.assertFalse(observed['authority']['public_https_proxy_routes_admitted'])
