@@ -78,6 +78,7 @@ PAYLOADS = {
     "Deployment/releases.py": "PY",
     "Deployment/dns_configuration.py": "PY",
     "Deployment/credentials.py": "PY",
+    "Deployment/email_credentials.py": "PY",
     "Deployment/services.py": "PY",
     "SSH/keys.py": "PY",
     "SSH/accounts.py": "PY",

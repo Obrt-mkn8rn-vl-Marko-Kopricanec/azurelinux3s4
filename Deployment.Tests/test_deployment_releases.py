@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -76,6 +76,27 @@ class ReleaseFixture(unittest.TestCase):
                           'application.env': b'Sava__DataPath=/var/lib/mk8.sava/application\nSava__DataEncryptionKeys__fixture=private-fixture-only\n',
                           'gateway.env': b'Gateway__StagingPath=/var/cache/mk8.sava-gateway/staging\n',
                           'rpc.key': b'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n'}
+            if app == 'mk8.email':
+                for role in ('worker', 'gateway'):
+                    runtime = '/run/credentials/mk8-email-' + role + '.service/'
+                    value = {'Database': {'PasswordFile': runtime + 'database-password.txt'},
+                             'Messaging': {'Enabled': True, 'EncryptionKeyId': 'primary',
+                                           'EncryptionKeyFile': runtime + 'messaging-key.txt',
+                                           'DecryptionKeys': [{'Id': 'old', 'KeyFile': runtime + 'messaging-decrypt-old.txt'}]},
+                             'ObjectStorage': {'ConnectionStringFile': runtime + 'blob-connection.txt'}}
+                    names = ['database-password.txt', 'messaging-key.txt', 'messaging-decrypt-old.txt', 'blob-connection.txt']
+                    if role == 'worker':
+                        value.update(OAuth={'EnableOAuth': True, 'EnableOpenIdConnect': True, 'SigningKeyFile': runtime + 'oauth-signing.txt'},
+                                     Mfa={'EnableTotp': True, 'EncryptionKeyFile': runtime + 'mfa-key.txt'},
+                                     Dkim={'EnableSigning': True, 'PrivateKeyPath': runtime + 'dkim-key.pem'})
+                        names.extend(('oauth-signing.txt', 'mfa-key.txt', 'dkim-key.pem'))
+                    else:
+                        value['Tls'] = {'CertificatePath': runtime + 'tls-certificate.pem', 'CertificateKeyPath': runtime + 'tls-key.pem'}
+                        names.extend(('tls-certificate.pem', 'tls-key.pem'))
+                    inputs[role + '.json'] = encoded(value)
+                    secrets = config / role; secrets.mkdir(mode=0o700)
+                    for name in names:
+                        p = secrets / name; p.write_bytes(('finite opaque Email input ' + role + '/' + name + '\n').encode()); p.chmod(0o600)
             for leaf, data in inputs.items():
                 p = config / leaf; p.write_bytes(data); p.chmod(0o600)
             document = {'schema': 1, 'app': app, 'commit': '1' * 40, 'tree': '2' * 40,

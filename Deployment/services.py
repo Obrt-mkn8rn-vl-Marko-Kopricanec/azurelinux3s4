@@ -37,7 +37,7 @@ def application_environment(data, prefixes):
     return result
 
 
-def application_configuration(app, bindings, plan, credentials=None, dns_configuration=None):
+def application_configuration(app, bindings, plan, credentials=None, dns_configuration=None, email_credentials=None):
     result, captured = [], {}
     for leaf in REL_CONFIGS[app]:
         path = '/etc/' + app + '/' + leaf
@@ -88,6 +88,10 @@ def application_configuration(app, bindings, plan, credentials=None, dns_configu
         observed = dns_credential_observe(captured)
         if credentials is not None:
             credentials.extend(observed)
+    if app == 'mk8.email':
+        observed = email_credential_observe(captured)
+        if email_credentials is not None:
+            email_credentials.extend(observed)
     return result
 
 
@@ -143,9 +147,11 @@ def application_units(app, release, plan, credentials=()):
                     after=('mk8-drava-application.service',) if role == 'gateway' else ())
                 for role in ('application', 'gateway')]
     if app == 'mk8.email':
+        if [row['role'] for row in credentials] != ['worker', 'gateway']:
+            raise ValueError('fresh Email credential observations required')
         return [application_unit('mk8-email-' + role, app, role, release,
                     arguments=('--serve',) if role == 'worker' else (), privileged=role == 'gateway',
-                    extra=('LoadCredential=config.json:' + config + role + '.json',
+                    extra=email_credential_unit(next(row for row in credentials if row['role'] == role)) + (
                            'Environment=MK8EMAIL_CONFIG_FILE=%d/config.json',
                            'Environment=ASPNETCORE_URLS=http://127.0.0.1:' + str(plan['private_ports']['email_http']),
                            'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false'),
@@ -179,17 +185,18 @@ def application_bundle(data, ssh_producer):
     candidate = deployment_bundle(data, ssh_producer)
     value, source = deployment_decode(data)
     plan = deployment_manifest(value)
-    releases, configuration, units, credentials, dns_configuration = [], [], [], [], []
+    releases, configuration, units, credentials, dns_configuration, email_credentials = [], [], [], [], [], []
     for app in DEP_APPS:
         observed = release_observe(app, plan['releases'][app])
-        configuration.extend(application_configuration(app, observed['configuration'], plan, credentials, dns_configuration))
-        units.extend(application_units(app, observed, plan, credentials if app == 'mk8.dns' else ()))
+        configuration.extend(application_configuration(app, observed['configuration'], plan, credentials, dns_configuration, email_credentials))
+        units.extend(application_units(app, observed, plan, credentials if app == 'mk8.dns' else email_credentials if app == 'mk8.email' else ()))
         releases.append(observed)
     result = {'schema': 1, 'source': source, 'deployment_candidate_sha256': dep_hash.sha256(
                   dep_json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest(),
               'releases': releases, 'configuration': configuration, 'files': units,
               'dns_credentials': credentials,
               'dns_control_configuration': dns_configuration,
+              'email_credentials': email_credentials,
               'dns_credential_helper': deployment_file(DNS_CREDENTIAL_HELPER_PATH[1:], '0755', DNS_CREDENTIAL_PROGRAM),
               'authority': {name: False for name in APP_AUTHORITY}}
     if len(dep_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) + 1 > APP_OUTPUT_LIMIT:
