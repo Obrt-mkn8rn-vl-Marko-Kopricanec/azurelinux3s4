@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.64.0
+S4_VERSION=0.65.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -7593,11 +7593,17 @@ s4_application_service_policy() {
     s4_ssh_candidate applications "$1"
 }
 
+s4_application_publish() {
+    [[ $# == 1 ]] || return 64
+    s4_ssh_candidate publish-applications "$1"
+}
+
 s4_ssh_candidate() {
-    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications ) ) ]] || return 64
+    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications || $1 == publish-applications ) ) ]] || return 64
     local allowance=30
     [[ $1 != publish ]] || allowance=90
     [[ $1 != applications ]] || allowance=300
+    [[ $1 != publish-applications ]] || allowance=390
     # Policy actions only produce bytes. Explicit publish writes inactive private
     # bundles only; LAN/caller/key/native/activation authority remains unmet.
     timeout --kill-after=5s "${allowance}s" python3 -I - "$@" <<'PY'
@@ -8417,19 +8423,19 @@ def publication_entries(fd):
     return result
 
 
-def publication_tree(parent, name, contents, partial=False):
+def publication_tree(parent, name, contents, partial=False, directories_profile=PUB_DIRECTORIES):
     device = dep_os.fstat(parent).st_dev
     with dep_context.ExitStack() as stack:
         fd, initial = publication_open_directory(stack, parent, name, device)
         directories = {'': fd}
         observed = [(parent, name, fd, initial)]
         entries = publication_entries(fd)
-        allowed = {'manifest.json', 'candidate.json', 'publication.json', *PUB_DIRECTORIES}
+        allowed = {'manifest.json', 'candidate.json', 'publication.json', *directories_profile}
         if not entries <= allowed or (not partial and entries != allowed):
             raise ValueError('unexpected publication root entries')
         # This complete exact marker is required before any partial-file recovery.
         publication_file(fd, 'publication.json', contents['publication.json'])
-        for directory in PUB_DIRECTORIES:
+        for directory in directories_profile:
             if directory in entries:
                 child, info = publication_open_directory(stack, fd, directory, device)
                 directories[directory] = child
@@ -8439,7 +8445,7 @@ def publication_tree(parent, name, contents, partial=False):
             actual = publication_entries(folder)
             expected = {path.rsplit('/', 1)[-1] for path in contents if path.rpartition('/')[0] == directory}
             if directory == '':
-                actual -= set(PUB_DIRECTORIES)
+                actual -= set(directories_profile)
             if not actual <= expected or (not partial and actual != expected):
                 raise ValueError('unexpected publication directory entries')
             for leaf in sorted(actual):
@@ -8472,10 +8478,10 @@ def publication_rename(parent, source, target):
         raise OSError(pub_ctypes.get_errno(), 'no-replace publication refused')
 
 
-def publication_sync_tree(parent, name):
+def publication_sync_tree(parent, name, directories_profile=PUB_DIRECTORIES):
     with dep_context.ExitStack() as stack:
         fd, _ = publication_open_directory(stack, parent, name, dep_os.fstat(parent).st_dev)
-        for directory in PUB_DIRECTORIES:
+        for directory in directories_profile:
             child, _ = publication_open_directory(stack, fd, directory, dep_os.fstat(parent).st_dev)
             for leaf in publication_entries(child):
                 item = dep_os.open(leaf, DEP_OPEN, dir_fd=child)
@@ -8494,13 +8500,13 @@ def publication_sync_tree(parent, name):
     dep_os.fsync(parent)
 
 
-def publication_store(stack):
+def publication_store(stack, store_path=PUB_STORE):
     parent = dep_os.open('/', DEP_OPEN | dep_os.O_DIRECTORY)
     stack.callback(dep_os.close, parent)
     initial_root = dep_os.fstat(parent)
     deployment_directory(initial_root)
     ancestors, links = [(parent, initial_root)], []
-    parts = deployment_path(PUB_STORE)
+    parts = deployment_path(store_path)
     for index, name in enumerate(parts):
         before = dep_os.stat(name, dir_fd=parent, follow_symlinks=False)
         deployment_directory(before)
@@ -8517,25 +8523,26 @@ def publication_store(stack):
     return parent, ancestors, links
 
 
-def publication_publish(data, ssh_producer):
+def publication_publish(data, ssh_producer, *, planner=None, store_path=PUB_STORE,
+                        directories_profile=PUB_DIRECTORIES, lock_bytes=PUB_LOCK):
     if dep_os.geteuid() != DEP_TRUSTED_UID:
         raise ValueError('inactive publication requires root')
-    digest, contents = publication_plan(data, ssh_producer)
+    digest, contents = (publication_plan if planner is None else planner)(data, ssh_producer)
     pending = '.pending-' + digest
     disposition = 'published'
     with dep_context.ExitStack() as stack:
-        store, ancestors, links = publication_store(stack)
+        store, ancestors, links = publication_store(stack, store_path)
         try:
             dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)
         except FileNotFoundError:
-            publication_write(store, '.publisher.lock', PUB_LOCK)
-        publication_file(store, '.publisher.lock', PUB_LOCK)
+            publication_write(store, '.publisher.lock', lock_bytes)
+        publication_file(store, '.publisher.lock', lock_bytes)
         lock = dep_os.open('.publisher.lock', DEP_OPEN, dir_fd=store)
         stack.callback(dep_os.close, lock)
         if deployment_identity(dep_os.fstat(lock)) != deployment_identity(dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)):
             raise ValueError('publisher lock changed')
         pub_fcntl.flock(lock, pub_fcntl.LOCK_EX | pub_fcntl.LOCK_NB)
-        publication_file(store, '.publisher.lock', PUB_LOCK)
+        publication_file(store, '.publisher.lock', lock_bytes)
         initial_lock = dep_os.fstat(lock)
         try:
             dep_os.stat(digest, dir_fd=store, follow_symlinks=False)
@@ -8550,11 +8557,11 @@ def publication_publish(data, ssh_producer):
                     publication_write(stage, 'publication.json', contents['publication.json'])
             else:
                 disposition = 'recovered'
-            previous = publication_tree(store, pending, contents, partial=True)
+            previous = publication_tree(store, pending, contents, partial=True, directories_profile=directories_profile)
             with dep_context.ExitStack() as writing:
                 stage, _ = publication_open_directory(writing, store, pending, dep_os.fstat(store).st_dev)
                 directories = {'': stage}
-                for name in PUB_DIRECTORIES:
+                for name in directories_profile:
                     if name not in publication_entries(stage):
                         dep_os.mkdir(name, 0o700, dir_fd=stage)
                         dep_os.fsync(stage)
@@ -8571,9 +8578,9 @@ def publication_publish(data, ssh_producer):
                         dep_os.unlink(leaf, dir_fd=folder)
                         dep_os.fsync(folder)
                     publication_write(folder, leaf, raw)
-            publication_tree(store, pending, contents)
-            publication_sync_tree(store, pending)
-            publication_tree(store, pending, contents)
+            publication_tree(store, pending, contents, directories_profile=directories_profile)
+            publication_sync_tree(store, pending, directories_profile)
+            publication_tree(store, pending, contents, directories_profile=directories_profile)
             publication_rename(store, pending, digest)
             dep_os.fsync(store)
         else:
@@ -8585,12 +8592,12 @@ def publication_publish(data, ssh_producer):
                 pass
             else:
                 raise ValueError('final and pending publication conflict')
-        publication_tree(store, digest, contents)
+        publication_tree(store, digest, contents, directories_profile=directories_profile)
         for current in (dep_os.fstat(lock), dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(initial_lock):
                 raise ValueError('publisher lock identity changed')
-        publication_sync_tree(store, digest)
-        publication_tree(store, digest, contents)
+        publication_sync_tree(store, digest, directories_profile)
+        publication_tree(store, digest, contents, directories_profile=directories_profile)
         for fd, before in ancestors:
             deployment_directory(dep_os.fstat(fd))
             if deployment_identity(dep_os.fstat(fd)) != deployment_identity(before):
@@ -8603,7 +8610,7 @@ def publication_publish(data, ssh_producer):
         stack.callback(dep_os.close, fresh)
         if deployment_identity(dep_os.fstat(fresh)) != deployment_identity(ancestors[0][1]):
             raise ValueError('publication root changed')
-    return {'scope': 'INACTIVE EXACT CANDIDATE STORAGE ONLY', 'bundle': PUB_STORE + '/' + digest,
+    return {'scope': 'INACTIVE EXACT CANDIDATE STORAGE ONLY', 'bundle': store_path + '/' + digest,
             'publication_sha256': digest, 'disposition': disposition,
             'source': {'bytes': len(data), 'sha256': dep_hash.sha256(data).hexdigest()},
             'stored_files': len(contents), 'stored_bytes': sum(map(len, contents.values())),
@@ -9825,7 +9832,89 @@ def application_main(ssh_producer):
         return 75
     print(output, end='')
     return 0
+"""Retain fresh complete application candidates in a separate inactive namespace."""
+
+
+APP_PUB_STORE = '/var/lib/azurelinux3s4/application-candidates'
+APP_PUB_LOCK = b'azurelinux3s4-inactive-application-publication-lock-v1\n'
+APP_PUB_DIRECTORIES = ('helpers', 'systemd')
+APP_PUB_LIMIT = 16 * 1024 * 1024
+APP_PUB_FILE_LIMIT = 64 * 1024
+APP_PUB_BASE_UNITS = ('mk8-sava-application', 'mk8-sava-gateway',
+                      'mk8-drava-application', 'mk8-drava-gateway',
+                      'mk8-dns-controller', 'mk8-dns-authoritative-replica')
+
+
+def application_publication_plan(data, ssh_producer):
+    # Always reconstruct from protected original files. No candidate/receipt input.
+    candidate = application_bundle(data, ssh_producer)
+    value, source = deployment_decode(data)
+    plan = deployment_manifest(value)
+    names = (*APP_PUB_BASE_UNITS,
+             *('mk8-dns-gateway' + str(row['version']) for row in plan['public']),
+             'mk8-email-worker', 'mk8-email-gateway')
+    expected = tuple('systemd/' + name + '.service' for name in names)
+    if (candidate['source'] != source or type(candidate['files']) is not list
+            or tuple(row['file'] for row in candidate['files']) != expected
+            or candidate['authority'] != {name: False for name in APP_AUTHORITY}):
+        raise ValueError('fresh complete inactive application candidate required')
+    contents = {'manifest.json': data, 'candidate.json': publication_encoded(candidate)}
+    rows = []
+    helper = candidate['dns_credential_helper']
+    payloads = [(row, row['file'], '0644') for row in candidate['files']]
+    payloads.append((helper, 'helpers/dns-credentials.py', '0755'))
+    for entry, stored, mode in payloads:
+        deployment_fields(entry, ('file', 'mode', 'bytes', 'sha256', 'content'))
+        if (type(entry['content']) is not str or type(entry['bytes']) is not int
+                or entry['mode'] != mode or (stored.startswith('helpers/')
+                and entry['file'] != DNS_CREDENTIAL_HELPER_PATH[1:])):
+            raise ValueError('fixed application payload identity/mode required')
+        raw = entry['content'].encode('ascii')
+        if (not 0 < len(raw) <= APP_PUB_FILE_LIMIT or not raw.endswith(b'\n')
+                or entry['bytes'] != len(raw) or entry['sha256'] != dep_hash.sha256(raw).hexdigest()
+                or any(byte < 32 and byte not in (9, 10) or byte > 126 for byte in raw)):
+            raise ValueError('application payload byte commitment mismatch')
+        contents[stored] = raw
+        rows.append({'stored': stored, **{name: entry[name] for name in ('file', 'mode', 'bytes', 'sha256')}})
+    intent = publication_encoded({'format': 'azurelinux3s4-inactive-application-candidate-v1',
+                                  'source': source, 'candidate': {'bytes': len(contents['candidate.json']),
+                                  'sha256': dep_hash.sha256(contents['candidate.json']).hexdigest()},
+                                  'files': rows, 'stored_leaf_mode': '0400', 'directory_mode': '0700',
+                                  'activation_authorized': False})
+    contents['publication.json'] = intent
+    if len(contents) not in (13, 14) or sum(map(len, contents.values())) > APP_PUB_LIMIT:
+        raise ValueError('complete application publication bound')
+    return dep_hash.sha256(intent).hexdigest(), contents
+
+
+def application_publication_publish(data, ssh_producer):
+    return publication_publish(data, ssh_producer, planner=application_publication_plan,
+                               store_path=APP_PUB_STORE, directories_profile=APP_PUB_DIRECTORIES,
+                               lock_bytes=APP_PUB_LOCK)
+
+
+def application_publication_main(ssh_producer):
+    if len(dep_sys.argv) != 2:
+        return 64
+    try:
+        dep_resource.setrlimit(dep_resource.RLIMIT_CPU, (150, 155))
+        dep_resource.setrlimit(dep_resource.RLIMIT_AS, (384 * 1024 * 1024,) * 2)
+        dep_resource.setrlimit(dep_resource.RLIMIT_CORE, (0, 0))
+        path = dep_sys.argv[1]
+        deployment_path(path)
+        for store in (APP_PUB_STORE, PUB_STORE):
+            if path == store or path.startswith(store + '/'):
+                raise ValueError('original manifest must be outside inactive stores')
+        output = publication_encoded(application_publication_publish(deployment_read(path), ssh_producer))
+    except (OSError, ValueError, TypeError, AttributeError, MemoryError, RecursionError, OverflowError):
+        print('Inactive application candidate publication refused', file=dep_sys.stderr)
+        return 75
+    print(output.decode('ascii'), end='')
+    return 0
 action = sys.argv[1]
+if action == 'publish-applications':
+    sys.argv = [sys.argv[0], sys.argv[2]]
+    raise SystemExit(application_publication_main(bundle))
 if action == 'applications':
     sys.argv = [sys.argv[0], sys.argv[2]]
     raise SystemExit(application_main(bundle))
@@ -11202,12 +11291,16 @@ s4_main() {
     umask 077
     local action=${1:-install}
     case $action in
+        --publish-application-candidate)
+            [[ $# == 2 ]] || return 64
+            s4_application_publish "$2"
+            return $? ;;
         --application-service-policy)
             [[ $# == 2 ]] || return 64
             s4_application_service_policy "$2"
             return $? ;;
         --help)
-            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --ssh-service-policy\n       sudo ./azurelinux3s4.sh --application-service-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --deployment-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --publish-deployment-candidate ROOT_MANIFEST_JSON\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\n       ./azurelinux3s4.sh --inspect-ssh-home\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
+            printf 'Usage: sudo ./azurelinux3s4.sh\n       sudo ./azurelinux3s4.sh --status\n       ./azurelinux3s4.sh --web-isolation-policy\n       ./azurelinux3s4.sh --ssh-policy\n       ./azurelinux3s4.sh --ssh-service-policy\n       sudo ./azurelinux3s4.sh --publish-application-candidate ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --application-service-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --deployment-policy ROOT_MANIFEST_JSON\n       sudo ./azurelinux3s4.sh --publish-deployment-candidate ROOT_MANIFEST_JSON\n       ./azurelinux3s4.sh --inspect-ssh-keys PUBLIC_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-key-policy PUBLIC_KEY_FILE REVOKED_KEY_FILE\n       ./azurelinux3s4.sh --inspect-ssh-account\n       ./azurelinux3s4.sh --inspect-ssh-home\nDevelopment checkpoint: signed-update preparation, read-only RPM tests and candidate web and SSH files. Server hardening and update installation are incomplete.\n'
             return 0 ;;
         --web-isolation-policy)
             [[ $# == 1 ]] || return 64

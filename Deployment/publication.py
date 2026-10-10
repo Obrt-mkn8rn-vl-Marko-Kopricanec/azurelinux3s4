@@ -140,19 +140,19 @@ def publication_entries(fd):
     return result
 
 
-def publication_tree(parent, name, contents, partial=False):
+def publication_tree(parent, name, contents, partial=False, directories_profile=PUB_DIRECTORIES):
     device = dep_os.fstat(parent).st_dev
     with dep_context.ExitStack() as stack:
         fd, initial = publication_open_directory(stack, parent, name, device)
         directories = {'': fd}
         observed = [(parent, name, fd, initial)]
         entries = publication_entries(fd)
-        allowed = {'manifest.json', 'candidate.json', 'publication.json', *PUB_DIRECTORIES}
+        allowed = {'manifest.json', 'candidate.json', 'publication.json', *directories_profile}
         if not entries <= allowed or (not partial and entries != allowed):
             raise ValueError('unexpected publication root entries')
         # This complete exact marker is required before any partial-file recovery.
         publication_file(fd, 'publication.json', contents['publication.json'])
-        for directory in PUB_DIRECTORIES:
+        for directory in directories_profile:
             if directory in entries:
                 child, info = publication_open_directory(stack, fd, directory, device)
                 directories[directory] = child
@@ -162,7 +162,7 @@ def publication_tree(parent, name, contents, partial=False):
             actual = publication_entries(folder)
             expected = {path.rsplit('/', 1)[-1] for path in contents if path.rpartition('/')[0] == directory}
             if directory == '':
-                actual -= set(PUB_DIRECTORIES)
+                actual -= set(directories_profile)
             if not actual <= expected or (not partial and actual != expected):
                 raise ValueError('unexpected publication directory entries')
             for leaf in sorted(actual):
@@ -195,10 +195,10 @@ def publication_rename(parent, source, target):
         raise OSError(pub_ctypes.get_errno(), 'no-replace publication refused')
 
 
-def publication_sync_tree(parent, name):
+def publication_sync_tree(parent, name, directories_profile=PUB_DIRECTORIES):
     with dep_context.ExitStack() as stack:
         fd, _ = publication_open_directory(stack, parent, name, dep_os.fstat(parent).st_dev)
-        for directory in PUB_DIRECTORIES:
+        for directory in directories_profile:
             child, _ = publication_open_directory(stack, fd, directory, dep_os.fstat(parent).st_dev)
             for leaf in publication_entries(child):
                 item = dep_os.open(leaf, DEP_OPEN, dir_fd=child)
@@ -217,13 +217,13 @@ def publication_sync_tree(parent, name):
     dep_os.fsync(parent)
 
 
-def publication_store(stack):
+def publication_store(stack, store_path=PUB_STORE):
     parent = dep_os.open('/', DEP_OPEN | dep_os.O_DIRECTORY)
     stack.callback(dep_os.close, parent)
     initial_root = dep_os.fstat(parent)
     deployment_directory(initial_root)
     ancestors, links = [(parent, initial_root)], []
-    parts = deployment_path(PUB_STORE)
+    parts = deployment_path(store_path)
     for index, name in enumerate(parts):
         before = dep_os.stat(name, dir_fd=parent, follow_symlinks=False)
         deployment_directory(before)
@@ -240,25 +240,26 @@ def publication_store(stack):
     return parent, ancestors, links
 
 
-def publication_publish(data, ssh_producer):
+def publication_publish(data, ssh_producer, *, planner=None, store_path=PUB_STORE,
+                        directories_profile=PUB_DIRECTORIES, lock_bytes=PUB_LOCK):
     if dep_os.geteuid() != DEP_TRUSTED_UID:
         raise ValueError('inactive publication requires root')
-    digest, contents = publication_plan(data, ssh_producer)
+    digest, contents = (publication_plan if planner is None else planner)(data, ssh_producer)
     pending = '.pending-' + digest
     disposition = 'published'
     with dep_context.ExitStack() as stack:
-        store, ancestors, links = publication_store(stack)
+        store, ancestors, links = publication_store(stack, store_path)
         try:
             dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)
         except FileNotFoundError:
-            publication_write(store, '.publisher.lock', PUB_LOCK)
-        publication_file(store, '.publisher.lock', PUB_LOCK)
+            publication_write(store, '.publisher.lock', lock_bytes)
+        publication_file(store, '.publisher.lock', lock_bytes)
         lock = dep_os.open('.publisher.lock', DEP_OPEN, dir_fd=store)
         stack.callback(dep_os.close, lock)
         if deployment_identity(dep_os.fstat(lock)) != deployment_identity(dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)):
             raise ValueError('publisher lock changed')
         pub_fcntl.flock(lock, pub_fcntl.LOCK_EX | pub_fcntl.LOCK_NB)
-        publication_file(store, '.publisher.lock', PUB_LOCK)
+        publication_file(store, '.publisher.lock', lock_bytes)
         initial_lock = dep_os.fstat(lock)
         try:
             dep_os.stat(digest, dir_fd=store, follow_symlinks=False)
@@ -273,11 +274,11 @@ def publication_publish(data, ssh_producer):
                     publication_write(stage, 'publication.json', contents['publication.json'])
             else:
                 disposition = 'recovered'
-            previous = publication_tree(store, pending, contents, partial=True)
+            previous = publication_tree(store, pending, contents, partial=True, directories_profile=directories_profile)
             with dep_context.ExitStack() as writing:
                 stage, _ = publication_open_directory(writing, store, pending, dep_os.fstat(store).st_dev)
                 directories = {'': stage}
-                for name in PUB_DIRECTORIES:
+                for name in directories_profile:
                     if name not in publication_entries(stage):
                         dep_os.mkdir(name, 0o700, dir_fd=stage)
                         dep_os.fsync(stage)
@@ -294,9 +295,9 @@ def publication_publish(data, ssh_producer):
                         dep_os.unlink(leaf, dir_fd=folder)
                         dep_os.fsync(folder)
                     publication_write(folder, leaf, raw)
-            publication_tree(store, pending, contents)
-            publication_sync_tree(store, pending)
-            publication_tree(store, pending, contents)
+            publication_tree(store, pending, contents, directories_profile=directories_profile)
+            publication_sync_tree(store, pending, directories_profile)
+            publication_tree(store, pending, contents, directories_profile=directories_profile)
             publication_rename(store, pending, digest)
             dep_os.fsync(store)
         else:
@@ -308,12 +309,12 @@ def publication_publish(data, ssh_producer):
                 pass
             else:
                 raise ValueError('final and pending publication conflict')
-        publication_tree(store, digest, contents)
+        publication_tree(store, digest, contents, directories_profile=directories_profile)
         for current in (dep_os.fstat(lock), dep_os.stat('.publisher.lock', dir_fd=store, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(initial_lock):
                 raise ValueError('publisher lock identity changed')
-        publication_sync_tree(store, digest)
-        publication_tree(store, digest, contents)
+        publication_sync_tree(store, digest, directories_profile)
+        publication_tree(store, digest, contents, directories_profile=directories_profile)
         for fd, before in ancestors:
             deployment_directory(dep_os.fstat(fd))
             if deployment_identity(dep_os.fstat(fd)) != deployment_identity(before):
@@ -326,7 +327,7 @@ def publication_publish(data, ssh_producer):
         stack.callback(dep_os.close, fresh)
         if deployment_identity(dep_os.fstat(fresh)) != deployment_identity(ancestors[0][1]):
             raise ValueError('publication root changed')
-    return {'scope': 'INACTIVE EXACT CANDIDATE STORAGE ONLY', 'bundle': PUB_STORE + '/' + digest,
+    return {'scope': 'INACTIVE EXACT CANDIDATE STORAGE ONLY', 'bundle': store_path + '/' + digest,
             'publication_sha256': digest, 'disposition': disposition,
             'source': {'bytes': len(data), 'sha256': dep_hash.sha256(data).hexdigest()},
             'stored_files': len(contents), 'stored_bytes': sum(map(len, contents.values())),

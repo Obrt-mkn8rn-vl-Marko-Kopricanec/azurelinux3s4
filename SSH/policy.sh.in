@@ -21,11 +21,17 @@ s4_application_service_policy() {
     s4_ssh_candidate applications "$1"
 }
 
+s4_application_publish() {
+    [[ $# == 1 ]] || return 64
+    s4_ssh_candidate publish-applications "$1"
+}
+
 s4_ssh_candidate() {
-    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications ) ) ]] || return 64
+    [[ ( $# == 1 && ( $1 == configuration || $1 == service ) ) || ( $# == 2 && ( $1 == deployment || $1 == publish || $1 == applications || $1 == publish-applications ) ) ]] || return 64
     local allowance=30
     [[ $1 != publish ]] || allowance=90
     [[ $1 != applications ]] || allowance=300
+    [[ $1 != publish-applications ]] || allowance=390
     # Policy actions only produce bytes. Explicit publish writes inactive private
     # bundles only; LAN/caller/key/native/activation authority remains unmet.
     timeout --kill-after=5s "${allowance}s" python3 -I - "$@" <<'PY'
@@ -41,7 +47,11 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/email_credentials.py
 # @s4-include Deployment/email_role_policy.py
 # @s4-include Deployment/services.py
+# @s4-include Deployment/application_publication.py
 action = sys.argv[1]
+if action == 'publish-applications':
+    sys.argv = [sys.argv[0], sys.argv[2]]
+    raise SystemExit(application_publication_main(bundle))
 if action == 'applications':
     sys.argv = [sys.argv[0], sys.argv[2]]
     raise SystemExit(application_main(bundle))
