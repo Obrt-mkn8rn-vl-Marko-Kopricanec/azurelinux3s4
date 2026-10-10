@@ -24,6 +24,7 @@ def application_publication_plan(data, ssh_producer):
             or tuple(row['file'] for row in candidate['files']) != expected
             or candidate['authority'] != {name: False for name in APP_AUTHORITY}):
         raise ValueError('fresh complete inactive application candidate required')
+    database = application_database_observe(candidate)
     contents = {'manifest.json': data, 'candidate.json': publication_encoded(candidate)}
     rows = []
     helper = candidate['dns_credential_helper']
@@ -46,6 +47,7 @@ def application_publication_plan(data, ssh_producer):
                                   'source': source, 'candidate': {'bytes': len(contents['candidate.json']),
                                   'sha256': dep_hash.sha256(contents['candidate.json']).hexdigest()},
                                   'files': rows, 'stored_leaf_mode': '0400', 'directory_mode': '0700',
+                                  'database_profile_correspondence': database,
                                   'activation_authorized': False})
     contents['publication.json'] = intent
     if len(contents) not in (13, 14) or sum(map(len, contents.values())) > APP_PUB_LIMIT:

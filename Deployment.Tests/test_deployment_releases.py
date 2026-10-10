@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/email_presentation.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/email_presentation.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py', 'Deployment/database_correspondence.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -76,7 +76,7 @@ class ReleaseFixture(unittest.TestCase):
                     secrets = config / role; secrets.mkdir(mode=0o700)
                     key = secrets / 'key.pem'; key.write_bytes(b'finite key bytes, not authenticated PEM\n'); key.chmod(0o600)
                 database = config / 'controller/database.txt'
-                database.write_bytes(b'finite database input, not a usable connection\n'); database.chmod(0o600)
+                database.write_bytes(b'Host=/run/postgresql;Port=5432;Database=mk8dns;Username=mk8dns;Password=finite-model-only-password'); database.chmod(0o600)
             if app == 'mk8.sava':
                 inputs = {'policy.env': b'Sava__DefaultAccount=fixture\nSava__Accounts__fixture=not-a-runtime-proof\nApplicationTransport__Endpoint=http://127.0.0.1:18581/internal/application\n',
                           'application.env': b'Sava__DataPath=/var/lib/mk8.sava/application\nSava__DataEncryptionKeys__fixture=private-fixture-only\n',
@@ -85,7 +85,8 @@ class ReleaseFixture(unittest.TestCase):
             if app == 'mk8.email':
                 for role in ('worker', 'gateway'):
                     runtime = '/run/credentials/mk8-email-' + role + '.service/'
-                    value = {'Database': {'PasswordFile': runtime + 'database-password.txt'},
+                    value = {'Database': {'Host': '127.0.0.1', 'Username': 'mk8email_' + role,
+                                          'PasswordFile': runtime + 'database-password.txt'},
                              'Smtp': {'Hostname': self.value['domains']['mk8.email']},
                              'Messaging': {'Enabled': True, 'EncryptionKeyId': 'primary',
                                            'EncryptionKeyFile': runtime + 'messaging-key.txt',

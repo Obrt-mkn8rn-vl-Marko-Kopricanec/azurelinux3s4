@@ -51,6 +51,7 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/email_presentation.py
 # @s4-include Deployment/drava_bootstrap.py
 # @s4-include Deployment/services.py
+# @s4-include Deployment/database_correspondence.py
 # @s4-include Deployment/application_publication.py
 action = sys.argv[1]
 if action == 'publish-applications':
