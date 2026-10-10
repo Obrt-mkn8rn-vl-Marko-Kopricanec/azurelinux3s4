@@ -74,6 +74,7 @@ PAYLOADS = {
     "SSH/service.py": "PY",
     "Deployment/configuration.py": "PY",
     "Deployment/policy.py": "PY",
+    "Deployment/postgresql_profile.py": "PY",
     "Deployment/publication.py": "PY",
     "Deployment/releases.py": "PY",
     "Deployment/dns_configuration.py": "PY",

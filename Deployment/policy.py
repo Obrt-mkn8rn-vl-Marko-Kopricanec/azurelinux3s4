@@ -196,15 +196,10 @@ def deployment_bundle(data, ssh_producer):
     ssh = ssh_producer([row['prefix'] for row in plan['admin']], [row['address'] for row in plan['admin']])
     files = list(ssh['files'])
     files.append(deployment_firewall(plan))
-    files.extend((deployment_file('postgresql/listener.conf', '0600', "listen_addresses = '127.0.0.1,::1'\nport = 5432\npassword_encryption = 'scram-sha-256'\n"),
-                  deployment_file('postgresql/pg_hba.conf', '0600',
-                                  'local all postgres peer\n'
-                                  'host mk8dns mk8dns 127.0.0.1/32 scram-sha-256\n'
-                                  'host mk8dns mk8dns ::1/128 scram-sha-256\n'
-                                  'host mk8email mk8email 127.0.0.1/32 scram-sha-256\n'
-                                  'host mk8email mk8email ::1/128 scram-sha-256\n'
-                                  'local all all reject\nhost all all 0.0.0.0/0 reject\nhost all all ::0/0 reject\n')))
+    postgresql_files, postgresql_requirements = postgresql_profile()
+    files.extend(postgresql_files)
     contract = {'applications': deployment_applications(plan), 'network': plan,
+                'postgresql_prerequisites': postgresql_requirements,
                 'port_owners': {'http_80_https_443': 'mk8.drava ONLY; no second nginx or static Web listener',
                                'dns_tcp_udp_53': 'mk8.dns authoritative Gateway; no public recursion',
                                'mail_tcp_25_587_993': 'mk8.email; optional ports require explicit manifest switches',
@@ -232,7 +227,7 @@ def deployment_bundle(data, ssh_producer):
               'limits': ['Source ownership and sequential repeated bytes/FD/path metadata are local observations under trusted root/base/Python/kernel and finite honest IO/scheduling, not credential-intent authority, content authenticity, atomicity, ABA protection or concurrent-root safety.',
                          'The IPv6 /64 is the stable proposed allocation only. Null admin IPv6 omits that SSH listener/prefix; public IPv6 and required ICMPv6 remain independent. No all-RFC1918/ULA/link-local admin allowance.',
                          'Firewall candidate contains no flush and was not loaded. Existing tables/hooks/TC/BPF/routes/NAT/proxy/VPN sources can affect semantics. Name-only interface matching does not bind ifindex/MAC/VLAN identity. Router exclusions do not establish direct original origin.',
-                         'PostgreSQL peer line and SCRAM declarations do not create roles/passwords/databases, verify major16 runtime, authenticate local peer mappings or authorize clients. All server/update/SSH/Web/lifecycle and physical durability gates remain open.']}
+                         'PostgreSQL peer/SCRAM and17+ feature prerequisites do not create roles/passwords/databases, authenticate a native server or local peer mappings, reconcile actual app connections, or grant SQL privileges. All server/update/SSH/Web/lifecycle and physical durability gates remain open.']}
     if len(dep_policy_json.dumps(result, sort_keys=True, separators=(',', ':')).encode('ascii')) > 256 * 1024:
         raise ValueError('complete candidate output bound')
     return result

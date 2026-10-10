@@ -78,6 +78,7 @@ MODULES = (
     "test_deployment_drava_bootstrap",
     "test_deployment_email_transport",
     "test_deployment_email_presentation",
+    "test_deployment_postgresql_profile",
 )
 
 

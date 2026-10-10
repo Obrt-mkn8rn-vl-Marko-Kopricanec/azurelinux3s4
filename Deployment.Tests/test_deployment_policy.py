@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LIBRARIES = ('SSH/policy.py', 'SSH/service.py', 'Deployment/configuration.py', 'Deployment/policy.py')
+LIBRARIES = ('SSH/policy.py', 'SSH/service.py', 'Deployment/configuration.py', 'Deployment/policy.py', 'Deployment/postgresql_profile.py')
 CAPTURES = []
 
 
@@ -137,7 +137,7 @@ class DeploymentPolicyTests(unittest.TestCase):
     def test_postgresql_private_independent_scram_roles_and_explicit_final_reject(self):
         result = self.candidate(); config = result['files'][2]['content']; hba = result['files'][3]['content']
         self.assertIn("listen_addresses = '127.0.0.1,::1'", config)
-        self.assertEqual(hba.count('scram-sha-256'), 4)
+        self.assertEqual(hba.count('scram-sha-256'), 5)
         self.assertIn('host mk8dns mk8dns', hba)
         self.assertIn('host mk8email mk8email', hba)
         self.assertTrue(hba.endswith('host all all 0.0.0.0/0 reject\nhost all all ::0/0 reject\n'))

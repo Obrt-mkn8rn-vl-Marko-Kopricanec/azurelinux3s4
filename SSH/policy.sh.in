@@ -40,6 +40,7 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include SSH/service.py
 # @s4-include Deployment/configuration.py
 # @s4-include Deployment/policy.py
+# @s4-include Deployment/postgresql_profile.py
 # @s4-include Deployment/publication.py
 # @s4-include Deployment/releases.py
 # @s4-include Deployment/dns_configuration.py
