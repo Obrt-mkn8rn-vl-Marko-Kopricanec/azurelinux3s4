@@ -89,6 +89,7 @@ PAYLOADS = {
     "Deployment/services.py": "PY",
     "Deployment/application_publication.py": "PY",
     "Deployment/application_installation.py": "PY",
+    "Deployment/application_rollback.py": "PY",
     "SSH/keys.py": "PY",
     "SSH/accounts.py": "PY",
     "SSH/home.py": "PY",

@@ -82,6 +82,7 @@ MODULES = (
     "test_deployment_database_correspondence",
     "test_deployment_sava_policy",
     "test_deployment_application_installation",
+    "test_deployment_application_rollback",
 )
 
 

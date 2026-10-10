@@ -55,6 +55,7 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/sava_policy.py
 # @s4-include Deployment/application_publication.py
 # @s4-include Deployment/application_installation.py
+# @s4-include Deployment/application_rollback.py
 action = sys.argv[1]
 if action == 'publish-applications':
     sys.argv = [sys.argv[0], sys.argv[2]]
