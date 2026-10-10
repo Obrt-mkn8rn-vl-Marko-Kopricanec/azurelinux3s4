@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/email_transport.py', 'Deployment/drava_bootstrap.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery

@@ -80,6 +80,7 @@ PAYLOADS = {
     "Deployment/credentials.py": "PY",
     "Deployment/email_credentials.py": "PY",
     "Deployment/email_role_policy.py": "PY",
+    "Deployment/email_transport.py": "PY",
     "Deployment/drava_bootstrap.py": "PY",
     "Deployment/services.py": "PY",
     "Deployment/application_publication.py": "PY",
