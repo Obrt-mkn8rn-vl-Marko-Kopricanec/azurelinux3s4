@@ -9,7 +9,7 @@ import os
 import stat
 import subprocess
 import sys
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from test_deployment_policy import emitted_program, encoded
 from test_deployment_publication import PublicationOS
@@ -56,6 +56,21 @@ class ApplicationAccountTests(ReleaseFixture):
         before = copy.deepcopy(units)
         with self.assertRaisesRegex((ValueError, OSError), message): self.policy(units)
         self.assertEqual(units, before)
+
+    def refused_publication_fault(self, old, new, message):
+        original = self.n['application_bundle']
+        store = Mock(side_effect=AssertionError('store IO forbidden'))
+        flock = Mock(side_effect=AssertionError('lock IO forbidden'))
+        def faulty(data, producer):
+            result = original(data, producer)
+            self.changed(result['files'][-1], old, new)
+            return result
+        self.n['application_bundle'] = faulty; self.n['publication_store'] = store
+        with patch.object(self.n['pub_fcntl'], 'flock', flock):
+            with self.assertRaisesRegex(ValueError, message):
+                self.n['application_publication_publish'](encoded(self.value), self.n['bundle'])
+        store.assert_not_called(); flock.assert_not_called()
+        self.assertEqual(list(self.store.iterdir()), []); self.assert_closed()
 
     def run_delivered(self, foreign=False):
         self.manifest_file.write_bytes(encoded(self.value))
@@ -196,6 +211,40 @@ class ApplicationAccountTests(ReleaseFixture):
         for header in ('[Service]', '[Socket]'):
             units = copy.deepcopy(self.candidate['files']); self.changed(units[-1], '[Install]', header)
             self.refused(units)
+
+    def test_indented_sections_cannot_move_committed_user_group_out_of_service(self):
+        units = copy.deepcopy(self.candidate['files'])
+        identities = 'User=mk8email-gateway\nGroup=mk8email-gateway\n'
+        self.changed(units[-1], identities, ' [Unit]\n' + identities + ' [Service]\n')
+        self.refused(units, 'unsupported account unit section')
+
+    def test_continuations_cannot_consume_committed_user_or_group_physical_lines(self):
+        for key in ('User', 'Group'):
+            with self.subTest(key=key):
+                units = copy.deepcopy(self.candidate['files']); identity = key + '=mk8email-gateway\n'
+                self.changed(units[-1], identity, 'XIdentity=ignored' + chr(92) + '\n' + identity)
+                self.refused(units, 'account unit continuations unsupported')
+
+    def test_noncanonical_headers_and_unexplained_bare_physical_lines_refuse(self):
+        for line in (' [Unit]', '[Unit] ', ' [Service]', '[Service] ', 'bare line', '   '):
+            with self.subTest(line=line):
+                units = copy.deepcopy(self.candidate['files'])
+                self.changed(units[-1], '[Service]\n', '[Service]\n' + line + '\n')
+                self.refused(units, 'account unit (section|assignment)')
+
+    def test_faulty_producer_indented_identity_sections_refuse_before_store_and_lock_io(self):
+        identities = 'User=mk8email-gateway\nGroup=mk8email-gateway\n'
+        self.refused_publication_fault(identities, ' [Unit]\n' + identities + ' [Service]\n',
+                                       'unsupported account unit section')
+
+    def test_faulty_producer_continuation_consuming_user_refuses_before_store_and_lock_io(self):
+        identity = 'User=mk8email-gateway\n'
+        self.refused_publication_fault(identity, 'XIdentity=ignored' + chr(92) + '\n' + identity,
+                                       'account unit continuations unsupported')
+
+    def test_faulty_producer_unexplained_bare_line_refuses_before_store_and_lock_io(self):
+        self.refused_publication_fault('[Service]\n', '[Service]\nunexplained line\n',
+                                       'canonical account unit assignment required')
 
     def test_missing_original_token_refuses_before_publication_store_io(self):
         (self.root / 'etc/mk8.drava/ipc-token.txt').unlink()

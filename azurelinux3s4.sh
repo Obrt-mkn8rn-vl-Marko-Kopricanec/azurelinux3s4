@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.76.0
+S4_VERSION=0.76.1
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -10481,6 +10481,23 @@ def application_account_policy(units):
         if (not raw.endswith(b'\n') or any(byte < 32 and byte != 10 or byte > 126 for byte in raw)
                 or entry['bytes'] != len(raw) or entry['sha256'] != dep_hash.sha256(raw).hexdigest()):
             raise ValueError('account unit byte commitment mismatch')
+        # Admit the whole canonical physical-line subset before extracting any
+        # identity. Native parsing trims section headers and joins continuations.
+        lines = entry['content'].splitlines()
+        for line in lines:
+            if line.endswith('\\'):
+                raise ValueError('account unit continuations unsupported')
+            if not line or line.startswith('#'):
+                continue
+            if line.lstrip().startswith('['):
+                if line not in ('[Unit]', '[Service]', '[Install]'):
+                    raise ValueError('unsupported account unit section')
+                continue
+            key, separator, value = line.partition('=')
+            if not separator:
+                raise ValueError('canonical account unit assignment required')
+            if not dep_re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', key):
+                raise ValueError('canonical account unit directive required')
         section, service_sections, identities = '', 0, {}
         for line in entry['content'].splitlines():
             if not line or line.startswith('#'):
