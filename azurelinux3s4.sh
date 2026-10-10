@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.63.0
+S4_VERSION=0.64.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -9573,6 +9573,36 @@ def email_credential_observe(captured):
 
 def email_credential_unit(plan):
     return tuple('LoadCredential=' + row['id'] + ':' + row['source'] for row in plan['inputs'])
+"""Admit Email's declared gateway paths and admin networks before inactive units."""
+
+
+EMAIL_GATEWAY_STATE = '/var/lib/mk8.email/gateway'
+EMAIL_ADMIN_FIELDS = ('AllowedNetworks', 'DataProtectionKeyPath', 'AuditLogPath', 'HealthStatusPath', 'SessionMinutes')
+EMAIL_ADMIN_PATHS = {'DataProtectionKeyPath': EMAIL_GATEWAY_STATE + '/data-protection',
+                     'AuditLogPath': EMAIL_GATEWAY_STATE + '/audit/admin.jsonl',
+                     'HealthStatusPath': EMAIL_GATEWAY_STATE + '/health/status.json'}
+
+
+def email_role_observe(captured, plan):
+    worker, gateway = (release_json(captured[role + '.json']) for role in ('worker', 'gateway'))
+    if type(worker) is not dict or type(gateway) is not dict or 'Admin' in worker:
+        raise ValueError('Email gateway-only admin declaration required')
+    admin = gateway.get('Admin')
+    if type(admin) is not dict or admin.keys() - set(EMAIL_ADMIN_FIELDS):
+        raise ValueError('canonical Email gateway admin record required')
+    if any(admin.get(field) != path for field, path in EMAIL_ADMIN_PATHS.items()):
+        raise ValueError('Email gateway-owned persistent paths required')
+    networks = admin.get('AllowedNetworks')
+    # Exact declarations only. This does not attest assignment, original-client
+    # locality, forwarded-header policy, a proxy, or actual request enforcement.
+    prefixes = [row['prefix'] for row in plan['admin']]
+    if type(networks) is not list or networks not in (prefixes[:1], prefixes):
+        raise ValueError('complete canonical Email admin network declarations required')
+    minutes = admin.get('SessionMinutes', 30)
+    if type(minutes) is not int or not 5 <= minutes <= 480:
+        raise ValueError('bounded Email gateway admin session declaration required')
+    # No separate receipt: original configuration hashes and whole unit bytes
+    # retain these declarations. Accounts/directories remain unprovisioned.
 """Produce inactive launch files only after complete release/input correspondence."""
 
 import base64 as app_base64
@@ -9664,6 +9694,7 @@ def application_configuration(app, bindings, plan, credentials=None, dns_configu
         if credentials is not None:
             credentials.extend(observed)
     if app == 'mk8.email':
+        email_role_observe(captured, plan)
         observed = email_credential_observe(captured)
         if email_credentials is not None:
             email_credentials.extend(observed)
@@ -9674,8 +9705,8 @@ def application_unit(name, app, role, release, arguments=(), extra=(), privilege
     program = REL_PROGRAMS[app][role]
     directory = release['directory'] + '/' + role
     account = {'mk8.sava': 'mk8sava-' + role, 'mk8.drava': 'mk8drava',
-               'mk8.dns': 'mk8dns', 'mk8.email': 'mk8email'}[app]
-    lines = ['# Inactive candidate. Parser, JIT, accounts, credentials and health remain unproven.',
+               'mk8.dns': 'mk8dns', 'mk8.email': 'mk8email-' + role}[app]
+    lines = ['# Inactive candidate; runtime unproven.',
              '[Unit]', 'Description=' + name, 'Wants=network-online.target',
              'After=network-online.target' + ((' ' + ' '.join(after)) if after else ''),
              'StartLimitIntervalSec=120', 'StartLimitBurst=5', '', '[Service]',
@@ -9729,7 +9760,8 @@ def application_units(app, release, plan, credentials=()):
                     extra=email_credential_unit(next(row for row in credentials if row['role'] == role)) + (
                            'Environment=MK8EMAIL_CONFIG_FILE=%d/config.json',
                            'Environment=ASPNETCORE_URLS=http://127.0.0.1:' + str(plan['private_ports']['email_http']),
-                           'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false'),
+                           'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false',
+                           'StateDirectory=mk8.email/' + role, 'StateDirectoryMode=0700'), state=False,
                     after=('postgresql.service',)) for role in ('worker', 'gateway')]
     units = []
     if [row['role'] for row in credentials] != ['controller', 'authoritative-replica']:

@@ -33,7 +33,7 @@ class ReleaseFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.n = {'__name__': 'application_release_private_delivery'}
-        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/services.py'):
+        for name in (*LIBRARIES, 'Deployment/releases.py', 'Deployment/dns_configuration.py', 'Deployment/credentials.py', 'Deployment/email_credentials.py', 'Deployment/email_role_policy.py', 'Deployment/services.py'):
             exec(compile((ROOT / name).read_bytes(), name, 'exec'), self.n)
         self.delivery = PrivateOS(self.root)
         self.n['dep_os'] = self.delivery
@@ -92,6 +92,10 @@ class ReleaseFixture(unittest.TestCase):
                         names.extend(('oauth-signing.txt', 'mfa-key.txt', 'dkim-key.pem'))
                     else:
                         value['Tls'] = {'CertificatePath': runtime + 'tls-certificate.pem', 'CertificateKeyPath': runtime + 'tls-key.pem'}
+                        value['Admin'] = {'AllowedNetworks': ['192.168.90.0/24'],
+                                          'DataProtectionKeyPath': '/var/lib/mk8.email/gateway/data-protection',
+                                          'AuditLogPath': '/var/lib/mk8.email/gateway/audit/admin.jsonl',
+                                          'HealthStatusPath': '/var/lib/mk8.email/gateway/health/status.json'}
                         names.extend(('tls-certificate.pem', 'tls-key.pem'))
                     inputs[role + '.json'] = encoded(value)
                     secrets = config / role; secrets.mkdir(mode=0o700)

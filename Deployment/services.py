@@ -89,6 +89,7 @@ def application_configuration(app, bindings, plan, credentials=None, dns_configu
         if credentials is not None:
             credentials.extend(observed)
     if app == 'mk8.email':
+        email_role_observe(captured, plan)
         observed = email_credential_observe(captured)
         if email_credentials is not None:
             email_credentials.extend(observed)
@@ -99,8 +100,8 @@ def application_unit(name, app, role, release, arguments=(), extra=(), privilege
     program = REL_PROGRAMS[app][role]
     directory = release['directory'] + '/' + role
     account = {'mk8.sava': 'mk8sava-' + role, 'mk8.drava': 'mk8drava',
-               'mk8.dns': 'mk8dns', 'mk8.email': 'mk8email'}[app]
-    lines = ['# Inactive candidate. Parser, JIT, accounts, credentials and health remain unproven.',
+               'mk8.dns': 'mk8dns', 'mk8.email': 'mk8email-' + role}[app]
+    lines = ['# Inactive candidate; runtime unproven.',
              '[Unit]', 'Description=' + name, 'Wants=network-online.target',
              'After=network-online.target' + ((' ' + ' '.join(after)) if after else ''),
              'StartLimitIntervalSec=120', 'StartLimitBurst=5', '', '[Service]',
@@ -154,7 +155,8 @@ def application_units(app, release, plan, credentials=()):
                     extra=email_credential_unit(next(row for row in credentials if row['role'] == role)) + (
                            'Environment=MK8EMAIL_CONFIG_FILE=%d/config.json',
                            'Environment=ASPNETCORE_URLS=http://127.0.0.1:' + str(plan['private_ports']['email_http']),
-                           'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false'),
+                           'Environment=ASPNETCORE_FORWARDEDHEADERS_ENABLED=false',
+                           'StateDirectory=mk8.email/' + role, 'StateDirectoryMode=0700'), state=False,
                     after=('postgresql.service',)) for role in ('worker', 'gateway')]
     units = []
     if [row['role'] for row in credentials] != ['controller', 'authoritative-replica']:

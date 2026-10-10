@@ -73,6 +73,7 @@ MODULES = (
     "test_deployment_credentials",
     "test_deployment_dns_configuration",
     "test_deployment_email_credentials",
+    "test_deployment_email_role_policy",
 )
 
 
