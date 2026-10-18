@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-S4_VERSION=0.78.0
+S4_VERSION=0.79.0
 S4_OS_RELEASE=/etc/os-release
 S4_SYSTEMD_RUNTIME=/run/systemd/system
 S4_STATE=/var/lib/azurelinux3s4
@@ -11141,7 +11141,7 @@ CONFIG_INSTALL_LIMITS = [
     'Destination directories must already exist with protected root ownership. Foreign files, changed plans and partial ownership records refuse without adoption, deletion or overwrite.',
     'Exact ownership permits completion of original 0600 prefixes, including private configuration whose final mode is also 0600; final readback still requires complete bytes.',
     'File visibility is sequential, not set-atomic. Failures may leave partial or complete bytes without success; a later independent consumer could read installed files.',
-    'No native parsing, include/command-line/manager precedence, firewall transaction, PostgreSQL cluster/role/schema setup, SSH reload, rollback, boot persistence or physical durability is established.',
+    'No native parsing, include/command-line/manager precedence, firewall transaction, PostgreSQL cluster/role/schema setup, SSH reload, effective native rollback, boot persistence or physical durability is established.',
 ]
 
 
@@ -11184,6 +11184,44 @@ def configuration_installation_plan(data, ssh_producer):
 
 def configuration_installation(data, ssh_producer):
     return installation_apply(data, ssh_producer, configuration=True)
+"""Disconnected exact owned-configuration retirement/reinstallation libraries."""
+
+
+CONFIG_ROLLBACK_LIMITS = [
+    'Disconnected library only; no CLI/default invocation or operational authorization. Native consumers, stopped-context and complete existing configuration precedence remain unproved.',
+    'Only the five exact owned configuration names return to absence. No previous configuration, firewall ruleset, SSH/PG loaded state, account, database or service state is restored.',
+    'Fresh complete original planning and all destination/owner/marker admissions precede retirement and repeat under the configuration-only lock. Exact owned 0600 prefixes may be retired.',
+    'Complete marker synchronization precedes every unlink, including a retained-marker retry. Installation ownership remains until all selected targets are absent and parents synchronized.',
+    'Interrupted retirement preserves ownership/marker/remainder; foreign or changed late bytes refuse without early deletion. Open files and native loaded configuration may outlive unlink.',
+    'The unchanged installer refuses a retained rollback marker. The separate exact reinstallation transition is required before writing again.',
+    'Sequential observations and file retirement are not atomic, hostile-root/ABA safe, physical power-loss durable or hard blocked-IO progress guarantees.',
+]
+CONFIG_REINSTALL_LIMITS = [
+    'Disconnected library only; no CLI/default or native activation. This transitions exact owned configuration files, not effective host configuration or services.',
+    'A complete marker requires every target absent. Exact ownership is synchronized before marker retirement; partial/foreign records refuse without recovery or deletion.',
+    'After checked closes and unlock, the fixed configuration installer reconstructs all five original payloads and reacquires the same configuration-only lock. Changed source/plan cannot reuse ownership.',
+    'Failures may leave both records, ownership alone or original 0600 prefixes. The transition/writer gap is sequential and not an atomic transaction or concurrent-root guarantee.',
+    'Marker-absent continuation proves no prior operational rollback. No previous versions, effective firewall/SSH/PG state, accounts, databases, physical durability or boot lifecycle is restored.',
+]
+
+
+def configuration_rollback_plan(data, ssh_producer):
+    digest, owner, rows = configuration_installation_plan(data, ssh_producer)
+    marker = publication_encoded({'format': 'azurelinux3s4-configuration-file-rollback-v1',
+                                  'publication_sha256': digest,
+                                  'installation_record': {'bytes': len(owner),
+                                                          'sha256': dep_hash.sha256(owner).hexdigest()},
+                                  'files': len(rows), 'restored_destination_state': 'absent',
+                                  'activation_authorized': False})
+    return digest, owner, rows, marker
+
+
+def configuration_rollback(data, ssh_producer):
+    return rollback_apply(data, ssh_producer, configuration=True)
+
+
+def configuration_reinstallation(data, ssh_producer):
+    return reinstallation_apply(data, ssh_producer, configuration=True)
 """Roll back owned first-installation files to absence; no CLI invokes this library.
 
 No service/process/configuration/database rollback is supplied. Future operational
@@ -11219,11 +11257,11 @@ def rollback_absent(parent, leaf):
     raise ValueError('rollback destination unexpectedly present')
 
 
-def rollback_admission(state, held, owner, rows, marker):
+def rollback_admission(state, held, owner, rows, marker, configuration=False):
     entries = publication_entries(state)
     if not entries <= {'.installer.lock', 'installation.json', 'rollback.json'}:
         raise ValueError('foreign rollback-state entries')
-    publication_file(state, '.installer.lock', APP_INSTALL_LOCK)
+    publication_file(state, '.installer.lock', CONFIG_INSTALL_LOCK if configuration else APP_INSTALL_LOCK)
     recorded = 'rollback.json' in entries
     if recorded:
         publication_file(state, 'rollback.json', marker)
@@ -11235,7 +11273,8 @@ def rollback_admission(state, held, owner, rows, marker):
     previous = []
     for row in rows:
         if owned:
-            previous.append(installation_leaf(held[row['parent']][0], row, True))
+            previous.append(installation_leaf(held[row['parent']][0], row, True, private_prefix=True)
+                            if configuration else installation_leaf(held[row['parent']][0], row, True))
         else:
             rollback_absent(held[row['parent']][0], row['leaf'])
             previous.append(None)
@@ -11264,32 +11303,44 @@ def rollback_marker_sync(state, marker):
     publication_file(state, 'rollback.json', marker)
 
 
-def application_rollback(data, ssh_producer):
+def rollback_apply(data, ssh_producer, configuration=False):
     # Deliberately disconnected from actual CLI/dispatcher/defaults.
+    if type(configuration) is not bool:
+        raise ValueError('fixed rollback kind required')
     if dep_os.geteuid() != DEP_TRUSTED_UID:
         raise ValueError('application-file rollback requires root')
-    digest, owner, rows, marker = application_rollback_plan(data, ssh_producer)
+    digest, owner, rows, marker = (configuration_rollback_plan(data, ssh_producer) if configuration
+                                  else application_rollback_plan(data, ssh_producer))
     removed = 0
     with dep_context.ExitStack() as stack:
-        held, links = installation_directories(stack)
-        state = held[APP_INSTALL_STATE][0]
-        rollback_admission(state, held, owner, rows, marker)
-        installation_context(held, links)
+        held, links = (installation_directories(stack, CONFIG_INSTALL_DIRECTORIES) if configuration
+                       else installation_directories(stack))
+        state = held[CONFIG_INSTALL_STATE if configuration else APP_INSTALL_STATE][0]
+        def check_context():
+            if configuration:
+                installation_context(held, links, CONFIG_INSTALL_DIRECTORIES)
+            else:
+                installation_context(held, links)
+        def admit():
+            return (rollback_admission(state, held, owner, rows, marker, configuration=True) if configuration
+                    else rollback_admission(state, held, owner, rows, marker))
+        admit()
+        check_context()
         lock = dep_os.open('.installer.lock', DEP_OPEN, dir_fd=state)
         stack.callback(dep_os.close, lock)
         initial_lock = dep_os.fstat(lock)
         if deployment_identity(initial_lock) != deployment_identity(dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             raise ValueError('rollback installer lock changed')
         pub_fcntl.flock(lock, pub_fcntl.LOCK_EX | pub_fcntl.LOCK_NB)
-        owned, recorded, previous = rollback_admission(state, held, owner, rows, marker)
-        installation_context(held, links)
+        owned, recorded, previous = admit()
+        check_context()
         if not recorded:
             # A complete synchronized marker precedes EVERY destination deletion.
             publication_write(state, 'rollback.json', marker)
         # A retained marker can come from an earlier failed file/parent fsync.
         rollback_marker_sync(state, marker)
         for row, old in zip(rows, previous):
-            installation_context(held, links)
+            check_context()
             if old is not None:
                 rollback_unlink(held[row['parent']][0], row['leaf'], old[0])
                 removed += 1
@@ -11300,7 +11351,7 @@ def application_rollback(data, ssh_producer):
             dep_os.fsync(parent)
         if owned:
             before, _ = publication_file(state, 'installation.json', owner)
-            installation_context(held, links)
+            check_context()
             rollback_unlink(state, 'installation.json', before)
         rollback_marker_sync(state, marker)
         for row in rows:
@@ -11312,18 +11363,22 @@ def application_rollback(data, ssh_producer):
         for current in (dep_os.fstat(lock), dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(initial_lock):
                 raise ValueError('rollback lock identity changed')
-        installation_context(held, links)
-    return {'scope': 'OWNED FIRST-INSTALLATION FILES TO ABSENCE ONLY',
+        check_context()
+    return {'scope': 'OWNED CONFIGURATION FILES TO ABSENCE ONLY' if configuration else 'OWNED FIRST-INSTALLATION FILES TO ABSENCE ONLY',
             'publication_sha256': digest, 'rollback_record_sha256': dep_hash.sha256(marker).hexdigest(),
             'files': len(rows), 'removed_files': removed,
             'disposition': 'rolled-back' if owned else 'already-absent',
             'checked_closes_completed': True, 'file_and_directory_fsync_returned': True,
             'authority': {name: False for name in APP_ROLLBACK_AUTHORITY},
-            'limits': ['No CLI/default calls this library. Actual stopped-manager/process admission, operational authority and native/full-lifecycle rollback remain required.',
+            'limits': CONFIG_ROLLBACK_LIMITS if configuration else ['No CLI/default calls this library. Actual stopped-manager/process admission, operational authority and native/full-lifecycle rollback remain required.',
                        'Only exact first-installation file absence is restored; no previous file versions, configuration, accounts, application state or database are restored.',
                        'Foreign/changed ownership, marker, plan or any late payload refuses before deletion. Complete rollback marker is retained for interrupted and idempotent retries.',
                        'The retained marker makes the unchanged installation engine refuse reinstallation. A future separately reviewed transition is required.',
                        'Retirement is sequential/non-set-atomic; failures may leave absent names without success. Open files or loaded manager/process state may outlive unlink. No ABA/concurrent-root or power-loss guarantee.']}
+
+
+def application_rollback(data, ssh_producer):
+    return rollback_apply(data, ssh_producer)
 """Checked owned-file reinstallation; disconnected from CLI and defaults.
 
 Only exact rollback-to-installation file state is transitioned. Service/process,
@@ -11339,11 +11394,11 @@ APP_REINSTALL_AUTHORITY = ('operationally_authorized', 'release_authenticated',
                           'concurrent_root_safety', 'server_ready')
 
 
-def reinstallation_admission(state, held, owner, rows, marker):
+def reinstallation_admission(state, held, owner, rows, marker, configuration=False):
     entries = publication_entries(state)
     if not entries <= {'.installer.lock', 'installation.json', 'rollback.json'}:
         raise ValueError('foreign reinstallation-state entries')
-    publication_file(state, '.installer.lock', APP_INSTALL_LOCK)
+    publication_file(state, '.installer.lock', CONFIG_INSTALL_LOCK if configuration else APP_INSTALL_LOCK)
     owned = publication_file(state, 'installation.json', owner)[0] if 'installation.json' in entries else None
     recorded = publication_file(state, 'rollback.json', marker)[0] if 'rollback.json' in entries else None
     if owned is None and recorded is None:
@@ -11353,7 +11408,10 @@ def reinstallation_admission(state, held, owner, rows, marker):
             # A marker may represent incomplete rollback: every target must be absent.
             rollback_absent(held[row['parent']][0], row['leaf'])
         else:
-            installation_leaf(held[row['parent']][0], row, True)
+            if configuration:
+                installation_leaf(held[row['parent']][0], row, True, private_prefix=True)
+            else:
+                installation_leaf(held[row['parent']][0], row, True)
     return owned, recorded
 
 
@@ -11372,41 +11430,53 @@ def reinstallation_owner_sync(state, owner):
         raise ValueError('reinstallation owner changed after synchronization')
 
 
-def application_reinstallation(data, ssh_producer):
+def reinstallation_apply(data, ssh_producer, configuration=False):
     # No operational dispatcher/default reaches this write-capable library.
+    if type(configuration) is not bool:
+        raise ValueError('fixed reinstallation kind required')
     if dep_os.geteuid() != DEP_TRUSTED_UID:
         raise ValueError('application-file reinstallation requires root')
-    digest, owner, rows, marker = application_rollback_plan(data, ssh_producer)
+    digest, owner, rows, marker = (configuration_rollback_plan(data, ssh_producer) if configuration
+                                  else application_rollback_plan(data, ssh_producer))
     recorded = None
     with dep_context.ExitStack() as stack:
-        held, links = installation_directories(stack)
-        state = held[APP_INSTALL_STATE][0]
-        before = reinstallation_admission(state, held, owner, rows, marker)
-        installation_context(held, links)
+        held, links = (installation_directories(stack, CONFIG_INSTALL_DIRECTORIES) if configuration
+                       else installation_directories(stack))
+        state = held[CONFIG_INSTALL_STATE if configuration else APP_INSTALL_STATE][0]
+        def check_context():
+            if configuration:
+                installation_context(held, links, CONFIG_INSTALL_DIRECTORIES)
+            else:
+                installation_context(held, links)
+        def admit():
+            return (reinstallation_admission(state, held, owner, rows, marker, configuration=True) if configuration
+                    else reinstallation_admission(state, held, owner, rows, marker))
+        before = admit()
+        check_context()
         lock = dep_os.open('.installer.lock', DEP_OPEN, dir_fd=state)
         stack.callback(dep_os.close, lock)
         initial_lock = dep_os.fstat(lock)
         if deployment_identity(initial_lock) != deployment_identity(dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             raise ValueError('reinstallation installer lock changed')
         pub_fcntl.flock(lock, pub_fcntl.LOCK_EX | pub_fcntl.LOCK_NB)
-        owned, recorded = reinstallation_admission(state, held, owner, rows, marker)
+        owned, recorded = admit()
         if tuple(None if row is None else deployment_identity(row) for row in (owned, recorded)) != tuple(
                 None if row is None else deployment_identity(row) for row in before):
             raise ValueError('reinstallation records changed before lock')
-        installation_context(held, links)
+        check_context()
         if recorded is not None:
             # Synchronize absence before handing ownership back to the installer.
             for parent in dict.fromkeys(row['parent'] for row in rows):
                 dep_os.fsync(held[parent][0])
             for row in rows:
                 rollback_absent(held[row['parent']][0], row['leaf'])
-            installation_context(held, links)
+            check_context()
             if owned is None:
                 publication_write(state, 'installation.json', owner)
             # Complete synchronized ownership survives interrupted marker retirement.
             reinstallation_owner_sync(state, owner)
-            reinstallation_admission(state, held, owner, rows, marker)
-            installation_context(held, links)
+            admit()
+            check_context()
             rollback_unlink(state, 'rollback.json', recorded)
         else:
             # A previous marker unlink can precede a failed parent sync or writer.
@@ -11419,24 +11489,29 @@ def application_reinstallation(data, ssh_producer):
         for current in (dep_os.fstat(lock), dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(initial_lock):
                 raise ValueError('reinstallation lock identity changed')
-        installation_context(held, links)
+        check_context()
     # Close/unlock before the unchanged installer acquires this SAME lock again.
     # Its fresh complete plan must still match the retained exact ownership bytes.
-    installed = application_installation(data, ssh_producer)
+    installed = (configuration_installation(data, ssh_producer) if configuration
+                 else application_installation(data, ssh_producer))
     if (installed['publication_sha256'] != digest
             or installed['installation_record_sha256'] != dep_hash.sha256(owner).hexdigest()):
         raise ValueError('reinstallation writer plan changed')
-    return {'scope': 'EXACT OWNED APPLICATION FILES ONLY; NO ACTIVATION',
+    return {'scope': 'EXACT OWNED CONFIGURATION FILES ONLY; NO ACTIVATION' if configuration else 'EXACT OWNED APPLICATION FILES ONLY; NO ACTIVATION',
             'publication_sha256': digest,
             'rollback_marker_observed': recorded is not None,
             'disposition': 'rollback-marker-retired' if recorded is not None else 'owned-installation-resumed',
             'installation': installed, 'checked_closes_completed': True,
             'authority': {name: False for name in APP_REINSTALL_AUTHORITY},
-            'limits': ['No CLI/default invokes this library. Operational, stopped-manager, native and full application lifecycle admission remain required.',
+            'limits': CONFIG_REINSTALL_LIMITS if configuration else ['No CLI/default invokes this library. Operational, stopped-manager, native and full application lifecycle admission remain required.',
                        'Exact rollback marker requires every selected target absent. Both complete records can resume a file transition; no claim of an observed prior service rollback follows.',
                        'Ownership is synchronized before marker retirement. Partial ownership refuses; failures can leave both records, only ownership, or installed prefixes without success.',
                        'The unchanged installer freshly rebuilds its complete raw plan after transition lock release. Changed sources/state refuse; this gap is not an atomic transaction or concurrent-root/ABA guarantee.',
                        'Only this exact file set is reinstalled. No old versions, accounts, configuration, database or manager state is restored; no physical power-loss or blocked-I/O progress guarantee.']}
+
+
+def application_reinstallation(data, ssh_producer):
+    return reinstallation_apply(data, ssh_producer)
 action = sys.argv[1]
 if action == 'publish-applications':
     sys.argv = [sys.argv[0], sys.argv[2]]

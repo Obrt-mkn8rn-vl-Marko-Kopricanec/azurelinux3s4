@@ -24,7 +24,7 @@ CONFIG_INSTALL_LIMITS = [
     'Destination directories must already exist with protected root ownership. Foreign files, changed plans and partial ownership records refuse without adoption, deletion or overwrite.',
     'Exact ownership permits completion of original 0600 prefixes, including private configuration whose final mode is also 0600; final readback still requires complete bytes.',
     'File visibility is sequential, not set-atomic. Failures may leave partial or complete bytes without success; a later independent consumer could read installed files.',
-    'No native parsing, include/command-line/manager precedence, firewall transaction, PostgreSQL cluster/role/schema setup, SSH reload, rollback, boot persistence or physical durability is established.',
+    'No native parsing, include/command-line/manager precedence, firewall transaction, PostgreSQL cluster/role/schema setup, SSH reload, effective native rollback, boot persistence or physical durability is established.',
 ]
 
 

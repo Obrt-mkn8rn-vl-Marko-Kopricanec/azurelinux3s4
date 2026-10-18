@@ -86,6 +86,7 @@ MODULES = (
     "test_deployment_sava_policy",
     "test_deployment_application_installation",
     "test_deployment_configuration_installation",
+    "test_deployment_configuration_lifecycle",
     "test_deployment_application_rollback",
     "test_deployment_application_reinstallation",
     "test_deployment_application_accounts",

@@ -92,6 +92,7 @@ PAYLOADS = {
     "Deployment/account_inventory.py": "PY",
     "Deployment/application_installation.py": "PY",
     "Deployment/configuration_installation.py": "PY",
+    "Deployment/configuration_lifecycle.py": "PY",
     "Deployment/application_rollback.py": "PY",
     "Deployment/application_reinstallation.py": "PY",
     "SSH/keys.py": "PY",

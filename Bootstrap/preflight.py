@@ -153,7 +153,8 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
         namespace['pub_ctypes'] = NoNativeOperations()
         for name in ('publication_publish', 'application_publication_publish', 'application_installation',
                      'application_rollback', 'application_reinstallation', 'publication_store',
-                     'configuration_installation', 'installation_apply'):
+                     'configuration_installation', 'installation_apply', 'configuration_rollback',
+                     'configuration_reinstallation', 'rollback_apply', 'reinstallation_apply'):
             namespace[name] = denied
         try:
             original = namespace['deployment_read'](manifest)
