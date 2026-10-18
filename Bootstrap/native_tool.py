@@ -68,4 +68,3 @@ class PinnedExecutable:
             raise ValueError('local ' + self.label + ' check refused')
         self.check()
         return child.stdout
-
