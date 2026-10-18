@@ -131,10 +131,11 @@ class NoNativeOperations:
         raise ValueError('private preflight cannot invoke native publication operations')
 
 
-def preflight(private_root, manifest, kind='applications', include_candidate=False):
+def preflight(private_root, manifest, kind='applications', include_candidate=False, include_sources=False):
     if os.geteuid() == 0 or os.getegid() != os.geteuid():
         raise ValueError('unprivileged developer with matching file UID/GID required')
-    if kind not in ('deployment', 'applications', 'accounts') or type(include_candidate) is not bool:
+    if (kind not in ('deployment', 'applications', 'accounts') or type(include_candidate) is not bool
+            or type(include_sources) is not bool or include_sources and kind == 'accounts'):
         raise ValueError('explicit supported preflight selection required')
     release = module('release')
     namespace, software = shipped_library()
@@ -156,6 +157,20 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
                      'configuration_installation', 'installation_apply', 'configuration_rollback',
                      'configuration_reinstallation', 'rollback_apply', 'reinstallation_apply'):
             namespace[name] = denied
+        sources = {}
+        protected_read = namespace['deployment_read']
+        if include_sources:
+            def observed_read(path):
+                namespace['deployment_path'](path)
+                raw = protected_read(path)
+                row = {'file': path, 'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest(), 'mode': '0600'}
+                if path in sources and sources[path] != row:
+                    raise ValueError('protected original source changed during preflight')
+                sources[path] = row
+                if len(sources) > 1024 or sum(row['bytes'] for row in sources.values()) > 16 * 1024 * 1024:
+                    raise ValueError('complete protected source census bound')
+                return raw
+            namespace['deployment_read'] = observed_read
         try:
             original = namespace['deployment_read'](manifest)
             planner = namespace['publication_plan'] if kind == 'deployment' else namespace['application_publication_plan']
@@ -164,6 +179,9 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
                                    if kind == 'accounts' else None)
             if namespace['deployment_read'](manifest) != original:
                 raise ValueError('preflight original manifest changed')
+            if include_sources:
+                for path in sorted(sources):
+                    namespace['deployment_read'](path)
             if release.identity(os.fstat(root)) != release.identity(before):
                 raise ValueError('private preflight root changed')
             release.check_links(links)
@@ -185,6 +203,8 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
             result['publication'] = json.loads(contents['publication.json'])
         if account_observation is not None:
             result['account_observation'] = account_observation
+        if include_sources:
+            result['protected_inputs'] = [sources[path] for path in sorted(sources)]
     return result
 
 
@@ -194,9 +214,10 @@ def main(argv=None):
     parser.add_argument('--manifest', required=True, help='logical absolute path inside the private root')
     parser.add_argument('--kind', choices=('deployment', 'applications', 'accounts'), default='applications')
     parser.add_argument('--include-candidate', action='store_true', help='include candidate declarations and file text on stdout')
+    parser.add_argument('--include-sources', action='store_true', help='include reobserved protected original input commitments, never their contents')
     args = parser.parse_args(argv)
     try:
-        result = preflight(args.root, args.manifest, args.kind, args.include_candidate)
+        result = preflight(args.root, args.manifest, args.kind, args.include_candidate, args.include_sources)
         raw = json.dumps(result, sort_keys=True, separators=(',', ':'))
         if len(raw) > 16 * 1024 * 1024:
             raise ValueError('private preflight output bound')
