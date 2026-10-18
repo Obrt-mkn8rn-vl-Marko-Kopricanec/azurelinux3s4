@@ -15,6 +15,7 @@ MODULES = (
     "test_native_dependencies",
     "test_tls_inputs",
     "test_email_tls_preflight",
+    "test_unit_preflight",
     "test_preflight",
     "test_bootstrap",
     "test_package_admission",

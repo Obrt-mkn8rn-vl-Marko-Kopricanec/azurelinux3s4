@@ -25,7 +25,6 @@ RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
 OPENSSL = '/usr/bin/openssl'
 INPUT_LIMIT = 1024 * 1024
-OUTPUT_LIMIT = 1024 * 1024
 COMMAND_SECONDS = 10
 ENVIRONMENT = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'OPENSSL_CONF': '/dev/null'}
 SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
@@ -79,56 +78,15 @@ def private_input(stack, links, path):
     return parent, path.name, raw, identity
 
 
-class NativeOpenSSL:
+SPEC = importlib.util.spec_from_file_location('tls_native_tool', Path(__file__).with_name('native_tool.py'))
+NATIVE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(NATIVE)
+
+
+class NativeOpenSSL(NATIVE.PinnedExecutable):
     def __init__(self, stack, expected):
-        if type(expected) is not str or not re.fullmatch('[0-9a-f]{64}', expected):
-            raise ValueError('explicit expected OpenSSL SHA256 required')
-        self.links = []
-        self.parent = RELEASE.anchor(stack, '/usr/bin', self.links)
-        self.fd = os.open('openssl', RELEASE.READ, dir_fd=self.parent)
-        stack.callback(os.close, self.fd)
-        self.before = os.fstat(self.fd)
-        if (not stat.S_ISREG(self.before.st_mode) or self.before.st_uid != 0
-                or self.before.st_nlink != 1 or self.before.st_mode & 0o7022
-                or not self.before.st_mode & 0o111 or not 0 < self.before.st_size <= 32 * 1024 * 1024):
-            raise ValueError('bounded protected root-owned OpenSSL executable required')
-        self.expected, self.commands = expected, []
-        self.check()
-
-    def check(self):
-        for _ in range(2):
-            os.lseek(self.fd, 0, os.SEEK_SET)
-            digest, size = hashlib.sha256(), 0
-            while True:
-                raw = os.read(self.fd, min(128 * 1024, self.before.st_size + 1 - size))
-                if not raw: break
-                size += len(raw); digest.update(raw)
-                if size > self.before.st_size: raise ValueError('OpenSSL executable changed size')
-            if size != self.before.st_size or digest.hexdigest() != self.expected:
-                raise ValueError('OpenSSL executable pin mismatch')
-        for current in (os.fstat(self.fd), os.stat('openssl', dir_fd=self.parent, follow_symlinks=False)):
-            if RELEASE.identity(current) != RELEASE.identity(self.before):
-                raise ValueError('OpenSSL executable identity changed')
-        RELEASE.check_links(self.links)
-
-    def run(self, arguments, raw=b'', descriptors=()):
-        # Only fixed calls below use this method. Neither input paths, arbitrary
-        # options, provider plugins nor a caller-selected command are admitted.
-        self.check()
-        start = time.monotonic()
-        child = subprocess.run([OPENSSL, *arguments], executable='/proc/self/fd/' + str(self.fd),
-                               pass_fds=(self.fd, *descriptors), input=raw, capture_output=True,
-                               env=ENVIRONMENT, cwd='/', timeout=COMMAND_SECONDS, check=False)
-        self.commands.append({'arguments': list(arguments), 'actual_returncode': child.returncode,
-                              'elapsed_seconds': time.monotonic() - start,
-                              'stdout_bytes': len(child.stdout), 'stderr_bytes': len(child.stderr),
-                              'stdout_sha256': hashlib.sha256(child.stdout).hexdigest(),
-                              'stderr_sha256': hashlib.sha256(child.stderr).hexdigest()})
-        if (child.returncode != 0 or len(child.stdout) > OUTPUT_LIMIT or len(child.stderr) > OUTPUT_LIMIT):
-            raise ValueError('local OpenSSL check refused')
-        self.check()
-        return child.stdout
-
+        super().__init__(stack, expected, path=OPENSSL, label='OpenSSL',
+                         environment=ENVIRONMENT, timeout=COMMAND_SECONDS)
 
 def dns_names(raw, contract):
     matched = re.fullmatch(rb'X509v3 Subject Alternative Name:(?: critical)? ?\n    ([A-Za-z0-9:., -]+)\n', raw)
