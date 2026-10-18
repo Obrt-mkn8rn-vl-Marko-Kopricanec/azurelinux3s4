@@ -1,5 +1,7 @@
 # Internal working material, including symlinks
 **/docs/internal
+# Development notes belong under docs/internal/development.
+/docs/development/
 .codex/
 **/[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
 **/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
