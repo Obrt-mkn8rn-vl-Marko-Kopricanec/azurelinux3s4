@@ -89,6 +89,7 @@ MODULES = (
     "test_deployment_application_rollback",
     "test_deployment_application_reinstallation",
     "test_deployment_application_accounts",
+    "test_deployment_account_inventory",
     "test_deployment_agnostic",
 )
 

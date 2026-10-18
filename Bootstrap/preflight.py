@@ -134,7 +134,7 @@ class NoNativeOperations:
 def preflight(private_root, manifest, kind='applications', include_candidate=False):
     if os.geteuid() == 0 or os.getegid() != os.geteuid():
         raise ValueError('unprivileged developer with matching file UID/GID required')
-    if kind not in ('deployment', 'applications') or type(include_candidate) is not bool:
+    if kind not in ('deployment', 'applications', 'accounts') or type(include_candidate) is not bool:
         raise ValueError('explicit supported preflight selection required')
     release = module('release')
     namespace, software = shipped_library()
@@ -159,6 +159,8 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
             original = namespace['deployment_read'](manifest)
             planner = namespace['publication_plan'] if kind == 'deployment' else namespace['application_publication_plan']
             digest, contents = planner(original, namespace['bundle'])
+            account_observation = (namespace['account_inventory_observe'](json.loads(contents['candidate.json'])['files'])
+                                   if kind == 'accounts' else None)
             if namespace['deployment_read'](manifest) != original:
                 raise ValueError('preflight original manifest changed')
             if release.identity(os.fstat(root)) != release.identity(before):
@@ -180,6 +182,8 @@ def preflight(private_root, manifest, kind='applications', include_candidate=Fal
         if include_candidate:
             result['candidate'] = json.loads(contents['candidate.json'])
             result['publication'] = json.loads(contents['publication.json'])
+        if account_observation is not None:
+            result['account_observation'] = account_observation
     return result
 
 
@@ -187,7 +191,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, help='existing private developer root, never /')
     parser.add_argument('--manifest', required=True, help='logical absolute path inside the private root')
-    parser.add_argument('--kind', choices=('deployment', 'applications'), default='applications')
+    parser.add_argument('--kind', choices=('deployment', 'applications', 'accounts'), default='applications')
     parser.add_argument('--include-candidate', action='store_true', help='include candidate declarations and file text on stdout')
     args = parser.parse_args(argv)
     try:

@@ -54,6 +54,7 @@ __name__ = 's4_ssh_candidate_library'
 # @s4-include Deployment/database_correspondence.py
 # @s4-include Deployment/sava_policy.py
 # @s4-include Deployment/application_accounts.py
+# @s4-include Deployment/account_inventory.py
 # @s4-include Deployment/application_publication.py
 # @s4-include Deployment/application_installation.py
 # @s4-include Deployment/configuration_installation.py
