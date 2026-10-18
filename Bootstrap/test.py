@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests", "Web.Tests", "SSH.Tests", "Deployment.Tests")
 MODULES = (
     "test_bundle",
+    "test_release",
     "test_bootstrap",
     "test_package_admission",
     "test_update_staging",
