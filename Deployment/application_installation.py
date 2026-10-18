@@ -68,13 +68,22 @@ def application_installation_plan(data, ssh_producer):
     return digest, record, payloads
 
 
-def installation_directories(stack):
+def installation_profile(profile):
+    if profile is None:
+        return (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS)
+    if profile != CONFIG_INSTALL_DIRECTORIES:
+        raise ValueError('fixed installation directory profile required')
+    return profile
+
+
+def installation_directories(stack, profile=None):
+    destinations = installation_profile(profile)
     root = dep_os.open('/', DEP_OPEN | dep_os.O_DIRECTORY)
     stack.callback(dep_os.close, root)
     deployment_directory(dep_os.fstat(root))
     held = {'/': (root, dep_os.fstat(root))}
     links = []
-    for path in (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS):
+    for path in destinations:
         parent, prefix = root, ''
         for leaf in deployment_path(path):
             prefix += '/' + leaf
@@ -92,13 +101,13 @@ def installation_directories(stack):
             parent = child
         if dep_os.fstat(parent).st_gid != DEP_TRUSTED_UID:
             raise ValueError('root-group installation destination required')
-    state = held[APP_INSTALL_STATE][0]
+    state = held[destinations[0]][0]
     publication_private(dep_os.fstat(state), dep_os.fstat(state).st_dev)
     return held, links
 
 
-def installation_context(held, links):
-    mutable = (APP_INSTALL_STATE, APP_INSTALL_UNITS, APP_INSTALL_HELPERS, APP_INSTALL_SYSUSERS)
+def installation_context(held, links, profile=None):
+    mutable = installation_profile(profile)
     for path, (fd, before) in held.items():
         current = dep_os.fstat(fd)
         deployment_directory(current)
@@ -117,7 +126,7 @@ def installation_context(held, links):
         dep_os.close(fresh)
 
 
-def installation_leaf(parent, row, owned):
+def installation_leaf(parent, row, owned, private_prefix=False):
     try:
         before = dep_os.stat(row['leaf'], dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -148,7 +157,8 @@ def installation_leaf(parent, row, owned):
             reads.append(bytes(raw))
         if (reads[0] != reads[1] or len(reads[0]) != before.st_size
                 or not row['raw'].startswith(reads[0])
-                or (mode == row['mode'] and reads[0] != row['raw'])):
+                or (mode == row['mode'] and reads[0] != row['raw']
+                    and not (private_prefix and mode == 0o600))):
             raise ValueError('owned installation prefix/content mismatch')
         for current in (dep_os.fstat(fd), dep_os.stat(row['leaf'], dir_fd=parent, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(before):
@@ -196,15 +206,29 @@ def installation_write(parent, row, previous):
     return True
 
 
-def application_installation(data, ssh_producer):
-    # Library only: no normal/default/CLI path calls this write-capable function.
+def installation_apply(data, ssh_producer, configuration=False):
+    # Only the two fixed library wrappers select a profile; no supplied planner,
+    # paths or retained receipt can bypass fresh reconstruction before target IO.
+    if type(configuration) is not bool:
+        raise ValueError('fixed installation kind required')
     if dep_os.geteuid() != DEP_TRUSTED_UID:
-        raise ValueError('application-file installation requires root')
-    digest, record, rows = application_installation_plan(data, ssh_producer)
+        raise ValueError('owned-file installation requires root')
+    if configuration:
+        digest, record, rows = configuration_installation_plan(data, ssh_producer)
+        state_path, lock_bytes = CONFIG_INSTALL_STATE, CONFIG_INSTALL_LOCK
+    else:
+        digest, record, rows = application_installation_plan(data, ssh_producer)
+        state_path, lock_bytes = APP_INSTALL_STATE, APP_INSTALL_LOCK
     changed = 0
     with dep_context.ExitStack() as stack:
-        held, links = installation_directories(stack)
-        state = held[APP_INSTALL_STATE][0]
+        held, links = (installation_directories(stack, CONFIG_INSTALL_DIRECTORIES) if configuration
+                       else installation_directories(stack))
+        def check_context():
+            if configuration:
+                installation_context(held, links, CONFIG_INSTALL_DIRECTORIES)
+            else:
+                installation_context(held, links)
+        state = held[state_path][0]
         if not publication_entries(state) <= {'.installer.lock', 'installation.json'}:
             raise ValueError('foreign installation-state entries')
         try:
@@ -216,20 +240,20 @@ def application_installation(data, ssh_producer):
             owned = True
         # Admit ALL fixed destinations before even creating the cooperative lock.
         for row in rows:
-            installation_leaf(held[row['parent']][0], row, owned)
-        installation_context(held, links)
+            installation_leaf(held[row['parent']][0], row, owned, private_prefix=configuration)
+        check_context()
         try:
             dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)
         except FileNotFoundError:
-            publication_write(state, '.installer.lock', APP_INSTALL_LOCK)
-        publication_file(state, '.installer.lock', APP_INSTALL_LOCK)
+            publication_write(state, '.installer.lock', lock_bytes)
+        publication_file(state, '.installer.lock', lock_bytes)
         lock = dep_os.open('.installer.lock', DEP_OPEN, dir_fd=state)
         stack.callback(dep_os.close, lock)
         initial_lock = dep_os.fstat(lock)
         if deployment_identity(initial_lock) != deployment_identity(dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             raise ValueError('installer lock changed')
         pub_fcntl.flock(lock, pub_fcntl.LOCK_EX | pub_fcntl.LOCK_NB)
-        publication_file(state, '.installer.lock', APP_INSTALL_LOCK)
+        publication_file(state, '.installer.lock', lock_bytes)
         # Re-admit complete state and every leaf under the ordinary participant lock.
         if not publication_entries(state) <= {'.installer.lock', 'installation.json'}:
             raise ValueError('installation-state entries changed')
@@ -242,12 +266,12 @@ def application_installation(data, ssh_producer):
                 pass
             else:
                 raise ValueError('installation ownership appeared before lock')
-        previous = [installation_leaf(held[row['parent']][0], row, owned) for row in rows]
-        installation_context(held, links)
+        previous = [installation_leaf(held[row['parent']][0], row, owned, private_prefix=configuration) for row in rows]
+        check_context()
         if not owned:
             publication_write(state, 'installation.json', record)
         for row, old in zip(rows, previous):
-            installation_context(held, links)
+            check_context()
             changed += installation_write(held[row['parent']][0], row, old)
         for row in rows:
             parent = held[row['parent']][0]
@@ -267,13 +291,18 @@ def application_installation(data, ssh_producer):
         for current in (dep_os.fstat(lock), dep_os.stat('.installer.lock', dir_fd=state, follow_symlinks=False)):
             if deployment_identity(current) != deployment_identity(initial_lock):
                 raise ValueError('installer lock identity changed')
-        installation_context(held, links)
-    return {'scope': 'FIXED APPLICATION FILES ONLY; NO ACTIVATION',
+        check_context()
+    return {'scope': 'FIXED DEPLOYMENT CONFIGURATION FILES ONLY; NO ACTIVATION' if configuration else 'FIXED APPLICATION FILES ONLY; NO ACTIVATION',
             'publication_sha256': digest, 'installation_record_sha256': dep_hash.sha256(record).hexdigest(),
             'files': len(rows), 'changed_files': changed, 'checked_closes_completed': True,
             'file_and_directory_fsync_returned': True,
-            'authority': {name: False for name in APP_INSTALL_AUTHORITY},
-            'limits': ['Library is disconnected from CLI/defaults; operational authorization and target/native/lifecycle admission remain required.',
+            'authority': {name: False for name in (CONFIG_INSTALL_AUTHORITY if configuration else APP_INSTALL_AUTHORITY)},
+            'limits': CONFIG_INSTALL_LIMITS if configuration else ['Library is disconnected from CLI/defaults; operational authorization and target/native/lifecycle admission remain required.',
                        'All destination ancestry must already exist and be protected. Accounts, configuration, schema, systemd reload/enable/start and rollback are not supplied.',
                        'Exact ownership permits completion of known 0600 prefixes only; foreign, partial ownership records or changed plans refuse without deletion/overwrite.',
                        'Writes are sequential across files/directories, not pair/set atomic. Failures may leave files without success; no physical power-loss or concurrent-root/ABA guarantee.']}
+
+
+def application_installation(data, ssh_producer):
+    # Library only: no normal/default/CLI path calls this write-capable function.
+    return installation_apply(data, ssh_producer)
