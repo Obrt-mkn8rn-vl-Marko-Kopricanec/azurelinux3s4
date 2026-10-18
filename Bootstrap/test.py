@@ -12,6 +12,7 @@ TEST_DIRECTORIES = ("Bootstrap.Tests", "Packages.Tests", "Updates.Tests", "Web.T
 MODULES = (
     "test_bundle",
     "test_release",
+    "test_native_dependencies",
     "test_bootstrap",
     "test_package_admission",
     "test_update_staging",
