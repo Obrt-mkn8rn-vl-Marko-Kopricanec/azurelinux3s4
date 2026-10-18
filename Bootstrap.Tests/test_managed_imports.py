@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -30,7 +31,9 @@ class ManagedImportTests(fixture.ReleaseFixture):
         folder = Path(cls.material.name); folder.chmod(0o700)
         environment = {**IMPORTS.ENVIRONMENT, 'DOTNET_CLI_HOME': str(folder),
                        'DOTNET_SKIP_FIRST_TIME_EXPERIENCE': '1', 'DOTNET_NOLOGO': '1',
-                       'MSBUILDDISABLENODEREUSE': '1', 'DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE': 'true'}
+                       'MSBUILDDISABLENODEREUSE': '1', 'DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE': 'true',
+                       'NUGET_PACKAGES': os.environ.get('NUGET_PACKAGES', str(folder / 'packages'))}
+        cls.build_environment = environment
         records = []
 
         def run(command):
@@ -183,3 +186,27 @@ public static class InertImports
             else: row['implmap_rows'] += 1
             with self.subTest(fault=fault), self.assertRaises(ValueError):
                 IMPORTS.admit_result(fixture.encoded(bad), [self.assembly], contract)
+
+    def test_actual_analyzer_rejects_loading_process_and_filesystem_apis_without_running_them(self):
+        project = self.root / 'analyzer-model'; project.mkdir(mode=0o700)
+        for name in ('.editorconfig', 'ManagedImports.csproj', 'NuGet.Config', 'Program.cs', 'BannedSymbols.txt', 'packages.lock.json'):
+            (project / name).write_bytes((ROOT / 'ManagedImports' / name).read_bytes())
+        types = ('System.Reflection.Assembly', 'System.Runtime.Loader.AssemblyLoadContext',
+                 'System.Reflection.Emit.AssemblyBuilder', 'System.Runtime.InteropServices.NativeLibrary',
+                 'System.Diagnostics.Process', 'System.IO.File', 'System.IO.Directory', 'System.IO.FileStream')
+        source = 'namespace S4.ManagedImports;\ninternal static class ForbiddenProbe\n{\n    internal static System.Type[] Types() => [\n'
+        source += ',\n'.join('        typeof(' + name + ')' for name in types) + '\n    ];\n}\n'
+        (project / 'ForbiddenProbe.cs').write_text(source)
+        command = [IMPORTS.DOTNET, 'build', str(project / 'ManagedImports.csproj'), '--configuration', 'Release',
+                   '--artifacts-path', str(project / 'build'), '--disable-build-servers', '--nologo',
+                   '-p:RestoreConfigFile=' + str(project / 'NuGet.Config'), '-p:NuGetAudit=false']
+        child = subprocess.run(command, capture_output=True, timeout=120, env=self.build_environment)
+        self.assertEqual(child.returncode, 1, child.stdout + child.stderr)
+        self.assertIn(b'Build FAILED.', child.stdout); self.assertNotIn(b'Build succeeded.', child.stdout)
+        diagnostics = {line for line in child.stdout.decode().splitlines() if 'error RS0030:' in line}
+        self.assertEqual(len(diagnostics), 8, child.stdout.decode())
+        self.assertEqual({int(re.search(r'ForbiddenProbe.cs\((\d+),', line)[1]) for line in diagnostics}, set(range(5, 13)))
+        self.assertNotIn(b'AD0001', child.stdout + child.stderr)
+        CAPTURES.append({'method': self._testMethodName, 'scope': 'EXPECTED FAILED COMPILATION OF INERT OWNED BANNED-API SOURCE',
+                         'source': source, 'command': command, 'actual_returncode': child.returncode,
+                         'stdout_hex': child.stdout.hex(), 'stderr_hex': child.stderr.hex(), 'unique_banned_api_errors': 8})

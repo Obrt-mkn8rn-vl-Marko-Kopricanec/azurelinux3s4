@@ -1,0 +1,3 @@
+[*.cs]
+dotnet_diagnostic.RS0030.severity = error
+dotnet_diagnostic.AD0001.severity = error

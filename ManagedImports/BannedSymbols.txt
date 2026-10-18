@@ -1,0 +1,9 @@
+// The helper inspects trusted bytes through metadata APIs only.
+T:System.Reflection.Assembly;Do not load or execute input assemblies.
+T:System.Runtime.Loader.AssemblyLoadContext;Do not load input assemblies or resolve their dependencies.
+T:System.Reflection.Emit.AssemblyBuilder;Do not emit or execute dynamic assemblies.
+T:System.Runtime.InteropServices.NativeLibrary;Do not resolve or call native libraries from metadata.
+T:System.Diagnostics.Process;Do not launch subprocesses from the metadata helper.
+T:System.IO.File;Input is framed standard input; do not open caller-controlled paths.
+T:System.IO.Directory;Do not inspect or modify filesystem namespaces from the helper.
+T:System.IO.FileStream;Input is framed standard input; do not open caller-controlled paths.

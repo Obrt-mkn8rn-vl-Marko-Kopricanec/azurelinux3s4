@@ -13,5 +13,14 @@
     <UseAppHost>false</UseAppHost>
     <DebugType>none</DebugType>
     <Deterministic>true</Deterministic>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Meziantou.Analyzer" Version="[3.0.307]" PrivateAssets="all" IncludeAssets="analyzers;build;buildtransitive" />
+    <PackageReference Include="Roslynator.Analyzers" Version="[5.0.1]" PrivateAssets="all" IncludeAssets="analyzers;build;buildtransitive" />
+    <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="[18.12.1]" PrivateAssets="all" IncludeAssets="analyzers;build;buildtransitive" />
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="[5.6.0]" PrivateAssets="all" IncludeAssets="analyzers;build;buildtransitive" />
+    <AdditionalFiles Include="BannedSymbols.txt" />
+  </ItemGroup>
 </Project>
