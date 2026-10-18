@@ -176,15 +176,16 @@ def closure(objects, providers, plan, roles):
     return output
 
 
-def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256, symbols=False, hashes=False):
-    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
+def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256, symbols=False, hashes=False, relocations=False):
+    if (type(symbols) is not bool or type(hashes) is not bool or type(relocations) is not bool
+            or hashes and not symbols or relocations and not hashes):
         raise ValueError('explicit dynamic symbol comparison selection required')
     if os.geteuid() == 0 or os.geteuid() != os.getegid():
         raise ValueError('unprivileged developer with matching UID/GID required')
     if type(providers_sha256) is not str or not re.fullmatch('[0-9a-f]{64}', providers_sha256):
         raise ValueError('explicit complete provider manifest SHA256 required')
     contract = RELEASE.contracts()
-    original = NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes)
+    original = NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes, relocations)
     with contextlib.ExitStack() as stack:
         links = []
         root = RELEASE.anchor(stack, RELEASE.absolute(providers), links)
@@ -207,14 +208,14 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
             if data[:2] != (row['bytes'], row['sha256']):
                 raise ValueError('complete provider file commitment mismatch')
             objects[name] = {'bytes': data[0], 'sha256': data[1], 'identity': list(identity),
-                             **NATIVE.elf_declarations(data[2], symbols, hashes)}
+                             **NATIVE.elf_declarations(data[2], symbols, hashes, relocations)}
             object_bytes += len(json.dumps(objects[name]))
             if object_bytes > NATIVE.REPORT_LIMIT:
                 raise ValueError('provider declaration report bound')
         selected = closure(original['objects'], objects, plan, contract['REL_PROGRAMS'][app])
         symbol_rows = (NATIVE.SYMBOLS.availability(selected, original['objects'], objects, plan['bindings'])
                        if symbols else None)
-        if NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes) != original:
+        if NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes, relocations) != original:
             raise ValueError('complete release changed during provider comparison')
         for name, row in files.items():
             with RELEASE.parent_for(root, name) as (parent, leaf):
@@ -256,6 +257,10 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
         result['checks']['complete_sysv_gnu_hash_tables_and_export_reachability'] = True
         result['limits'][2] = result['limits'][2].replace('Hash tables, relocations,',
             'Declared SysV/GNU name hashes, chains, bloom bits and export reachability are checked. Relocations,')
+    if relocations:
+        result['scope'] = 'OFFLINE EXPLICIT ELF PROVIDER, SYMBOL, HASH AND RELOCATION DECLARATIONS'
+        result['checks']['complete_supported_relocation_records_and_initial_write_ranges'] = True
+        result['limits'].append('Supported x86-64 RELA/PLT/RELR records and their initial writable/nonexecutable destination ranges are checked. No relocation is applied, no runtime arithmetic/overflow/TLS layout/resolver or actual binding is established; COPY/REL/text/composed or unknown relocation profiles refuse.')
     if len(json.dumps(result)) > NATIVE.REPORT_LIMIT:
         raise ValueError('native closure report bound')
     return result
@@ -267,10 +272,12 @@ def main(argv=None):
         parser.add_argument('--'+name, required=True)
     parser.add_argument('--symbols', action='store_true', help='compare complete dynamic symbol/version declarations in explicit providers')
     parser.add_argument('--hash-tables', action='store_true', help='validate complete SysV/GNU lookup metadata; implies --symbols')
+    parser.add_argument('--relocations', action='store_true', help='inspect supported x86-64 RELA/RELR declarations; implies symbols and hash tables')
     args = parser.parse_args(argv)
     try:
         result = audit(args.app, args.commit, args.tree, args.manifest_sha256, args.release,
-                       args.providers, args.providers_sha256, args.symbols or args.hash_tables, args.hash_tables)
+                       args.providers, args.providers_sha256, args.symbols or args.hash_tables or args.relocations,
+                       args.hash_tables or args.relocations, args.relocations)
     except (OSError, ValueError, TypeError, AttributeError, KeyError, MemoryError, RecursionError,
             OverflowError, UnicodeError, struct.error):
         print('Native provider closure refused', file=sys.stderr)

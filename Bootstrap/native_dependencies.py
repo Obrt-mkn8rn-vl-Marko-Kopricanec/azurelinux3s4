@@ -24,6 +24,9 @@ VERSION_SPEC.loader.exec_module(VERSIONS)
 SYMBOL_SPEC = importlib.util.spec_from_file_location('elf_symbol_declarations', Path(__file__).with_name('elf_symbols.py'))
 SYMBOLS = importlib.util.module_from_spec(SYMBOL_SPEC)
 SYMBOL_SPEC.loader.exec_module(SYMBOLS)
+RELOC_SPEC = importlib.util.spec_from_file_location('elf_relocation_declarations', Path(__file__).with_name('elf_relocations.py'))
+RELOCATIONS = importlib.util.module_from_spec(RELOC_SPEC)
+RELOC_SPEC.loader.exec_module(RELOCATIONS)
 ELF_LIMIT = 256 * 1024 * 1024
 PROGRAM_HEADERS = 1024
 DYNAMIC_ENTRIES = 8192
@@ -50,8 +53,9 @@ def text_at(data, offset):
     return data[offset:end].decode('ascii')
 
 
-def elf_declarations(data, symbols=False, hashes=False):
-    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
+def elf_declarations(data, symbols=False, hashes=False, relocations=False):
+    if (type(symbols) is not bool or type(hashes) is not bool or type(relocations) is not bool
+            or hashes and not symbols or relocations and not hashes):
         raise ValueError('explicit dynamic symbol inspection selection required')
     if type(data) is not bytes or not 64 <= len(data) <= ELF_LIMIT:
         raise ValueError('bounded complete ELF bytes required')
@@ -72,7 +76,7 @@ def elf_declarations(data, symbols=False, hashes=False):
         if ptype == 1:
             if (size > memory or (align not in (0, 1) and (align & (align - 1) or address % align != offset % align))):
                 raise ValueError('unsupported ELF load segment bounds or alignment')
-            loads.append({'offset': offset, 'address': address, 'bytes': size, 'flags': flags})
+            loads.append({'offset': offset, 'address': address, 'bytes': size, 'memory': memory, 'flags': flags})
         elif ptype == 2:
             dynamic.append((offset, address, size))
         elif ptype == 3:
@@ -150,9 +154,12 @@ def elf_declarations(data, symbols=False, hashes=False):
     if symbols:
         result['dynamic_symbols'] = SYMBOLS.declarations(data, tags, strings, file_offset, text_at,
             result['version_requirements'], result['version_definitions'], hashes)
+    if relocations:
+        result['relocations'] = RELOCATIONS.declarations(data,tags,file_offset,loads,
+                                                       result['dynamic_symbols']['symbols'])
     result['other_dynamic_tags'] = sorted(tag for tag in tags if tag not in
         {*selected, 1, 0x7ffffffd, *VERSIONS.VERSION_TAGS, *(SYMBOLS.TAGS if symbols else ()),
-         *(SYMBOLS.HASHES.TAGS if hashes else ())})
+         *(SYMBOLS.HASHES.TAGS if hashes else ()), *(RELOCATIONS.TAGS if relocations else ())})
     return result
 
 
@@ -182,8 +189,9 @@ def dependency_inventory(objects):
     return dependencies
 
 
-def report(app, commit, tree, manifest_sha256, path, symbols=False, hashes=False):
-    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
+def report(app, commit, tree, manifest_sha256, path, symbols=False, hashes=False, relocations=False):
+    if (type(symbols) is not bool or type(hashes) is not bool or type(relocations) is not bool
+            or hashes and not symbols or relocations and not hashes):
         raise ValueError('explicit dynamic symbol inspection selection required')
     contract = RELEASE.contracts()
     if (app not in contract['REL_PROGRAMS']
@@ -212,7 +220,7 @@ def report(app, commit, tree, manifest_sha256, path, symbols=False, hashes=False
                 full, _ = RELEASE.read_file(parent, leaf, ELF_LIMIT, capture=True, expected=before[name])
                 if full[:2] != prefix[:2]:
                     raise ValueError('ELF bytes changed before inspection')
-                objects[name] = {'bytes': full[0], 'sha256': full[1], **elf_declarations(full[2], symbols, hashes)}
+                objects[name] = {'bytes': full[0], 'sha256': full[1], **elf_declarations(full[2], symbols, hashes, relocations)}
                 total += len(json.dumps(objects[name]))
                 if total > REPORT_LIMIT:
                     raise ValueError('native inventory object byte bound')
@@ -244,6 +252,9 @@ def report(app, commit, tree, manifest_sha256, path, symbols=False, hashes=False
     if hashes:
         result['scope'] = 'OFFLINE ELF SYMBOL AND HASH-TABLE DECLARATION CORRESPONDENCE'
         result['limits'][0] = 'Complete selected SysV/GNU hash tables, name hashes, bounded chains, GNU bloom bits and declared export reachability are checked as DATA. No native lookup, relocation or runtime binding is executed.'
+    if relocations:
+        result['scope'] = 'OFFLINE ELF SYMBOL, HASH AND RELOCATION DECLARATIONS'
+        result['limits'][0] += ' Supported complete x86-64 RELA/PLT/RELR records, typed symbol references and nonoverlapping initially writable/nonexecutable destination ranges are inspected; relocations are not applied.'
     if len(json.dumps(result)) > REPORT_LIMIT:
         raise ValueError('complete native inventory byte bound')
     return result
@@ -255,10 +266,12 @@ def main(argv=None):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--symbols', action='store_true', help='require complete section-backed dynamic symbol and VERSYM declarations')
     parser.add_argument('--hash-tables', action='store_true', help='also validate complete SysV/GNU hash tables; implies --symbols')
+    parser.add_argument('--relocations', action='store_true', help='inspect supported x86-64 RELA/RELR records; implies symbols and hash tables')
     args = parser.parse_args(argv)
     try:
         value = report(args.app, args.commit, args.tree, args.manifest_sha256, args.release,
-                       args.symbols or args.hash_tables, args.hash_tables)
+                       args.symbols or args.hash_tables or args.relocations,
+                       args.hash_tables or args.relocations, args.relocations)
     except (OSError, ValueError, TypeError, KeyError, MemoryError, RecursionError, OverflowError, struct.error):
         print('Native dependency inventory refused', file=sys.stderr)
         return 75
