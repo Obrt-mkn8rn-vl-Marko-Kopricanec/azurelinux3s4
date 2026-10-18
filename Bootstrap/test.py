@@ -15,6 +15,7 @@ MODULES = (
     "test_release_attestation",
     "test_application_attestations",
     "test_native_dependencies",
+    "test_native_closure",
     "test_tls_inputs",
     "test_email_tls_preflight",
     "test_unit_preflight",
