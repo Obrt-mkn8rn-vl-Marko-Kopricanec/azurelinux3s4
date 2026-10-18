@@ -176,13 +176,15 @@ def closure(objects, providers, plan, roles):
     return output
 
 
-def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256):
+def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256, symbols=False):
+    if type(symbols) is not bool:
+        raise ValueError('explicit dynamic symbol comparison selection required')
     if os.geteuid() == 0 or os.geteuid() != os.getegid():
         raise ValueError('unprivileged developer with matching UID/GID required')
     if type(providers_sha256) is not str or not re.fullmatch('[0-9a-f]{64}', providers_sha256):
         raise ValueError('explicit complete provider manifest SHA256 required')
     contract = RELEASE.contracts()
-    original = NATIVE.report(app, commit, tree, manifest_sha256, release)
+    original = NATIVE.report(app, commit, tree, manifest_sha256, release, symbols)
     with contextlib.ExitStack() as stack:
         links = []
         root = RELEASE.anchor(stack, RELEASE.absolute(providers), links)
@@ -205,12 +207,14 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
             if data[:2] != (row['bytes'], row['sha256']):
                 raise ValueError('complete provider file commitment mismatch')
             objects[name] = {'bytes': data[0], 'sha256': data[1], 'identity': list(identity),
-                             **NATIVE.elf_declarations(data[2])}
+                             **NATIVE.elf_declarations(data[2], symbols)}
             object_bytes += len(json.dumps(objects[name]))
             if object_bytes > NATIVE.REPORT_LIMIT:
                 raise ValueError('provider declaration report bound')
         selected = closure(original['objects'], objects, plan, contract['REL_PROGRAMS'][app])
-        if NATIVE.report(app, commit, tree, manifest_sha256, release) != original:
+        symbol_rows = (NATIVE.SYMBOLS.availability(selected, original['objects'], objects, plan['bindings'])
+                       if symbols else None)
+        if NATIVE.report(app, commit, tree, manifest_sha256, release, symbols) != original:
             raise ValueError('complete release changed during provider comparison')
         for name, row in files.items():
             with RELEASE.parent_for(root, name) as (parent, leaf):
@@ -237,6 +241,16 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
                              'Strong GNU version names and canonical ELF hashes must be present in the chosen provider. Missing weak versions are reported. This intentionally refuses unversioned providers for strong requirements, although some native loaders may allow them with diagnostics.',
                              'No dynamic symbol tables, VERSYM/relocations, symbol interposition, IFUNC/CPU features, constructors or ABI implementation are validated. dlopen/.NET PInvoke/ICU/OpenSSL/provider-selected objects can lie outside DT_NEEDED.',
                              'Complete private source bytes/modes are pinned and reread, not authenticated as vendor/build/installed objects. No ldd, loader, subprocess, object/application, manager, network, GPU or host operation executes. Sequential trusted-base observations retain non-atomic/ABA/finite-IO limits.']}
+    if symbols:
+        result['scope'] = 'OFFLINE EXPLICIT ELF PROVIDER AND SYMBOL DECLARATION AVAILABILITY'
+        result['symbol_requirements'] = symbol_rows
+        result['checks']['all_strong_named_symbol_requirements_have_candidates'] = True
+        result['limits'][2] = ('Complete section-backed dynamic symbols and VERSYM associations are compared as declarations. '
+            'Versioned imports require matching named/hash definitions in their explicitly bound library; unversioned imports '
+            'search all explicitly selected same-role objects. This overapproximates runtime scope and selects no winner. '
+            'Hidden/internal/local and nondefault-version definitions cannot satisfy unversioned external imports. '
+            'Missing weak symbols remain reported data. Hash tables, relocations, interposition, IFUNC/CPU features, '
+            'constructors and ABI implementation are not validated or executed.')
     if len(json.dumps(result)) > NATIVE.REPORT_LIMIT:
         raise ValueError('native closure report bound')
     return result
@@ -246,10 +260,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('app', 'commit', 'tree', 'manifest-sha256', 'release', 'providers', 'providers-sha256'):
         parser.add_argument('--'+name, required=True)
+    parser.add_argument('--symbols', action='store_true', help='compare complete dynamic symbol/version declarations in explicit providers')
     args = parser.parse_args(argv)
     try:
         result = audit(args.app, args.commit, args.tree, args.manifest_sha256, args.release,
-                       args.providers, args.providers_sha256)
+                       args.providers, args.providers_sha256, args.symbols)
     except (OSError, ValueError, TypeError, AttributeError, KeyError, MemoryError, RecursionError,
             OverflowError, UnicodeError, struct.error):
         print('Native provider closure refused', file=sys.stderr)
