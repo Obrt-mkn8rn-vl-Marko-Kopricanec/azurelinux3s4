@@ -18,6 +18,7 @@ MODULES = (
     "test_unit_preflight",
     "test_ssh_preflight",
     "test_postgresql_preflight",
+    "test_account_preflight",
     "test_preflight",
     "test_bootstrap",
     "test_package_admission",
