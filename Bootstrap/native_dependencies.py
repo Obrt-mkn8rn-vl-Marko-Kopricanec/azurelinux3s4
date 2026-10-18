@@ -18,6 +18,9 @@ import sys
 SPEC = importlib.util.spec_from_file_location('release_staging', Path(__file__).with_name('release.py'))
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
+VERSION_SPEC = importlib.util.spec_from_file_location('elf_version_declarations', Path(__file__).with_name('elf_versions.py'))
+VERSIONS = importlib.util.module_from_spec(VERSION_SPEC)
+VERSION_SPEC.loader.exec_module(VERSIONS)
 ELF_LIMIT = 256 * 1024 * 1024
 PROGRAM_HEADERS = 1024
 DYNAMIC_ENTRIES = 8192
@@ -98,6 +101,7 @@ def elf_declarations(data):
     result = {'kind': 'executable' if kind == 2 else 'shared-or-pie', 'machine': 'x86_64',
               'interpreter': interpreter, 'needed': [], 'soname': None, 'rpath': None, 'runpath': None,
               'filter': None, 'auxiliary': [], 'audit': None, 'depaudit': None,
+              'version_requirements': [], 'version_definitions': [],
               'executable_stack_declared': stacks[0] if stacks else None,
               'writable_executable_loads': sum(row['flags'] & 3 == 3 for row in loads),
               'relro_segment_declared': relro, 'dynamic': bool(dynamic), 'other_dynamic_tags': []}
@@ -134,7 +138,9 @@ def elf_declarations(data):
     result['auxiliary'] = [text_at(strings, value) for value in tags.get(0x7ffffffd, [])]
     if any(not name for name in result['needed'] + result['auxiliary']):
         raise ValueError('nonempty ELF library declarations required')
-    result['other_dynamic_tags'] = sorted(tag for tag in tags if tag not in {*selected, 1, 0x7ffffffd})
+    result['version_requirements'], result['version_definitions'] = VERSIONS.declarations(
+        data, tags, strings, file_offset, text_at)
+    result['other_dynamic_tags'] = sorted(tag for tag in tags if tag not in {*selected, 1, 0x7ffffffd, *VERSIONS.VERSION_TAGS})
     return result
 
 
@@ -154,6 +160,8 @@ def dependency_inventory(objects):
             row = {'object': name, 'needed': needed,
                    'bundled_name_matches': sorted(names.get((role, needed), [])) if literal else [],
                    'bundled_soname_matches': sorted(sonames.get((role, needed), [])) if literal else [],
+                   'version_requirements': [version for group in item['version_requirements']
+                                            if group['library'] == needed for version in group['versions']],
                    'loader_selection_proven': False}
             total += len(json.dumps(row))
             if total > REPORT_LIMIT:
@@ -198,14 +206,20 @@ def report(app, commit, tree, manifest_sha256, path):
             raise ValueError('release changed during ELF inspection')
         RELEASE.check_links(links)
     dependencies = dependency_inventory(objects)
+    required_versions = {}
+    for item in objects.values():
+        for group in item['version_requirements']:
+            required_versions.setdefault(group['library'], set()).update(row['name'] for row in group['versions'])
     result = {'scope': 'OFFLINE ELF DEPENDENCY DECLARATIONS', 'application': app, 'declaration': declaration,
             'objects': objects, 'dependencies': dependencies,
+            'required_version_names': {name: sorted(versions) for name, versions in sorted(required_versions.items())},
             'no_bundled_filename': sorted({row['needed'] for row in dependencies if not row['bundled_name_matches']}),
             'interpreters': sorted({row['interpreter'] for row in objects.values() if row['interpreter']}),
             'authority': {'elf_executed': False, 'loader_resolution_proven': False, 'system_libraries_observed': False,
                           'symbol_versions_compatible': False, 'dynamic_loads_discovered': False,
                           'runtime_authenticated': False, 'application_usable': False, 'server_ready': False},
-            'limits': ['DT_NEEDED and optional interpreter/search/audit/filter declarations only; no relocation or symbol-version validation.',
+            'limits': ['DT_NEEDED, optional interpreter/search/audit/filter, and bounded GNU version requirement/definition declarations only; no relocation or symbol binding validation.',
+                       'Version names, stored hashes, indices and flags are data; no provider selection, hash-algorithm authenticity, version-definition availability or per-symbol VERSYM/ABI compatibility is established. Weak requirements are retained, not promoted to mandatory failures.',
                        'Filename/SONAME matches are same-role data candidates. RPATH/RUNPATH, environment, cache, preload and loader precedence are not evaluated.',
                        'dlopen, .NET NativeLibrary/PInvoke and runtime-selected ICU/OpenSSL or provider dependencies can add requirements absent from these declarations.',
                        'Whole release verification and ELF inspection use the same held tree; observations remain sequential and do not authenticate source/build/vendor or hostile concurrent mutation.']}

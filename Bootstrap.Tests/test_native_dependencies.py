@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 import test_deployment_releases as fixture
 
@@ -46,6 +47,78 @@ def elf(needed=('libc.so.6',), soname=None, interpreter=None, runpath='$ORIGIN')
     data[512:512 + len(dynamic)] = dynamic
     data[1024:1024 + len(strings)] = strings
     return bytes(data)
+
+
+def versioned_elf():
+    data = bytearray(elf()) + bytearray(2048)
+    strings = bytearray(b'\0')
+    offsets = {}
+    for name in ('libc.so.6', 'libstdc++.so.6', 'libsample.so', 'GLIBC_2.2.5',
+                 'GLIBC_2.34', 'GLIBCXX_3.4.26', 'DEMO_1.0', 'DEMO_0.9'):
+        offsets[name] = len(strings); strings.extend(name.encode() + b'\0')
+    tags = [(1, offsets['libc.so.6']), (1, offsets['libstdc++.so.6']), (14, offsets['libsample.so']),
+            (5, 0x400400), (10, len(strings)), (0x6ffffffe, 0x400800), (0x6fffffff, 2),
+            (0x6ffffffc, 0x400900), (0x6ffffffd, 2), (0, 0)]
+    dynamic = b''.join(struct.pack('<qQ', *row) for row in tags)
+    struct.pack_into('<QQ', data, 64 + 32, len(data), len(data))
+    struct.pack_into('<QQ', data, 120 + 32, len(dynamic), len(dynamic))
+    data[512:512 + len(dynamic)] = dynamic
+    data[1024:1024 + len(strings)] = strings
+    struct.pack_into('<HHIII', data, 2048, 1, 2, offsets['libc.so.6'], 16, 48)
+    struct.pack_into('<IHHII', data, 2064, 0x12, 0, 2, offsets['GLIBC_2.2.5'], 16)
+    struct.pack_into('<IHHII', data, 2080, 0x34, 2, 0x8003, offsets['GLIBC_2.34'], 0)
+    struct.pack_into('<HHIII', data, 2096, 1, 1, offsets['libstdc++.so.6'], 16, 0)
+    struct.pack_into('<IHHII', data, 2112, 0x56, 0, 4, offsets['GLIBCXX_3.4.26'], 0)
+    struct.pack_into('<HHHHIII', data, 2304, 1, 1, 1, 1, 0x78, 20, 28)
+    struct.pack_into('<II', data, 2324, offsets['libsample.so'], 0)
+    struct.pack_into('<HHHHIII', data, 2332, 1, 0, 2, 2, 0x9a, 20, 0)
+    struct.pack_into('<II', data, 2352, offsets['DEMO_1.0'], 8)
+    struct.pack_into('<II', data, 2360, offsets['DEMO_0.9'], 0)
+    return bytes(data)
+
+
+class ElfVersionTests(unittest.TestCase):
+    def test_requirements_definitions_weak_flags_and_dependency_binding_preserve_declarations(self):
+        value = NATIVE.elf_declarations(versioned_elf())
+        needs = value['version_requirements']
+        self.assertEqual([row['library'] for row in needs], ['libc.so.6', 'libstdc++.so.6'])
+        self.assertEqual([row['name'] for row in needs[0]['versions']], ['GLIBC_2.2.5', 'GLIBC_2.34'])
+        self.assertEqual(needs[0]['versions'][1], {'name': 'GLIBC_2.34', 'hash': 0x34,
+                         'flags': 2, 'weak': True, 'index': 3, 'hidden_index_bit': True})
+        self.assertTrue(value['version_definitions'][0]['base'])
+        self.assertEqual(value['version_definitions'][1]['name'], 'DEMO_1.0')
+        self.assertEqual(value['version_definitions'][1]['parents'], ['DEMO_0.9'])
+        rows = NATIVE.dependency_inventory({'application/app': value})
+        self.assertEqual(rows[0]['version_requirements'], needs[0]['versions'])
+        self.assertEqual(rows[1]['version_requirements'], needs[1]['versions'])
+        self.assertTrue(all(row['loader_selection_proven'] is False for row in rows))
+        self.assertEqual(NATIVE.elf_declarations(elf())['version_requirements'], [])
+
+    def test_late_auxiliary_malformed_ranges_and_chain_counts_refuse(self):
+        original = versioned_elf()
+        for offset, layout, value in (
+            (2048, '<H', 2), (2048 + 2, '<H', 0), (2048 + 8, '<I', 12),
+            (2048 + 12, '<I', 0), (2080 + 12, '<I', 16), (2112 + 8, '<I', 0xffffffff),
+            (2096 + 8, '<I', 0xfffffff0), (2332 + 6, '<H', 3),
+            (2352 + 4, '<I', 4), (2360 + 4, '<I', 8),
+        ):
+            with self.subTest(offset=offset, value=value):
+                changed = bytearray(original); struct.pack_into(layout, changed, offset, value)
+                with self.assertRaises(ValueError): NATIVE.elf_declarations(bytes(changed))
+        with patch.object(NATIVE.VERSIONS, 'RECORD_LIMIT', 3):
+            with self.assertRaisesRegex(ValueError, 'bounded aligned'):
+                NATIVE.elf_declarations(original)
+
+    def test_missing_duplicate_excessive_or_unmapped_dynamic_table_pairs_refuse(self):
+        original = versioned_elf()
+        for offset, layout, value in (
+            (512 + 6 * 16, '<q', 21), (512 + 8 * 16, '<q', 0x6fffffff),
+            (512 + 6 * 16 + 8, '<Q', 0), (512 + 8 * 16 + 8, '<Q', 1025),
+            (512 + 5 * 16 + 8, '<Q', 0x500000), (512 + 7 * 16 + 8, '<Q', 0x400901),
+        ):
+            with self.subTest(offset=offset, value=value):
+                changed = bytearray(original); struct.pack_into(layout, changed, offset, value)
+                with self.assertRaises(ValueError): NATIVE.elf_declarations(bytes(changed))
 
 
 class ElfDeclarationTests(unittest.TestCase):
