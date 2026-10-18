@@ -73,7 +73,7 @@ def envelope(raw, app, commit, tree, manifest_sha256, key_sha256, minimum_sequen
 
 
 def audit(app, commit, tree, manifest_sha256, release, attestation, signature, public_key,
-          public_key_sha256, openssl_sha256, minimum_sequence, at=None):
+          public_key_sha256, openssl_sha256, minimum_sequence, at=None, expected_sources=None):
     if os.geteuid() == 0 or os.geteuid() != os.getegid():
         raise ValueError('unprivileged developer with matching UID/GID required')
     if type(public_key_sha256) is not str or not re.fullmatch('[0-9a-f]{64}', public_key_sha256):
@@ -89,6 +89,9 @@ def audit(app, commit, tree, manifest_sha256, release, attestation, signature, p
             raise ValueError('original release manifest changed')
         captured = {name: INPUTS.private_input(stack, links, path) for name, path in
                     (('attestation', attestation), ('signature', signature), ('public_key', public_key))}
+        commitments = {name: {'bytes': row[2][0], 'sha256': row[2][1]} for name, row in captured.items()}
+        if expected_sources is not None and expected_sources != commitments:
+            raise ValueError('attestation inputs differ from the complete preflight source commitments')
         raw = captured['attestation'][2][2]; key = captured['public_key'][2][2]; signed = captured['signature'][2][2]
         if (len(key) != len(ED25519_SPKI) + 32 or not key.startswith(ED25519_SPKI)
                 or hashlib.sha256(key).hexdigest() != public_key_sha256 or len(signed) != 64):
@@ -122,6 +125,7 @@ def audit(app, commit, tree, manifest_sha256, release, attestation, signature, p
                   'declaration': before['declaration'], 'files': before['files'], 'payload_bytes': before['payload_bytes'],
                   'attestation': selected, 'evaluation_unix_seconds': current, 'explicit_time_supplied': at is not None,
                   'minimum_sequence': minimum_sequence, 'signed_message_bytes': len(message),
+                  'source_commitments_supplied': expected_sources is not None,
                   'signed_message_sha256': hashlib.sha256(message).hexdigest(),
                   'sources': {name: {'bytes': row[2][0], 'sha256': row[2][1], 'identity': list(row[3])}
                               for name,row in captured.items()},

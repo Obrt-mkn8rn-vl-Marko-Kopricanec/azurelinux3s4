@@ -13,6 +13,7 @@ MODULES = (
     "test_bundle",
     "test_release",
     "test_release_attestation",
+    "test_application_attestations",
     "test_native_dependencies",
     "test_tls_inputs",
     "test_email_tls_preflight",
