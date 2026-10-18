@@ -20,6 +20,7 @@ MODULES = (
     "test_native_symbols",
     "test_native_hashes",
     "test_native_relocations",
+    "test_managed_imports",
     "test_tls_inputs",
     "test_email_tls_preflight",
     "test_dns_key_preflight",

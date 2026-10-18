@@ -33,4 +33,6 @@ Thumbs.db
 /out/
 /artifacts/
 /coverage/
+**/bin/
+**/obj/
 __pycache__/
