@@ -33,22 +33,7 @@ def module(name):
 PREFLIGHT = module('preflight')
 INPUTS = module('tls_inputs')
 RELEASE = INPUTS.RELEASE
-
-
-def der(raw, offset, tag):
-    if type(raw) is not bytes or not 0 <= offset < len(raw)-1 or raw[offset] != tag:
-        raise ValueError('complete canonical DNS key DER tag required')
-    size = raw[offset+1]; start = offset+2
-    if size & 0x80:
-        count = size & 0x7f
-        if not 1 <= count <= 2 or start+count > len(raw) or raw[start] == 0:
-            raise ValueError('bounded minimal DNS key DER length required')
-        size = int.from_bytes(raw[start:start+count], 'big'); start += count
-        if size < 128 or count == 2 and size < 256:
-            raise ValueError('nonminimal DNS key DER length')
-    if start+size > len(raw):
-        raise ValueError('incomplete DNS key DER content')
-    return raw[start:start+size], start+size
+der = module('key_formats').der
 
 
 def pkcs8(raw):

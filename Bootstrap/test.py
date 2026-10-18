@@ -19,6 +19,7 @@ MODULES = (
     "test_tls_inputs",
     "test_email_tls_preflight",
     "test_dns_key_preflight",
+    "test_email_key_preflight",
     "test_unit_preflight",
     "test_ssh_preflight",
     "test_postgresql_preflight",
