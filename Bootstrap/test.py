@@ -13,6 +13,7 @@ MODULES = (
     "test_bundle",
     "test_release",
     "test_native_dependencies",
+    "test_preflight",
     "test_bootstrap",
     "test_package_admission",
     "test_update_staging",
