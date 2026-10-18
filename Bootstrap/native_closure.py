@@ -176,15 +176,15 @@ def closure(objects, providers, plan, roles):
     return output
 
 
-def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256, symbols=False):
-    if type(symbols) is not bool:
+def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha256, symbols=False, hashes=False):
+    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
         raise ValueError('explicit dynamic symbol comparison selection required')
     if os.geteuid() == 0 or os.geteuid() != os.getegid():
         raise ValueError('unprivileged developer with matching UID/GID required')
     if type(providers_sha256) is not str or not re.fullmatch('[0-9a-f]{64}', providers_sha256):
         raise ValueError('explicit complete provider manifest SHA256 required')
     contract = RELEASE.contracts()
-    original = NATIVE.report(app, commit, tree, manifest_sha256, release, symbols)
+    original = NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes)
     with contextlib.ExitStack() as stack:
         links = []
         root = RELEASE.anchor(stack, RELEASE.absolute(providers), links)
@@ -207,14 +207,14 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
             if data[:2] != (row['bytes'], row['sha256']):
                 raise ValueError('complete provider file commitment mismatch')
             objects[name] = {'bytes': data[0], 'sha256': data[1], 'identity': list(identity),
-                             **NATIVE.elf_declarations(data[2], symbols)}
+                             **NATIVE.elf_declarations(data[2], symbols, hashes)}
             object_bytes += len(json.dumps(objects[name]))
             if object_bytes > NATIVE.REPORT_LIMIT:
                 raise ValueError('provider declaration report bound')
         selected = closure(original['objects'], objects, plan, contract['REL_PROGRAMS'][app])
         symbol_rows = (NATIVE.SYMBOLS.availability(selected, original['objects'], objects, plan['bindings'])
                        if symbols else None)
-        if NATIVE.report(app, commit, tree, manifest_sha256, release, symbols) != original:
+        if NATIVE.report(app, commit, tree, manifest_sha256, release, symbols, hashes) != original:
             raise ValueError('complete release changed during provider comparison')
         for name, row in files.items():
             with RELEASE.parent_for(root, name) as (parent, leaf):
@@ -251,6 +251,11 @@ def audit(app, commit, tree, manifest_sha256, release, providers, providers_sha2
             'Hidden/internal/local and nondefault-version definitions cannot satisfy unversioned external imports. '
             'Missing weak symbols remain reported data. Hash tables, relocations, interposition, IFUNC/CPU features, '
             'constructors and ABI implementation are not validated or executed.')
+    if hashes:
+        result['scope'] = 'OFFLINE EXPLICIT ELF SYMBOL CANDIDATES WITH HASH-TABLE CORRESPONDENCE'
+        result['checks']['complete_sysv_gnu_hash_tables_and_export_reachability'] = True
+        result['limits'][2] = result['limits'][2].replace('Hash tables, relocations,',
+            'Declared SysV/GNU name hashes, chains, bloom bits and export reachability are checked. Relocations,')
     if len(json.dumps(result)) > NATIVE.REPORT_LIMIT:
         raise ValueError('native closure report bound')
     return result
@@ -261,10 +266,11 @@ def main(argv=None):
     for name in ('app', 'commit', 'tree', 'manifest-sha256', 'release', 'providers', 'providers-sha256'):
         parser.add_argument('--'+name, required=True)
     parser.add_argument('--symbols', action='store_true', help='compare complete dynamic symbol/version declarations in explicit providers')
+    parser.add_argument('--hash-tables', action='store_true', help='validate complete SysV/GNU lookup metadata; implies --symbols')
     args = parser.parse_args(argv)
     try:
         result = audit(args.app, args.commit, args.tree, args.manifest_sha256, args.release,
-                       args.providers, args.providers_sha256, args.symbols)
+                       args.providers, args.providers_sha256, args.symbols or args.hash_tables, args.hash_tables)
     except (OSError, ValueError, TypeError, AttributeError, KeyError, MemoryError, RecursionError,
             OverflowError, UnicodeError, struct.error):
         print('Native provider closure refused', file=sys.stderr)

@@ -50,8 +50,8 @@ def text_at(data, offset):
     return data[offset:end].decode('ascii')
 
 
-def elf_declarations(data, symbols=False):
-    if type(symbols) is not bool:
+def elf_declarations(data, symbols=False, hashes=False):
+    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
         raise ValueError('explicit dynamic symbol inspection selection required')
     if type(data) is not bytes or not 64 <= len(data) <= ELF_LIMIT:
         raise ValueError('bounded complete ELF bytes required')
@@ -149,9 +149,10 @@ def elf_declarations(data, symbols=False):
         data, tags, strings, file_offset, text_at)
     if symbols:
         result['dynamic_symbols'] = SYMBOLS.declarations(data, tags, strings, file_offset, text_at,
-            result['version_requirements'], result['version_definitions'])
+            result['version_requirements'], result['version_definitions'], hashes)
     result['other_dynamic_tags'] = sorted(tag for tag in tags if tag not in
-        {*selected, 1, 0x7ffffffd, *VERSIONS.VERSION_TAGS, *(SYMBOLS.TAGS if symbols else ())})
+        {*selected, 1, 0x7ffffffd, *VERSIONS.VERSION_TAGS, *(SYMBOLS.TAGS if symbols else ()),
+         *(SYMBOLS.HASHES.TAGS if hashes else ())})
     return result
 
 
@@ -181,8 +182,8 @@ def dependency_inventory(objects):
     return dependencies
 
 
-def report(app, commit, tree, manifest_sha256, path, symbols=False):
-    if type(symbols) is not bool:
+def report(app, commit, tree, manifest_sha256, path, symbols=False, hashes=False):
+    if type(symbols) is not bool or type(hashes) is not bool or hashes and not symbols:
         raise ValueError('explicit dynamic symbol inspection selection required')
     contract = RELEASE.contracts()
     if (app not in contract['REL_PROGRAMS']
@@ -211,7 +212,7 @@ def report(app, commit, tree, manifest_sha256, path, symbols=False):
                 full, _ = RELEASE.read_file(parent, leaf, ELF_LIMIT, capture=True, expected=before[name])
                 if full[:2] != prefix[:2]:
                     raise ValueError('ELF bytes changed before inspection')
-                objects[name] = {'bytes': full[0], 'sha256': full[1], **elf_declarations(full[2], symbols)}
+                objects[name] = {'bytes': full[0], 'sha256': full[1], **elf_declarations(full[2], symbols, hashes)}
                 total += len(json.dumps(objects[name]))
                 if total > REPORT_LIMIT:
                     raise ValueError('native inventory object byte bound')
@@ -240,6 +241,9 @@ def report(app, commit, tree, manifest_sha256, path, symbols=False):
         result['scope'] = 'OFFLINE ELF DEPENDENCY AND DYNAMIC SYMBOL DECLARATIONS'
         result['limits'][0] = 'Complete selected dynamic symbol tables and per-symbol GNU version associations are DATA declarations; no hash lookup, relocation or symbol binding execution.'
         result['limits'][1] = 'The symbol profile requires complete matching nonextended section headers and dynamic tags. Names/types/visibility/version indices are inspected, not actual provider selection, ABI or runtime usability.'
+    if hashes:
+        result['scope'] = 'OFFLINE ELF SYMBOL AND HASH-TABLE DECLARATION CORRESPONDENCE'
+        result['limits'][0] = 'Complete selected SysV/GNU hash tables, name hashes, bounded chains, GNU bloom bits and declared export reachability are checked as DATA. No native lookup, relocation or runtime binding is executed.'
     if len(json.dumps(result)) > REPORT_LIMIT:
         raise ValueError('complete native inventory byte bound')
     return result
@@ -250,9 +254,11 @@ def main(argv=None):
     for name in ('app', 'commit', 'tree', 'manifest-sha256', 'release'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--symbols', action='store_true', help='require complete section-backed dynamic symbol and VERSYM declarations')
+    parser.add_argument('--hash-tables', action='store_true', help='also validate complete SysV/GNU hash tables; implies --symbols')
     args = parser.parse_args(argv)
     try:
-        value = report(args.app, args.commit, args.tree, args.manifest_sha256, args.release, args.symbols)
+        value = report(args.app, args.commit, args.tree, args.manifest_sha256, args.release,
+                       args.symbols or args.hash_tables, args.hash_tables)
     except (OSError, ValueError, TypeError, KeyError, MemoryError, RecursionError, OverflowError, struct.error):
         print('Native dependency inventory refused', file=sys.stderr)
         return 75

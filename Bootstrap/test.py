@@ -18,6 +18,7 @@ MODULES = (
     "test_native_dependencies",
     "test_native_closure",
     "test_native_symbols",
+    "test_native_hashes",
     "test_tls_inputs",
     "test_email_tls_preflight",
     "test_dns_key_preflight",

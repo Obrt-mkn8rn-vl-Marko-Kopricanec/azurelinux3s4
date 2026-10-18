@@ -5,6 +5,8 @@ dynamic tags. It does not implement hash lookup, relocation or loader scope.
 """
 
 import hashlib
+import importlib.util
+from pathlib import Path
 import struct
 
 
@@ -12,9 +14,12 @@ TAGS = {6, 11, 0x6ffffff0}
 SYMBOL_LIMIT = 65536
 TOTAL_LIMIT = 131072
 SECTION_LIMIT = 8192
+HASH_SPEC = importlib.util.spec_from_file_location('elf_symbol_hashes', Path(__file__).with_name('elf_hashes.py'))
+HASHES = importlib.util.module_from_spec(HASH_SPEC)
+HASH_SPEC.loader.exec_module(HASHES)
 
 
-def declarations(data,tags,strings,file_offset,text_at,requirements,definitions):
+def declarations(data,tags,strings,file_offset,text_at,requirements,definitions,hashes=False):
     if (len(tags.get(6,[]))!=1 or tags.get(11)!=[24] or len(tags.get(0x6ffffff0,[]))>1):
         raise ValueError('complete unique ELF dynamic symbol tags required')
     header=struct.unpack_from('<16sHHIQQQIHHHHHH',data)
@@ -92,10 +97,22 @@ def declarations(data,tags,strings,file_offset,text_at,requirements,definitions)
         symbols.append({'index':index,'name':label,'binding':binding,'type':kind,'visibility':other,
                         'section':section,'value':value,'size':length,'version_index':version_index,
                         'version_hidden':hidden,'version':version})
-    return {'count':symbol_count,'local_count':local_count,
+    result={'count':symbol_count,'local_count':local_count,
             'table_sha256':hashlib.sha256(data[offset:offset+size]).hexdigest(),
             'versym_sha256':None if version_bytes is None else hashlib.sha256(version_bytes).hexdigest(),
             'symbols':symbols}
+    if hashes:
+        result['hash_tables']=HASHES.inspect(data,tags,sections,sections.index(table),ranges,symbols,
+            {symbol['index'] for symbol in symbols if exported(symbol)},file_offset)
+    return result
+
+
+def exported(symbol):
+    return (symbol['section']!=0 and symbol['binding'] in (1,2,10) and symbol['visibility'] in (0,3)
+            and symbol['type'] in (0,1,2,5,6,10)
+            and (symbol['value']!=0 or symbol['section']==0xfff1 or symbol['type']==6)
+            and symbol['version_index']!=0
+            and (symbol['version'] is None or symbol['version']['kind']=='definition'))
 
 
 def compatible(required,provided):
@@ -120,11 +137,7 @@ def availability(roles,release_objects,provider_objects,bindings):
                 if symbol['index']==0:continue
                 if symbol['section']==0:
                     requirements.append((source,path,symbol));continue
-                if (symbol['binding'] not in (1,2,10) or symbol['visibility'] not in (0,3)
-                        or symbol['type'] not in (0,1,2,5,6,10)
-                        or symbol['value']==0 and symbol['section']!=0xfff1 and symbol['type']!=6
-                        or symbol['version_index']==0 or symbol['version'] is not None
-                        and symbol['version']['kind']!='definition'):
+                if not exported(symbol):
                     continue
                 exports.setdefault(symbol['name'],[]).append((source,path,symbol))
         rows=[]

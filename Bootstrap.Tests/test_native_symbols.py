@@ -30,7 +30,7 @@ def locations(raw):
     return {'section':header[6]+index*64,'symbols':table[4],'count':table[5]//24,'versions':version[4]}
 
 
-class NativeSymbolTests(fixture.ReleaseFixture):
+class NativeSymbolFixture(fixture.ReleaseFixture):
     @classmethod
     def setUpClass(cls):
         cls.material=tempfile.TemporaryDirectory(dir=Path.home()/'.cache');cls.addClassCleanup(cls.material.cleanup)
@@ -82,6 +82,8 @@ class NativeSymbolTests(fixture.ReleaseFixture):
         return dict(app=self.app,**self.value['releases'][self.app],release=self.folder(self.app),
                     providers=self.providers,providers_sha256=self.pin,symbols=True)
 
+
+class NativeSymbolTests(NativeSymbolFixture):
     def test_complete_cli_binds_actual_compiler_symbols_versions_and_missing_weak_data_without_execution(self):
         before=self.snapshot();args=self.arguments();args.pop('symbols')
         command=[sys.executable,'-I','-B',str(ROOT/'Bootstrap/native_closure.py'),'--symbols']
