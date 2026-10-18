@@ -145,7 +145,8 @@ def dns_names(raw, contract):
     return names
 
 
-def audit(domain, certificate, key, anchors, openssl_sha256, intermediates=None, at=None, minimum_seconds=86400):
+def audit(domain, certificate, key, anchors, openssl_sha256, intermediates=None, at=None, minimum_seconds=86400,
+          expected_sources=None):
     if os.geteuid() == 0 or os.geteuid() != os.getegid():
         raise ValueError('unprivileged developer with matching UID/GID required')
     contract = RELEASE.contracts()
@@ -160,6 +161,15 @@ def audit(domain, certificate, key, anchors, openssl_sha256, intermediates=None,
         links = []
         captured = {name: private_input(stack, links, path) for name, path in paths.items()}
         inputs = {name: row[2][2] for name, row in captured.items()}
+        if expected_sources is not None:
+            if type(expected_sources) is not dict or expected_sources.keys() != paths.keys():
+                raise ValueError('complete expected TLS source commitments required')
+            for name, expected in expected_sources.items():
+                if (type(expected) is not dict or expected.keys() != {'bytes', 'sha256'}
+                        or type(expected['bytes']) is not int or not 0 < expected['bytes'] <= INPUT_LIMIT
+                        or type(expected['sha256']) is not str or not re.fullmatch('[0-9a-f]{64}', expected['sha256'])
+                        or (expected['bytes'], expected['sha256']) != captured[name][2][:2]):
+                    raise ValueError('TLS input differs from expected source commitment')
         leaf = pem_blocks(inputs['certificate'], {'CERTIFICATE'}, 1)[0]
         pem_blocks(inputs['key'], {'PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY'}, 1)
         anchor_count = len(pem_blocks(inputs['anchors'], {'CERTIFICATE'}, 64))
@@ -195,6 +205,7 @@ def audit(domain, certificate, key, anchors, openssl_sha256, intermediates=None,
                 raise ValueError('TLS original input changed during checks')
         RELEASE.check_links(links); native.check()
         result = {'scope': 'LOCAL DEVELOPMENT TLS INPUT CHECK', 'domain': domain,
+                  'source_commitments_supplied': expected_sources is not None,
                   'evaluation_unix_seconds': current, 'explicit_time_supplied': at is not None,
                   'minimum_validity_seconds': minimum_seconds, 'dns_subject_alternative_names': names,
                   'certificate_der_sha256': hashlib.sha256(leaf).hexdigest(),
